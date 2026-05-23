@@ -364,6 +364,7 @@ int main(int argc, char **argv) {
     E.buf = E.filepath ? load_file(E.filepath) : buffer_new("", 0);
 
     ui_init(&E.ui, term_cols, term_rows);
+    ui_register_builtins(&E.ui);
     render_init(&E.render, term_cols, term_rows);
     render_set_theme(&E.render, &E.theme);
 

@@ -41,7 +41,12 @@ typedef struct RenderState {
     /* Diagnostics from LSP */
     Diagnostic diagnostics[MAX_DIAGNOSTICS];
     int        diag_count;
+
+    /* Cursor positions for UI widgets */
+    int        cx, cy;
 } RenderState;
+
+void ui_register_builtins(UIRegistry *ui);
 
 void render_init      (RenderState *r, int width, int height);
 void render_free      (RenderState *r);

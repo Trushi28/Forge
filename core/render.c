@@ -162,17 +162,7 @@ static void adjust_scroll(RenderState *r, int cx, int cy, int text_rows) {
     if (r->scroll_col < 0) r->scroll_col = 0;
 }
 
-/* ── Gutter ──────────────────────────────────────────────────*/
 
-static void write_gutter(char *row, int line_no) {
-    unsigned n = (unsigned)(line_no < 1 ? 1
-                          : line_no > 9999 ? 9999 : line_no);
-    row[4] = ' ';
-    row[3] = (char)('0' + n % 10); n /= 10;
-    row[2] = n ? (char)('0' + n % 10) : ' '; n /= 10;
-    row[1] = n ? (char)('0' + n % 10) : ' '; n /= 10;
-    row[0] = n ? (char)('0' + n % 10) : ' ';
-}
 
 /* ══════════════════════════════════════════════════════════════
    Syntax highlighting — simple state-machine tokenizer
@@ -397,6 +387,141 @@ static ThemeColor hl_to_color(ForgeTheme *t, HighlightKind kind) {
     }
 }
 
+#define ESC_RESET       "\x1b[0m"
+#define ESC_BOLD        "\x1b[1m"
+#define ESC_ITALIC      "\x1b[3m"
+#define ESC_HIDE_CURSOR "\x1b[?25l"
+#define ESC_SHOW_CURSOR "\x1b[?25h"
+
+static void gutter_widget_render(Widget *self, RenderState *r, Buffer *b) {
+    (void)self;
+    int text_rows = r->height - 1;
+    size_t total_lines = buffer_line_count(b);
+
+    for (int y = 0; y < text_rows; y++) {
+        int logical = r->scroll_row + y;
+        char *row = r->back_buffer[y];
+
+        if ((size_t)logical < total_lines) {
+            int line_no = logical + 1;
+            unsigned n = (unsigned)(line_no < 1 ? 1 : line_no > 9999 ? 9999 : line_no);
+            row[4] = ' ';
+            row[3] = (char)('0' + n % 10); n /= 10;
+            row[2] = n ? (char)('0' + n % 10) : ' '; n /= 10;
+            row[1] = n ? (char)('0' + n % 10) : ' '; n /= 10;
+            row[0] = n ? (char)('0' + n % 10) : ' ';
+        } else {
+            row[0] = '~';
+            for (int i = 1; i < 5; i++) row[i] = ' ';
+        }
+    }
+}
+
+static void content_widget_render(Widget *self, RenderState *r, Buffer *b) {
+    (void)self;
+    int text_rows = r->height - 1;
+    size_t total_lines = buffer_line_count(b);
+
+    for (int y = 0; y < text_rows; y++) {
+        int logical = r->scroll_row + y;
+        char *row = r->back_buffer[y];
+
+        if ((size_t)logical < total_lines) {
+            char *line = buffer_get_line(b, logical);
+            if (line) {
+                int text_cols = r->width - GUTTER_WIDTH;
+                int llen      = (int)strlen(line);
+                int avail     = llen - r->scroll_col;
+                if (avail > 0) {
+                    int copy = avail < text_cols ? avail : text_cols;
+                    memcpy(row + GUTTER_WIDTH, line + r->scroll_col, copy);
+                }
+                free(line);
+            }
+        }
+    }
+}
+
+static void statusbar_widget_render(Widget *self, RenderState *r, Buffer *b) {
+    (void)self;
+    (void)b;
+    int cy = r->cy;
+    int cx = r->cx;
+
+    stream_printf(r, "\x1b[%d;1H", r->height);
+
+    if (r->theme) {
+        ForgeTheme *t = r->theme;
+        stream_bg(r, t->statusbar_accent);
+        stream_fg(r, t->statusbar_bg);
+        stream_str(r, ESC_BOLD);
+        stream_str(r, "  FORGE  ");
+        stream_str(r, ESC_RESET);
+
+        stream_bg(r, t->statusbar_bg);
+        stream_fg(r, t->statusbar_accent);
+        stream_str(r, " │ ");
+
+        stream_fg(r, t->statusbar_fg);
+        stream_bg(r, t->statusbar_bg);
+        const char *msg = r->status_msg[0] ? r->status_msg : "ready";
+        stream_str(r, msg);
+
+        char right[128];
+        int rl = snprintf(right, sizeof(right), " %s │ Ln %d, Col %d  ",
+                          t->name, cy + 1, cx + 1);
+
+        int left_used = 9 + 3 + (int)strlen(msg);
+        int pad = r->width - left_used - rl;
+        for (int i = 0; i < pad; i++) stream_append(r, " ", 1);
+
+        stream_fg(r, t->statusbar_fg);
+        stream_append(r, right, rl < (int)sizeof(right) - 1 ? rl : (int)sizeof(right) - 1);
+    } else {
+        stream_str(r, "\x1b[7m\x1b[1m");
+
+        char left[256];
+        int ll = snprintf(left, sizeof(left), "  FORGE  │  %s",
+                          r->status_msg[0] ? r->status_msg : "ready");
+        stream_append(r, left, ll < (int)sizeof(left) - 1 ? ll : (int)sizeof(left) - 1);
+
+        char right[64];
+        int rl = snprintf(right, sizeof(right), " Ln %d, Col %d  ", cy + 1, cx + 1);
+        int pad = r->width - ll - rl;
+        for (int i = 0; i < pad; i++) stream_append(r, " ", 1);
+        stream_append(r, right, rl < (int)sizeof(right) - 1 ? rl : (int)sizeof(right) - 1);
+    }
+
+    stream_str(r, ESC_RESET);
+}
+
+static Widget gutter_widget;
+static Widget content_widget;
+static Widget statusbar_widget;
+
+void ui_register_builtins(UIRegistry *ui) {
+    memset(&gutter_widget, 0, sizeof(gutter_widget));
+    strncpy(gutter_widget.name, "gutter", sizeof(gutter_widget.name) - 1);
+    gutter_widget.visible = true;
+    gutter_widget.priority = 10;
+    gutter_widget.render = gutter_widget_render;
+    ui_register_widget(ui, SLOT_GUTTER, &gutter_widget);
+
+    memset(&content_widget, 0, sizeof(content_widget));
+    strncpy(content_widget.name, "content", sizeof(content_widget.name) - 1);
+    content_widget.visible = true;
+    content_widget.priority = 10;
+    content_widget.render = content_widget_render;
+    ui_register_widget(ui, SLOT_CONTENT, &content_widget);
+
+    memset(&statusbar_widget, 0, sizeof(statusbar_widget));
+    strncpy(statusbar_widget.name, "statusbar", sizeof(statusbar_widget.name) - 1);
+    statusbar_widget.visible = true;
+    statusbar_widget.priority = 10;
+    statusbar_widget.render = statusbar_widget_render;
+    ui_register_widget(ui, SLOT_STATUSBAR, &statusbar_widget);
+}
+
 /* ══════════════════════════════════════════════════════════════
    render_frame — the main render loop
 
@@ -405,16 +530,8 @@ static ThemeColor hl_to_color(ForgeTheme *t, HighlightKind kind) {
    status bar.
    ══════════════════════════════════════════════════════════════ */
 
-#define ESC_RESET       "\x1b[0m"
-#define ESC_BOLD        "\x1b[1m"
-#define ESC_ITALIC      "\x1b[3m"
-#define ESC_HIDE_CURSOR "\x1b[?25l"
-#define ESC_SHOW_CURSOR "\x1b[?25h"
-
 void render_frame(RenderState *r, Buffer *b, UIRegistry *ui,
                   int cx, int cy) {
-    (void)ui;
-
     int text_rows = r->height - 1;
     adjust_scroll(r, cx, cy, text_rows);
 
@@ -463,31 +580,17 @@ void render_frame(RenderState *r, Buffer *b, UIRegistry *ui,
     }
 
     /* ── Build back-buffer (text rows) ───────────────────────*/
+    r->cx = cx;
+    r->cy = cy;
+
     for (int y = 0; y < text_rows; y++) {
         char *row = r->back_buffer[y];
         memset(row, ' ', r->width);
         row[r->width] = '\0';
-
-        int logical = r->scroll_row + y;
-        if ((size_t)logical < total_lines) {
-            write_gutter(row, logical + 1);
-
-            char *line = buffer_get_line(b, logical);
-            if (line) {
-                int text_cols = r->width - GUTTER_WIDTH;
-                int llen      = (int)strlen(line);
-                int avail     = llen - r->scroll_col;
-                if (avail > 0) {
-                    int copy = avail < text_cols ? avail : text_cols;
-                    memcpy(row + GUTTER_WIDTH,
-                           line + r->scroll_col, copy);
-                }
-                free(line);
-            }
-        } else {
-            row[0] = '~';
-        }
     }
+
+    /* Call slot-based widgets to populate gutter & content */
+    ui_render_slots(ui, r, b);
 
     /* ── Diff & emit text rows with syntax highlighting ──────*/
     /* Reset block comment state for actual rendering pass */
@@ -624,63 +727,6 @@ void render_frame(RenderState *r, Buffer *b, UIRegistry *ui,
         }
 
         memcpy(r->front_buffer[y], row, r->width);
-    }
-
-    /* ── Status bar ──────────────────────────────────────────*/
-    {
-        stream_printf(r, "\x1b[%d;1H", r->height);
-
-        if (r->theme) {
-            ForgeTheme *t = r->theme;
-            /* Mode badge with accent color */
-            stream_bg(r, t->statusbar_accent);
-            stream_fg(r, t->statusbar_bg);
-            stream_str(r, ESC_BOLD);
-            stream_str(r, "  FORGE  ");
-            stream_str(r, ESC_RESET);
-
-            /* Separator */
-            stream_bg(r, t->statusbar_bg);
-            stream_fg(r, t->statusbar_accent);
-            stream_str(r, " │ ");
-
-            /* Status message */
-            stream_fg(r, t->statusbar_fg);
-            stream_bg(r, t->statusbar_bg);
-            const char *msg = r->status_msg[0] ? r->status_msg : "ready";
-            stream_str(r, msg);
-
-            /* Right side: position + theme name */
-            char right[128];
-            int rl = snprintf(right, sizeof(right), " %s │ Ln %d, Col %d  ",
-                              t->name, cy + 1, cx + 1);
-
-            int left_used = 9 + 3 + (int)strlen(msg); /* "  FORGE  " + " │ " + msg */
-            int pad = r->width - left_used - rl;
-            for (int i = 0; i < pad; i++) stream_append(r, " ", 1);
-
-            stream_fg(r, t->statusbar_fg);
-            stream_append(r, right, rl < (int)sizeof(right) - 1 ? rl : (int)sizeof(right) - 1);
-        } else {
-            /* Fallback: reverse video status */
-            stream_str(r, "\x1b[7m\x1b[1m");
-
-            char left[256];
-            int ll = snprintf(left, sizeof(left), "  FORGE  │  %s",
-                              r->status_msg[0] ? r->status_msg : "ready");
-            stream_append(r, left,
-                          ll < (int)sizeof(left) - 1 ? ll : (int)sizeof(left) - 1);
-
-            char right[64];
-            int rl = snprintf(right, sizeof(right), " Ln %d, Col %d  ",
-                              cy + 1, cx + 1);
-            int pad = r->width - ll - rl;
-            for (int i = 0; i < pad; i++) stream_append(r, " ", 1);
-            stream_append(r, right,
-                          rl < (int)sizeof(right) - 1 ? rl : (int)sizeof(right) - 1);
-        }
-
-        stream_str(r, ESC_RESET);
     }
 
     /* ── Place cursor ────────────────────────────────────────*/
