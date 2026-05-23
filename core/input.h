@@ -3,6 +3,7 @@
 
 enum KeyCode {
   KEY_CTRL_A = 1,
+  KEY_CTRL_B = 2,
   KEY_CTRL_C = 3,
   KEY_CTRL_D = 4,
   KEY_CTRL_G = 7,

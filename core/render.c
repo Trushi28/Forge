@@ -506,6 +506,199 @@ static void statusbar_widget_render(Widget *self, RenderState *r, Buffer *b) {
 static Widget gutter_widget;
 static Widget content_widget;
 static Widget statusbar_widget;
+static Widget timeline_widget_inst;
+
+/* ── Timeline scrubber widget ───────────────────────────────── */
+
+static void timeline_widget_render(Widget *self, RenderState *r, Buffer *b) {
+    (void)self; (void)b;
+    if (!r->git || !r->git->timeline_visible || r->git->commit_count == 0)
+        return;
+
+    ForgeTheme *t = r->theme;
+    if (!t) return;
+
+    int timeline_row = r->height - TIMELINE_HEIGHT;
+    int width = r->width;
+    GitState *gs = r->git;
+
+    /* ── Top border ──────────────────────────────────────── */
+    stream_printf(r, "\x1b[%d;1H", timeline_row);
+    stream_bg(r, t->gutter_bg);
+    stream_fg(r, t->accent);
+    stream_str(r, "─");
+    stream_str(r, " TimeLine ");
+    for (int i = 11; i < width; i++) stream_str(r, "─");
+    stream_str(r, ESC_RESET);
+
+    /* ── Commit strip ────────────────────────────────────── */
+    stream_printf(r, "\x1b[%d;1H", timeline_row + 1);
+    stream_bg(r, t->gutter_bg);
+    stream_fg(r, t->gutter_fg);
+    stream_str(r, " ◄ ");
+
+    /* Calculate visible range of commits */
+    int avail = width - 6;  /* 3 left arrow, 3 right arrow */
+    int entry_width = 14;   /* space per commit entry */
+    int visible_count = avail / entry_width;
+    if (visible_count < 1) visible_count = 1;
+    if (visible_count > gs->commit_count) visible_count = gs->commit_count;
+
+    /* Center selected commit in view */
+    int start = gs->timeline_selected - visible_count / 2;
+    if (start < 0) start = 0;
+    if (start + visible_count > gs->commit_count)
+        start = gs->commit_count - visible_count;
+    if (start < 0) start = 0;
+
+    int chars_used = 3;  /* initial " ◄ " */
+
+    for (int i = 0; i < visible_count && chars_used + entry_width < width - 3; i++) {
+        int idx = start + i;
+        bool is_selected = (idx == gs->timeline_selected);
+
+        if (is_selected) {
+            stream_fg(r, t->accent);
+            stream_str(r, ESC_BOLD);
+            stream_str(r, "[");
+        } else {
+            stream_fg(r, t->gutter_fg);
+            stream_str(r, " ");
+        }
+
+        /* Show short SHA + abbreviated message */
+        char entry[16];
+        snprintf(entry, sizeof(entry), "%.7s", gs->commits[idx].short_sha);
+        stream_str(r, entry);
+
+        if (is_selected) {
+            stream_str(r, "]");
+            stream_str(r, ESC_RESET);
+            stream_bg(r, t->gutter_bg);
+        } else {
+            stream_str(r, " ");
+        }
+
+        /* Separator */
+        stream_fg(r, t->gutter_fg);
+        if (i < visible_count - 1)
+            stream_str(r, " ── ");
+        else
+            stream_str(r, " ");
+
+        chars_used += entry_width;
+    }
+
+    /* Fill rest + right arrow */
+    for (int i = chars_used; i < width - 3; i++)
+        stream_append(r, " ", 1);
+    stream_fg(r, t->gutter_fg);
+    stream_str(r, " ► ");
+    stream_str(r, ESC_RESET);
+
+    /* ── Detail row (message + author + date) ────────────── */
+    stream_printf(r, "\x1b[%d;1H", timeline_row + 2);
+    stream_bg(r, t->gutter_bg);
+    stream_fg(r, t->statusbar_fg);
+
+    if (gs->timeline_selected >= 0 && gs->timeline_selected < gs->commit_count) {
+        GitCommit *c = &gs->commits[gs->timeline_selected];
+
+        /* Format relative date */
+        char datestr[32];
+        time_t now = time(NULL);
+        long diff_secs = (long)(now - c->date);
+        if (diff_secs < 60)
+            snprintf(datestr, sizeof(datestr), "%lds ago", diff_secs);
+        else if (diff_secs < 3600)
+            snprintf(datestr, sizeof(datestr), "%ldm ago", diff_secs / 60);
+        else if (diff_secs < 86400)
+            snprintf(datestr, sizeof(datestr), "%ldh ago", diff_secs / 3600);
+        else
+            snprintf(datestr, sizeof(datestr), "%ldd ago", diff_secs / 86400);
+
+        char detail[512];
+        int dlen = snprintf(detail, sizeof(detail),
+                            "  %s  │  %s  │  %s",
+                            c->short_sha, c->author, c->message);
+
+        if (dlen > width - 20) dlen = width - 20;
+        stream_append(r, detail, dlen > 0 ? dlen : 0);
+
+        /* Right-align the date */
+        int date_len = (int)strlen(datestr);
+        int pad = width - dlen - date_len - 2;
+        for (int i = 0; i < pad; i++) stream_append(r, " ", 1);
+        stream_fg(r, t->accent);
+        stream_str(r, datestr);
+        stream_append(r, "  ", 2);
+    } else {
+        for (int i = 0; i < width; i++) stream_append(r, " ", 1);
+    }
+
+    stream_str(r, ESC_RESET);
+}
+
+/* ── Inline blame rendering ─────────────────────────────────── */
+
+static void blame_render(RenderState *r, int cy) {
+    if (!r->git || !r->git->blame_visible || r->git->blame_count == 0)
+        return;
+
+    ForgeTheme *t = r->theme;
+    if (!t) return;
+
+    int text_rows = r->height - 1;
+    if (r->git->timeline_visible) text_rows -= TIMELINE_HEIGHT;
+
+    for (int y = 0; y < text_rows; y++) {
+        int logical = r->scroll_row + y;
+        if (logical < 0 || logical >= r->git->blame_count) continue;
+
+        GitBlameLine *bl = &r->git->blame[logical];
+
+        /* Position at end of line area */
+        int blame_col = r->width - BLAME_COL_WIDTH;
+        if (blame_col < GUTTER_WIDTH + 20) continue;  /* too narrow */
+
+        stream_printf(r, "\x1b[%d;%dH", y + 1, blame_col);
+
+        /* Format relative time */
+        char timestr[16];
+        time_t now = time(NULL);
+        long diff_secs = (long)(now - bl->date);
+        if (diff_secs < 60)
+            snprintf(timestr, sizeof(timestr), "%lds", diff_secs);
+        else if (diff_secs < 3600)
+            snprintf(timestr, sizeof(timestr), "%ldm", diff_secs / 60);
+        else if (diff_secs < 86400)
+            snprintf(timestr, sizeof(timestr), "%ldh", diff_secs / 3600);
+        else if (diff_secs < 2592000)
+            snprintf(timestr, sizeof(timestr), "%ldd", diff_secs / 86400);
+        else
+            snprintf(timestr, sizeof(timestr), "%ldmo", diff_secs / 2592000);
+
+        /* Author name (truncated) */
+        char author[12];
+        snprintf(author, sizeof(author), "%.10s", bl->author);
+
+        ThemeColor blame_bg = (logical == cy) ? t->line_highlight : t->bg;
+        stream_bg(r, blame_bg);
+        stream_fg(r, t->comment);
+        stream_str(r, ESC_ITALIC);
+
+        char blame_str[BLAME_COL_WIDTH + 1];
+        int blen = snprintf(blame_str, sizeof(blame_str),
+                            " %s • %s ago", author, timestr);
+        /* Pad to fixed width */
+        for (int i = blen; i < BLAME_COL_WIDTH; i++)
+            blame_str[i] = ' ';
+        blame_str[BLAME_COL_WIDTH] = '\0';
+
+        stream_str(r, blame_str);
+        stream_str(r, ESC_RESET);
+    }
+}
 
 void ui_register_builtins(UIRegistry *ui) {
     memset(&gutter_widget, 0, sizeof(gutter_widget));
@@ -528,6 +721,13 @@ void ui_register_builtins(UIRegistry *ui) {
     statusbar_widget.priority = 10;
     statusbar_widget.render = statusbar_widget_render;
     ui_register_widget(ui, SLOT_STATUSBAR, &statusbar_widget);
+
+    memset(&timeline_widget_inst, 0, sizeof(timeline_widget_inst));
+    strncpy(timeline_widget_inst.name, "git_timeline", sizeof(timeline_widget_inst.name) - 1);
+    timeline_widget_inst.visible = true;
+    timeline_widget_inst.priority = 20;
+    timeline_widget_inst.render = timeline_widget_render;
+    ui_register_widget(ui, SLOT_BOTTOMBAR, &timeline_widget_inst);
 }
 
 /* ══════════════════════════════════════════════════════════════
@@ -541,6 +741,9 @@ void ui_register_builtins(UIRegistry *ui) {
 void render_frame(RenderState *r, Buffer *b, UIRegistry *ui,
                   int cx, int cy) {
     int text_rows = r->height - 1;
+    /* Reduce text area when timeline is visible */
+    if (r->git && r->git->timeline_visible && r->git->commit_count > 0)
+        text_rows -= TIMELINE_HEIGHT;
     adjust_scroll(r, cx, cy, text_rows);
 
     r->out_len = 0;
@@ -755,6 +958,9 @@ void render_frame(RenderState *r, Buffer *b, UIRegistry *ui,
 
         memcpy(r->front_buffer[y], row, r->width);
     }
+
+    /* ── Render blame overlay ─────────────────────────────────*/
+    blame_render(r, cy);
 
     /* ── Place cursor ────────────────────────────────────────*/
     int screen_row = cy - r->scroll_row + 1;

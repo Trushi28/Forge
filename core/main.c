@@ -8,6 +8,7 @@
 #include "lsp.h"
 #include "palette.h"
 #include "plugin.h"
+#include "forgescript.h"
 #include "render.h"
 #include "theme.h"
 #include "ui.h"
@@ -36,6 +37,7 @@ typedef struct {
     UndoStack      undo;
     GitState       git;
     PluginHost     plugins;
+    ForgeScriptVM  scripts;
     IPCBridge      ipc;
 
     const char    *filepath;
@@ -220,6 +222,12 @@ static void cmd_save(void *ctx) {
             /* Fire shell hook */
             if (E.cfg.hook_on_save[0])
                 plugin_run_hook(E.cfg.hook_on_save, E.filepath);
+
+            /* Fire plugin callbacks */
+            plugin_on_save(&E.plugins, E.filepath);
+
+            /* Fire ForgeScript event */
+            fs_vm_fire_event(&E.scripts, FS_EVENT_SAVE, E.filepath);
         } else {
             render_set_status(&E.render, "ERROR: could not save  %s", E.filepath);
         }
@@ -489,6 +497,27 @@ int main(int argc, char **argv) {
 
     /* ── Initialize plugins ───────────────────────────────── */
     plugin_host_init(&E.plugins);
+    /* Load plugins from default directories */
+    for (int i = 0; i < E.plugins.search_path_count; i++)
+        plugin_host_load_dir(&E.plugins, E.plugins.search_paths[i]);
+
+    /* ── Initialize ForgeScript VM ────────────────────────── */
+    fs_vm_init(&E.scripts);
+    {
+        char script_dir[1024];
+        const char *home = getenv("HOME");
+        if (home) {
+            snprintf(script_dir, sizeof(script_dir),
+                     "%s/.config/forge/scripts", home);
+            fs_vm_load_dir(&E.scripts, script_dir);
+        }
+        /* Also load from project-local scripts */
+        if (has_cwd) {
+            snprintf(script_dir, sizeof(script_dir),
+                     "%s/scripts/user", cwd);
+            fs_vm_load_dir(&E.scripts, script_dir);
+        }
+    }
 
     /* ── Initialize IPC (try to connect to forge-net) ─────── */
     ipc_init(&E.ipc);
@@ -819,6 +848,94 @@ int main(int argc, char **argv) {
             continue;
         }
 
+        /* ── Ctrl+B: Toggle Git Blame ────────────────────── */
+        if (key == KEY_CTRL_B) {
+            cmd_toggle_blame(NULL);
+            continue;
+        }
+
+        /* ── Timeline navigation (when timeline is visible) ── */
+        if (E.git.timeline_visible && E.git.commit_count > 0) {
+            if (key == KEY_ARROW_LEFT && E.git.timeline_selected > 0) {
+                E.git.timeline_selected--;
+                E.render.full_redraw = true;
+                GitCommit *c = &E.git.commits[E.git.timeline_selected];
+                render_set_status(&E.render, "Timeline: %s — %s",
+                                  c->short_sha, c->message);
+                continue;
+            }
+            if (key == KEY_ARROW_RIGHT &&
+                E.git.timeline_selected < E.git.commit_count - 1) {
+                E.git.timeline_selected++;
+                E.render.full_redraw = true;
+                GitCommit *c = &E.git.commits[E.git.timeline_selected];
+                render_set_status(&E.render, "Timeline: %s — %s",
+                                  c->short_sha, c->message);
+                continue;
+            }
+            /* Enter: load file at selected commit (read-only view) */
+            if ((key == '\r' || key == '\n') && E.filepath) {
+                GitCommit *c = &E.git.commits[E.git.timeline_selected];
+                char *content = git_file_at_commit(&E.git, E.filepath, c->sha);
+                if (content) {
+                    /* Replace buffer with historical content (read-only) */
+                    buffer_free(E.buf);
+                    E.buf = buffer_new(content, strlen(content));
+                    free(content);
+                    E.git.timeline_viewing = true;
+                    E.cx = 0; E.cy = 0;
+                    render_set_status(&E.render,
+                        "[READ-ONLY] %s @ %s — %s  (Esc to return)",
+                        E.filepath, c->short_sha, c->message);
+                    E.render.full_redraw = true;
+                } else {
+                    render_set_status(&E.render,
+                        "Could not load %s at commit %s",
+                        E.filepath, c->short_sha);
+                }
+                continue;
+            }
+            /* Escape: return to present */
+            if (key == KEY_ESC) {
+                if (E.git.timeline_viewing) {
+                    /* Reload the current file from disk */
+                    buffer_free(E.buf);
+                    E.buf = E.filepath ? load_file(E.filepath)
+                                       : buffer_new("", 0);
+                    E.git.timeline_viewing = false;
+                    E.cx = 0; E.cy = 0;
+                    render_set_status(&E.render, "%s  [%s]",
+                                      E.filepath ? E.filepath : "[new file]",
+                                      E.git.branch);
+                    E.render.full_redraw = true;
+                } else {
+                    /* Just close timeline */
+                    E.git.timeline_visible = false;
+                    E.render.full_redraw = true;
+                    render_set_status(&E.render, "Timeline closed");
+                }
+                continue;
+            }
+        }
+
+        /* ── Block editing when viewing historical file ────── */
+        if (E.git.timeline_viewing) {
+            /* Only allow navigation and escape, not editing */
+            if (key == KEY_ARROW_UP || key == KEY_ARROW_DOWN ||
+                key == KEY_ARROW_LEFT || key == KEY_ARROW_RIGHT ||
+                key == KEY_PAGE_UP || key == KEY_PAGE_DOWN ||
+                key == KEY_HOME || key == KEY_END) {
+                /* Fall through to normal navigation */
+            } else if (key == KEY_CTRL_Q) {
+                E.running = false;
+                continue;
+            } else {
+                render_set_status(&E.render,
+                    "[READ-ONLY] Press Esc to return to present");
+                continue;
+            }
+        }
+
         /* ── Ctrl+Z: Undo ────────────────────────────────── */
         if (key == (KEY_CTRL_A + 25)) {  /* Ctrl+Z = 26 */
             UndoEntry *e = undo_pop(&E.undo);
@@ -1105,6 +1222,7 @@ int main(int argc, char **argv) {
     undo_free(&E.undo);
     git_state_free(&E.git);
     plugin_host_free(&E.plugins);
+    fs_vm_free(&E.scripts);
     ipc_free(&E.ipc);
     buffer_free(E.buf);
     arena_free(session_arena);

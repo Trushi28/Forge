@@ -9,6 +9,8 @@
 #include <stdarg.h>
 
 #define GUTTER_WIDTH 5   /* 4 digits + 1 separator space */
+#define TIMELINE_HEIGHT 3 /* rows for the git timeline scrubber */
+#define BLAME_COL_WIDTH 28 /* width of inline blame annotations */
 
 /* ── Diagnostic markers for gutter ──────────────────────────── */
 #define DIAG_NONE    0
