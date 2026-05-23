@@ -485,6 +485,7 @@ int main(int argc, char **argv) {
             git_refresh_branch(&E.git);
         }
     }
+    E.render.git = &E.git;
 
     /* ── Initialize plugins ───────────────────────────────── */
     plugin_host_init(&E.plugins);
