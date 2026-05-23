@@ -4,10 +4,15 @@
 enum KeyCode {
   KEY_CTRL_A = 1,
   KEY_CTRL_C = 3,
+  KEY_CTRL_D = 4,
   KEY_CTRL_G = 7,
+  KEY_CTRL_H = 8,
+  KEY_CTRL_K = 11,
+  KEY_CTRL_N = 14,
   KEY_CTRL_P = 16,
   KEY_CTRL_Q = 17,
   KEY_CTRL_S = 19,
+  KEY_CTRL_T = 20,
   KEY_ESC = 27,
   KEY_BACKSPACE = 127,
   KEY_ARROW_UP = 1000,
@@ -17,7 +22,8 @@ enum KeyCode {
   KEY_PAGE_UP,
   KEY_PAGE_DOWN,
   KEY_HOME,
-  KEY_END
+  KEY_END,
+  KEY_DELETE
 };
 
 void input_enable_raw_mode(void);

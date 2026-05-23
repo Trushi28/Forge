@@ -1,13 +1,18 @@
 CC      = gcc
-CFLAGS  = -Wall -Wextra -std=c11 -O2 -Wno-unused-result
+CFLAGS  = -Wall -Wextra -std=c11 -O2 -Wno-unused-result -Wno-format-truncation -D_GNU_SOURCE
 SRCDIR  = core
 TARGET  = forge
 
-SRCS = $(SRCDIR)/arena.c   \
-       $(SRCDIR)/buffer.c  \
-       $(SRCDIR)/input.c   \
-       $(SRCDIR)/ui.c      \
-       $(SRCDIR)/render.c  \
+SRCS = $(SRCDIR)/arena.c      \
+       $(SRCDIR)/buffer.c     \
+       $(SRCDIR)/config.c     \
+       $(SRCDIR)/theme.c      \
+       $(SRCDIR)/input.c      \
+       $(SRCDIR)/ui.c         \
+       $(SRCDIR)/render.c     \
+       $(SRCDIR)/lsp.c        \
+       $(SRCDIR)/completion.c \
+       $(SRCDIR)/palette.c    \
        $(SRCDIR)/main.c
 
 OBJS = $(SRCS:.c=.o)
@@ -22,7 +27,7 @@ $(TARGET): $(OBJS)
 $(SRCDIR)/%.o: $(SRCDIR)/%.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
-debug: CFLAGS = -Wall -Wextra -std=c11 -g -DDEBUG -Wno-unused-result
+debug: CFLAGS = -Wall -Wextra -std=c11 -g -DDEBUG -Wno-unused-result -Wno-format-truncation -D_GNU_SOURCE
 debug: $(TARGET)
 
 clean:

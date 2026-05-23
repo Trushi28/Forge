@@ -3,10 +3,26 @@
 
 #include "buffer.h"
 #include "ui.h"
+#include "theme.h"
 #include <stdbool.h>
 #include <stdarg.h>
 
 #define GUTTER_WIDTH 5   /* 4 digits + 1 separator space */
+
+/* ── Diagnostic markers for gutter ──────────────────────────── */
+#define DIAG_NONE    0
+#define DIAG_ERROR   1
+#define DIAG_WARNING 2
+#define DIAG_INFO    3
+#define DIAG_HINT    4
+
+#define MAX_DIAGNOSTICS 4096
+
+typedef struct {
+    int line;          /* 0-indexed */
+    int severity;      /* DIAG_ERROR, DIAG_WARNING, etc. */
+    char message[256];
+} Diagnostic;
 
 typedef struct RenderState {
     int   width, height;
@@ -18,13 +34,27 @@ typedef struct RenderState {
     char  *output_stream;
     int    out_len, out_cap;
     char   status_msg[256];
+
+    /* Theme */
+    ForgeTheme *theme;
+
+    /* Diagnostics from LSP */
+    Diagnostic diagnostics[MAX_DIAGNOSTICS];
+    int        diag_count;
 } RenderState;
 
 void render_init      (RenderState *r, int width, int height);
 void render_free      (RenderState *r);
 void render_resize    (RenderState *r, int width, int height);
 void render_set_status(RenderState *r, const char *fmt, ...);
+void render_set_theme (RenderState *r, ForgeTheme *theme);
 
 void render_frame     (RenderState *r, Buffer *b, UIRegistry *ui, int cx, int cy);
+
+/* Diagnostic management */
+void render_clear_diagnostics(RenderState *r);
+void render_add_diagnostic(RenderState *r, int line, int severity,
+                           const char *msg);
+int  render_get_diag_severity(RenderState *r, int line);
 
 #endif

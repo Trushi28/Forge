@@ -48,6 +48,7 @@ int input_read_key(void) {
       if (seq[2] == '~') {
         switch (seq[1]) {
           case '1': return KEY_HOME;
+          case '3': return KEY_DELETE;
           case '4': return KEY_END;
           case '5': return KEY_PAGE_UP;
           case '6': return KEY_PAGE_DOWN;

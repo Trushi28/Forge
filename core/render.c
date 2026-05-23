@@ -1,6 +1,8 @@
 #include "render.h"
 #include "buffer.h"
+#include "theme.h"
 #include "ui.h"
+#include <ctype.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -8,7 +10,7 @@
 #include <unistd.h>
 
 /* ══════════════════════════════════════════════════════════════
-   Output stream
+   Output stream — batches all ANSI output into one write()
    ══════════════════════════════════════════════════════════════ */
 
 static void stream_grow(RenderState *r, int need) {
@@ -28,21 +30,26 @@ static void stream_str(RenderState *r, const char *s) {
 }
 
 static void stream_printf(RenderState *r, const char *fmt, ...) {
-    char tmp[128];
+    char tmp[256];
     va_list ap;
     va_start(ap, fmt);
     int n = vsnprintf(tmp, sizeof(tmp), fmt, ap);
     va_end(ap);
-    if (n > 0) stream_append(r, tmp, n < 128 ? n : 127);
+    if (n > 0) stream_append(r, tmp, n < (int)sizeof(tmp) ? n : (int)sizeof(tmp) - 1);
+}
+
+/* Emit truecolor foreground */
+static void stream_fg(RenderState *r, ThemeColor c) {
+    stream_printf(r, "\x1b[38;2;%u;%u;%um", c.r, c.g, c.b);
+}
+
+/* Emit truecolor background */
+static void stream_bg(RenderState *r, ThemeColor c) {
+    stream_printf(r, "\x1b[48;2;%u;%u;%um", c.r, c.g, c.b);
 }
 
 /* ══════════════════════════════════════════════════════════════
    Cell buffer helpers
-   Each row is (width) display bytes.  We keep a front and back
-   buffer of these rows.  front is what is currently on-screen;
-   back is what we want.  On every frame we diff and only write
-   changed rows.  On the very first frame (or after a resize) we
-   force a full repaint by poisoning front with 0x00.
    ══════════════════════════════════════════════════════════════ */
 
 static void alloc_cell_bufs(RenderState *r) {
@@ -51,7 +58,6 @@ static void alloc_cell_bufs(RenderState *r) {
     for (int i = 0; i < r->height; i++) {
         r->front_buffer[i] = malloc(r->width + 1);
         r->back_buffer[i]  = malloc(r->width + 1);
-        /* poison front so every row is dirty on first paint */
         memset(r->front_buffer[i], 0,   r->width + 1);
         memset(r->back_buffer[i],  ' ', r->width);
         r->back_buffer[i][r->width] = '\0';
@@ -67,18 +73,20 @@ static void free_cell_bufs(RenderState *r) {
     free(r->back_buffer);
 }
 
-/* ── Lifecycle ────────────────────────────────────────────────*/
+/* ── Lifecycle ───────────────────────────────────────────────*/
 
 void render_init(RenderState *r, int width, int height) {
     r->width         = width;
     r->height        = height;
     r->scroll_row    = 0;
     r->scroll_col    = 0;
-    r->out_cap       = 32768;
+    r->out_cap       = 65536;
     r->out_len       = 0;
     r->output_stream = malloc(r->out_cap);
     r->status_msg[0] = '\0';
     r->full_redraw   = true;
+    r->theme         = NULL;
+    r->diag_count    = 0;
     alloc_cell_bufs(r);
 }
 
@@ -92,7 +100,7 @@ void render_resize(RenderState *r, int width, int height) {
     free(r->output_stream);
     r->width         = width;
     r->height        = height;
-    r->out_cap       = 32768;
+    r->out_cap       = 65536;
     r->out_len       = 0;
     r->output_stream = malloc(r->out_cap);
     r->full_redraw   = true;
@@ -106,7 +114,39 @@ void render_set_status(RenderState *r, const char *fmt, ...) {
     va_end(ap);
 }
 
-/* ── Scroll adjustment ────────────────────────────────────────*/
+void render_set_theme(RenderState *r, ForgeTheme *theme) {
+    r->theme = theme;
+    r->full_redraw = true;
+}
+
+/* ── Diagnostics ─────────────────────────────────────────────*/
+
+void render_clear_diagnostics(RenderState *r) {
+    r->diag_count = 0;
+}
+
+void render_add_diagnostic(RenderState *r, int line, int severity,
+                           const char *msg) {
+    if (r->diag_count >= MAX_DIAGNOSTICS) return;
+    Diagnostic *d = &r->diagnostics[r->diag_count++];
+    d->line     = line;
+    d->severity = severity;
+    strncpy(d->message, msg, sizeof(d->message) - 1);
+    d->message[sizeof(d->message) - 1] = '\0';
+}
+
+int render_get_diag_severity(RenderState *r, int line) {
+    int worst = DIAG_NONE;
+    for (int i = 0; i < r->diag_count; i++) {
+        if (r->diagnostics[i].line == line) {
+            if (r->diagnostics[i].severity < worst || worst == DIAG_NONE)
+                worst = r->diagnostics[i].severity;
+        }
+    }
+    return worst;
+}
+
+/* ── Scroll adjustment ───────────────────────────────────────*/
 
 static void adjust_scroll(RenderState *r, int cx, int cy, int text_rows) {
     if (cy < r->scroll_row)
@@ -122,11 +162,9 @@ static void adjust_scroll(RenderState *r, int cx, int cy, int text_rows) {
     if (r->scroll_col < 0) r->scroll_col = 0;
 }
 
-/* ── Gutter ───────────────────────────────────────────────────*/
+/* ── Gutter ──────────────────────────────────────────────────*/
 
 static void write_gutter(char *row, int line_no) {
-    /* Right-align a 4-digit line number then a separator space.
-       Hand-rolled to avoid snprintf truncation warning.          */
     unsigned n = (unsigned)(line_no < 1 ? 1
                           : line_no > 9999 ? 9999 : line_no);
     row[4] = ' ';
@@ -137,37 +175,292 @@ static void write_gutter(char *row, int line_no) {
 }
 
 /* ══════════════════════════════════════════════════════════════
-   render_frame
+   Syntax highlighting — simple state-machine tokenizer
+
+   Recognizes: C/Rust/Go/JS keywords, strings, comments,
+   numbers, preprocessor directives, and operators.
+   Fast single-pass per line; no regex or AST needed.
    ══════════════════════════════════════════════════════════════ */
 
-/*  ANSI escape shorthand */
+typedef enum {
+    HL_NORMAL,
+    HL_KEYWORD,
+    HL_TYPE,
+    HL_STRING,
+    HL_NUMBER,
+    HL_COMMENT,
+    HL_OPERATOR,
+    HL_PREPROC,
+    HL_FUNCTION,
+    HL_CONSTANT
+} HighlightKind;
+
+static const char *c_keywords[] = {
+    "auto", "break", "case", "const", "continue", "default", "do",
+    "else", "enum", "extern", "for", "goto", "if", "inline",
+    "register", "restrict", "return", "sizeof", "static", "struct",
+    "switch", "typedef", "union", "volatile", "while",
+    /* Rust/JS/Go additions */
+    "fn", "let", "mut", "pub", "impl", "trait", "match", "use", "mod",
+    "crate", "self", "super", "async", "await", "yield",
+    "function", "var", "class", "new", "this", "throw", "try", "catch",
+    "finally", "import", "export", "from", "extends",
+    "func", "package", "defer", "go", "range", "select", "chan",
+    NULL
+};
+
+static const char *c_types[] = {
+    "int", "char", "void", "float", "double", "long", "short", "unsigned",
+    "signed", "size_t", "uint8_t", "uint16_t", "uint32_t", "uint64_t",
+    "int8_t", "int16_t", "int32_t", "int64_t", "ssize_t", "bool",
+    "true", "false", "NULL",
+    /* Rust types */
+    "i8", "i16", "i32", "i64", "i128", "u8", "u16", "u32", "u64", "u128",
+    "f32", "f64", "usize", "isize", "String", "Vec", "Option", "Result",
+    "Box", "Self",
+    /* Go types */
+    "string", "byte", "rune", "error", "nil",
+    NULL
+};
+
+static const char *c_constants[] = {
+    "TRUE", "FALSE", "NULL", "EOF", "STDIN_FILENO", "STDOUT_FILENO",
+    "STDERR_FILENO", "EXIT_SUCCESS", "EXIT_FAILURE",
+    "None", "Some", "Ok", "Err", "undefined", "null",
+    NULL
+};
+
+static bool is_word_char(char c) {
+    return isalnum((unsigned char)c) || c == '_';
+}
+
+static bool word_match(const char *word, int len, const char *list[]) {
+    for (int i = 0; list[i]; i++) {
+        int wl = (int)strlen(list[i]);
+        if (wl == len && memcmp(word, list[i], len) == 0)
+            return true;
+    }
+    return false;
+}
+
+/* Classify each character of `line` into hl_out[].
+   Handles // comments, "strings", 'chars', numbers, keywords.  */
+static void highlight_line(const char *line, int len, HighlightKind *hl_out,
+                           bool *in_block_comment) {
+    int i = 0;
+
+    /* If we're inside a block comment from a previous line */
+    if (*in_block_comment) {
+        while (i < len) {
+            hl_out[i] = HL_COMMENT;
+            if (i + 1 < len && line[i] == '*' && line[i + 1] == '/') {
+                hl_out[i + 1] = HL_COMMENT;
+                i += 2;
+                *in_block_comment = false;
+                break;
+            }
+            i++;
+        }
+    }
+
+    while (i < len) {
+        /* Preprocessor: # at start of line (after whitespace) */
+        if (line[i] == '#') {
+            bool at_start = true;
+            for (int j = 0; j < i; j++) {
+                if (line[j] != ' ' && line[j] != '\t') {
+                    at_start = false;
+                    break;
+                }
+            }
+            if (at_start) {
+                while (i < len) hl_out[i++] = HL_PREPROC;
+                break;
+            }
+        }
+
+        /* Block comment start */
+        if (i + 1 < len && line[i] == '/' && line[i + 1] == '*') {
+            *in_block_comment = true;
+            while (i < len) {
+                hl_out[i] = HL_COMMENT;
+                if (i + 1 < len && line[i] == '*' && line[i + 1] == '/') {
+                    hl_out[i + 1] = HL_COMMENT;
+                    i += 2;
+                    *in_block_comment = false;
+                    break;
+                }
+                i++;
+            }
+            continue;
+        }
+
+        /* Line comment: // */
+        if (i + 1 < len && line[i] == '/' && line[i + 1] == '/') {
+            while (i < len) hl_out[i++] = HL_COMMENT;
+            break;
+        }
+
+        /* String: "..." */
+        if (line[i] == '"') {
+            hl_out[i++] = HL_STRING;
+            while (i < len && line[i] != '"') {
+                if (line[i] == '\\' && i + 1 < len) {
+                    hl_out[i++] = HL_STRING;
+                }
+                hl_out[i++] = HL_STRING;
+            }
+            if (i < len) hl_out[i++] = HL_STRING;
+            continue;
+        }
+
+        /* Char: '...' */
+        if (line[i] == '\'') {
+            hl_out[i++] = HL_STRING;
+            while (i < len && line[i] != '\'') {
+                if (line[i] == '\\' && i + 1 < len) {
+                    hl_out[i++] = HL_STRING;
+                }
+                hl_out[i++] = HL_STRING;
+            }
+            if (i < len) hl_out[i++] = HL_STRING;
+            continue;
+        }
+
+        /* Numbers */
+        if (isdigit((unsigned char)line[i]) ||
+            (line[i] == '.' && i + 1 < len && isdigit((unsigned char)line[i + 1]))) {
+            /* Don't highlight numbers that are part of identifiers */
+            if (i > 0 && is_word_char(line[i - 1])) {
+                hl_out[i++] = HL_NORMAL;
+                continue;
+            }
+            while (i < len && (isdigit((unsigned char)line[i]) ||
+                               line[i] == '.' || line[i] == 'x' ||
+                               line[i] == 'X' ||
+                               (line[i] >= 'a' && line[i] <= 'f') ||
+                               (line[i] >= 'A' && line[i] <= 'F') ||
+                               line[i] == 'u' || line[i] == 'U' ||
+                               line[i] == 'l' || line[i] == 'L'))
+                hl_out[i++] = HL_NUMBER;
+            continue;
+        }
+
+        /* Identifiers / keywords / types */
+        if (isalpha((unsigned char)line[i]) || line[i] == '_') {
+            int start = i;
+            while (i < len && is_word_char(line[i])) i++;
+            int wlen = i - start;
+
+            /* Check if followed by '(' → function call */
+            int j = i;
+            while (j < len && (line[j] == ' ' || line[j] == '\t')) j++;
+            bool is_func = (j < len && line[j] == '(');
+
+            HighlightKind kind = HL_NORMAL;
+            if (word_match(line + start, wlen, c_keywords))
+                kind = HL_KEYWORD;
+            else if (word_match(line + start, wlen, c_types))
+                kind = HL_TYPE;
+            else if (word_match(line + start, wlen, c_constants))
+                kind = HL_CONSTANT;
+            else if (is_func)
+                kind = HL_FUNCTION;
+
+            for (int k = start; k < i; k++)
+                hl_out[k] = kind;
+            continue;
+        }
+
+        /* Operators */
+        if (strchr("+-*/%=!<>&|^~?:;,.(){}[]", line[i])) {
+            hl_out[i++] = HL_OPERATOR;
+            continue;
+        }
+
+        hl_out[i++] = HL_NORMAL;
+    }
+}
+
+static ThemeColor hl_to_color(ForgeTheme *t, HighlightKind kind) {
+    switch (kind) {
+        case HL_KEYWORD:   return t->keyword;
+        case HL_TYPE:      return t->type_color;
+        case HL_STRING:    return t->string_color;
+        case HL_NUMBER:    return t->number_color;
+        case HL_COMMENT:   return t->comment;
+        case HL_OPERATOR:  return t->operator_color;
+        case HL_PREPROC:   return t->preprocessor;
+        case HL_FUNCTION:  return t->function_color;
+        case HL_CONSTANT:  return t->constant;
+        default:           return t->fg;
+    }
+}
+
+/* ══════════════════════════════════════════════════════════════
+   render_frame — the main render loop
+
+   Now theme-aware with syntax highlighting, current-line
+   highlight, themed gutter, diagnostic markers, and themed
+   status bar.
+   ══════════════════════════════════════════════════════════════ */
+
 #define ESC_RESET       "\x1b[0m"
 #define ESC_BOLD        "\x1b[1m"
-#define ESC_REVERSE     "\x1b[7m"
+#define ESC_ITALIC      "\x1b[3m"
 #define ESC_HIDE_CURSOR "\x1b[?25l"
 #define ESC_SHOW_CURSOR "\x1b[?25h"
-/* Dim white for gutter numbers */
-#define ESC_GUTTER_ON   "\x1b[2;37m"
-/* Active line gutter highlight */
-#define ESC_GUTTER_ACT  "\x1b[0;33m"
 
 void render_frame(RenderState *r, Buffer *b, UIRegistry *ui,
                   int cx, int cy) {
     (void)ui;
 
-    int text_rows = r->height - 1;   /* last row reserved for status bar */
+    int text_rows = r->height - 1;
     adjust_scroll(r, cx, cy, text_rows);
 
     r->out_len = 0;
     stream_str(r, ESC_HIDE_CURSOR);
 
-    /* ── Clear on first paint / after resize ─────────────────*/
+    /* Full clear on first paint / resize */
     if (r->full_redraw) {
-        stream_str(r, "\x1b[2J");   /* erase whole display */
+        stream_str(r, "\x1b[2J");
+        /* Set terminal background color for the whole screen */
+        if (r->theme) {
+            stream_bg(r, r->theme->bg);
+            /* Fill every cell with background */
+            for (int y = 0; y < r->height; y++) {
+                stream_printf(r, "\x1b[%d;1H", y + 1);
+                for (int x = 0; x < r->width; x++)
+                    stream_append(r, " ", 1);
+            }
+        }
         r->full_redraw = false;
+        /* Poison front buffer so every line repaints */
+        for (int y = 0; y < r->height; y++)
+            memset(r->front_buffer[y], 0, r->width + 1);
     }
 
     size_t total_lines = buffer_line_count(b);
+
+    /* Track block comment state across lines */
+    bool in_block_comment = false;
+
+    /* We need to process highlight state from scroll_row=0 to handle
+       block comments that start above the viewport. For efficiency,
+       just scan from the beginning up to scroll_row. */
+    if (r->scroll_row > 0) {
+        for (int y = 0; y < r->scroll_row && (size_t)y < total_lines; y++) {
+            char *line = buffer_get_line(b, y);
+            if (line) {
+                int llen = (int)strlen(line);
+                HighlightKind *hl = malloc(llen * sizeof(HighlightKind));
+                memset(hl, 0, llen * sizeof(HighlightKind));
+                highlight_line(line, llen, hl, &in_block_comment);
+                free(hl);
+                free(line);
+            }
+        }
+    }
 
     /* ── Build back-buffer (text rows) ───────────────────────*/
     for (int y = 0; y < text_rows; y++) {
@@ -192,65 +485,207 @@ void render_frame(RenderState *r, Buffer *b, UIRegistry *ui,
                 free(line);
             }
         } else {
-            /* Past end-of-file: tilde placeholder */
             row[0] = '~';
         }
     }
 
-    /* ── Diff & emit text rows ────────────────────────────────*/
+    /* ── Diff & emit text rows with syntax highlighting ──────*/
+    /* Reset block comment state for actual rendering pass */
+    in_block_comment = false;
+    if (r->scroll_row > 0) {
+        for (int y = 0; y < r->scroll_row && (size_t)y < total_lines; y++) {
+            char *line = buffer_get_line(b, y);
+            if (line) {
+                int llen = (int)strlen(line);
+                HighlightKind *hl = malloc(llen * sizeof(HighlightKind));
+                memset(hl, 0, llen * sizeof(HighlightKind));
+                highlight_line(line, llen, hl, &in_block_comment);
+                free(hl);
+                free(line);
+            }
+        }
+    }
+
     for (int y = 0; y < text_rows; y++) {
-        if (memcmp(r->front_buffer[y], r->back_buffer[y], r->width) == 0)
+        if (memcmp(r->front_buffer[y], r->back_buffer[y], r->width) == 0
+            && !r->theme)
             continue;
 
-        /* Move to row, reset attrs, emit gutter with dim colour,
-           then emit the text portion in default colour.          */
         stream_printf(r, "\x1b[%d;1H", y + 1);
 
-        int is_cursor_row = ((r->scroll_row + y) == cy);
-
-        /* Gutter */
-        if (is_cursor_row)
-            stream_str(r, ESC_GUTTER_ACT);
-        else
-            stream_str(r, ESC_GUTTER_ON);
-
+        int logical = r->scroll_row + y;
+        int is_cursor_row = (logical == cy);
         char *row = r->back_buffer[y];
-        stream_append(r, row, GUTTER_WIDTH);
 
-        /* Text */
-        stream_str(r, ESC_RESET);
-        stream_append(r, row + GUTTER_WIDTH, r->width - GUTTER_WIDTH);
+        if (r->theme) {
+            ForgeTheme *t = r->theme;
+
+            /* Background for this row */
+            ThemeColor row_bg = is_cursor_row ? t->line_highlight : t->bg;
+
+            /* ── Gutter ─────────────────────────────────────*/
+            stream_bg(r, t->gutter_bg);
+            if (is_cursor_row)
+                stream_fg(r, t->gutter_active);
+            else
+                stream_fg(r, t->gutter_fg);
+
+            if ((size_t)logical < total_lines) {
+                stream_append(r, row, GUTTER_WIDTH);
+            } else {
+                /* Past EOF: dim tilde */
+                stream_fg(r, t->gutter_fg);
+                stream_append(r, "~    ", 5);
+            }
+
+            /* ── Diagnostic marker after gutter ─────────────*/
+            int diag = render_get_diag_severity(r, logical);
+            if (diag == DIAG_ERROR) {
+                stream_fg(r, t->error);
+                stream_bg(r, row_bg);
+                stream_str(r, "●");
+            } else if (diag == DIAG_WARNING) {
+                stream_fg(r, t->warning);
+                stream_bg(r, row_bg);
+                stream_str(r, "▲");
+            } else {
+                stream_bg(r, row_bg);
+                stream_append(r, " ", 1);
+            }
+
+            /* ── Text portion with syntax highlighting ──────*/
+            if ((size_t)logical < total_lines) {
+                char *line = buffer_get_line(b, logical);
+                int llen = line ? (int)strlen(line) : 0;
+
+                /* Highlight the full line */
+                HighlightKind *hl = NULL;
+                if (llen > 0) {
+                    hl = malloc(llen * sizeof(HighlightKind));
+                    memset(hl, 0, llen * sizeof(HighlightKind));
+                    highlight_line(line, llen, hl, &in_block_comment);
+                } else {
+                    /* Empty line — still need to maintain block comment state */
+                    HighlightKind dummy;
+                    highlight_line("", 0, &dummy, &in_block_comment);
+                }
+
+                int text_cols = r->width - GUTTER_WIDTH - 1; /* -1 for diag col */
+                int start_col = r->scroll_col;
+                ThemeColor prev_color = t->fg;
+                bool first = true;
+
+                stream_bg(r, row_bg);
+
+                for (int x = 0; x < text_cols; x++) {
+                    int src_col = start_col + x;
+                    if (src_col < llen && line) {
+                        HighlightKind kind = hl[src_col];
+                        ThemeColor fc = hl_to_color(t, kind);
+
+                        if (first || fc.r != prev_color.r ||
+                            fc.g != prev_color.g || fc.b != prev_color.b) {
+                            stream_fg(r, fc);
+                            if (kind == HL_KEYWORD)
+                                stream_str(r, ESC_BOLD);
+                            else if (kind == HL_COMMENT)
+                                stream_str(r, ESC_ITALIC);
+                            prev_color = fc;
+                            first = false;
+                        }
+                        char ch = line[src_col];
+                        stream_append(r, &ch, 1);
+                    } else {
+                        stream_append(r, " ", 1);
+                    }
+                }
+
+                if (hl) free(hl);
+                if (line) free(line);
+            } else {
+                /* Past EOF: fill with background */
+                int fill = r->width - GUTTER_WIDTH - 1;
+                stream_bg(r, row_bg);
+                for (int x = 0; x < fill; x++)
+                    stream_append(r, " ", 1);
+            }
+
+            stream_str(r, ESC_RESET);
+        } else {
+            /* Fallback: no theme, basic ANSI colors */
+            if (is_cursor_row)
+                stream_str(r, "\x1b[0;33m");
+            else
+                stream_str(r, "\x1b[2;37m");
+
+            stream_append(r, row, GUTTER_WIDTH);
+            stream_str(r, ESC_RESET);
+            stream_append(r, row + GUTTER_WIDTH, r->width - GUTTER_WIDTH);
+        }
 
         memcpy(r->front_buffer[y], row, r->width);
     }
 
-    /* ── Status bar (always repaint) ─────────────────────────*/
+    /* ── Status bar ──────────────────────────────────────────*/
     {
         stream_printf(r, "\x1b[%d;1H", r->height);
-        stream_str(r, ESC_REVERSE ESC_BOLD);
 
-        /* Left side: editor name + status message */
-        char left[256];
-        int  ll = snprintf(left, sizeof(left), "  FORGE  │  %s",
-                           r->status_msg[0] ? r->status_msg : "ready");
-        stream_append(r, left, ll < (int)sizeof(left) - 1 ? ll : (int)sizeof(left) - 1);
+        if (r->theme) {
+            ForgeTheme *t = r->theme;
+            /* Mode badge with accent color */
+            stream_bg(r, t->statusbar_accent);
+            stream_fg(r, t->statusbar_bg);
+            stream_str(r, ESC_BOLD);
+            stream_str(r, "  FORGE  ");
+            stream_str(r, ESC_RESET);
 
-        /* Right side: position indicator */
-        char right[64];
-        int  rl = snprintf(right, sizeof(right), " Ln %d, Col %d  ",
-                           cy + 1, cx + 1);
+            /* Separator */
+            stream_bg(r, t->statusbar_bg);
+            stream_fg(r, t->statusbar_accent);
+            stream_str(r, " │ ");
 
-        /* Fill gap between left and right */
-        int pad = r->width - ll - rl;
-        for (int i = 0; i < pad; i++) stream_append(r, " ", 1);
-        stream_append(r, right, rl < (int)sizeof(right) - 1 ? rl : (int)sizeof(right) - 1);
+            /* Status message */
+            stream_fg(r, t->statusbar_fg);
+            stream_bg(r, t->statusbar_bg);
+            const char *msg = r->status_msg[0] ? r->status_msg : "ready";
+            stream_str(r, msg);
+
+            /* Right side: position + theme name */
+            char right[128];
+            int rl = snprintf(right, sizeof(right), " %s │ Ln %d, Col %d  ",
+                              t->name, cy + 1, cx + 1);
+
+            int left_used = 9 + 3 + (int)strlen(msg); /* "  FORGE  " + " │ " + msg */
+            int pad = r->width - left_used - rl;
+            for (int i = 0; i < pad; i++) stream_append(r, " ", 1);
+
+            stream_fg(r, t->statusbar_fg);
+            stream_append(r, right, rl < (int)sizeof(right) - 1 ? rl : (int)sizeof(right) - 1);
+        } else {
+            /* Fallback: reverse video status */
+            stream_str(r, "\x1b[7m\x1b[1m");
+
+            char left[256];
+            int ll = snprintf(left, sizeof(left), "  FORGE  │  %s",
+                              r->status_msg[0] ? r->status_msg : "ready");
+            stream_append(r, left,
+                          ll < (int)sizeof(left) - 1 ? ll : (int)sizeof(left) - 1);
+
+            char right[64];
+            int rl = snprintf(right, sizeof(right), " Ln %d, Col %d  ",
+                              cy + 1, cx + 1);
+            int pad = r->width - ll - rl;
+            for (int i = 0; i < pad; i++) stream_append(r, " ", 1);
+            stream_append(r, right,
+                          rl < (int)sizeof(right) - 1 ? rl : (int)sizeof(right) - 1);
+        }
 
         stream_str(r, ESC_RESET);
     }
 
-    /* ── Place cursor ─────────────────────────────────────────*/
+    /* ── Place cursor ────────────────────────────────────────*/
     int screen_row = cy - r->scroll_row + 1;
-    int screen_col = cx - r->scroll_col + GUTTER_WIDTH + 1;
+    int screen_col = cx - r->scroll_col + GUTTER_WIDTH + 1 + 1; /* +1 for diag col */
     stream_printf(r, "\x1b[%d;%dH", screen_row, screen_col);
     stream_str(r, ESC_SHOW_CURSOR);
 
