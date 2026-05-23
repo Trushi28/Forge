@@ -1,6 +1,7 @@
 CC      = gcc
 CFLAGS  = -Wall -Wextra -std=c11 -O2 -Wno-unused-result -Wno-format-truncation -D_GNU_SOURCE
 SRCDIR  = core
+BUILDDIR = build
 TARGET  = forge
 
 SRCS = $(SRCDIR)/arena.c      \
@@ -13,22 +14,30 @@ SRCS = $(SRCDIR)/arena.c      \
        $(SRCDIR)/lsp.c        \
        $(SRCDIR)/completion.c \
        $(SRCDIR)/palette.c    \
+       $(SRCDIR)/undo.c       \
+       $(SRCDIR)/git.c        \
+       $(SRCDIR)/plugin.c     \
+       $(SRCDIR)/ipc.c        \
        $(SRCDIR)/main.c
 
-OBJS = $(SRCS:.c=.o)
+OBJS = $(patsubst $(SRCDIR)/%.c,$(BUILDDIR)/%.o,$(SRCS))
 
 .PHONY: all clean debug
 
-all: $(TARGET)
+all: $(BUILDDIR) $(TARGET)
+
+$(BUILDDIR):
+	mkdir -p $(BUILDDIR)
 
 $(TARGET): $(OBJS)
-	$(CC) $(CFLAGS) -o $@ $^
+	$(CC) $(CFLAGS) -o $@ $^ -lgit2 -ldl
 
-$(SRCDIR)/%.o: $(SRCDIR)/%.c
+$(BUILDDIR)/%.o: $(SRCDIR)/%.c | $(BUILDDIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 debug: CFLAGS = -Wall -Wextra -std=c11 -g -DDEBUG -Wno-unused-result -Wno-format-truncation -D_GNU_SOURCE
-debug: $(TARGET)
+debug: $(BUILDDIR) $(TARGET)
 
 clean:
-	rm -f $(SRCDIR)/*.o $(TARGET)
+	rm -rf $(BUILDDIR) $(TARGET)
+	rm -f $(SRCDIR)/*.o

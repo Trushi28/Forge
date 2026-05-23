@@ -2,6 +2,7 @@
 #define FORGE_RENDER_H
 
 #include "buffer.h"
+#include "git.h"
 #include "ui.h"
 #include "theme.h"
 #include <stdbool.h>
@@ -44,6 +45,9 @@ typedef struct RenderState {
 
     /* Cursor positions for UI widgets */
     int        cx, cy;
+
+    /* Git state pointer (set by main, read by widgets) */
+    GitState  *git;
 } RenderState;
 
 void ui_register_builtins(UIRegistry *ui);

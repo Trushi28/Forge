@@ -2,17 +2,22 @@
 #include "buffer.h"
 #include "completion.h"
 #include "config.h"
+#include "git.h"
 #include "input.h"
+#include "ipc.h"
 #include "lsp.h"
 #include "palette.h"
+#include "plugin.h"
 #include "render.h"
 #include "theme.h"
 #include "ui.h"
+#include "undo.h"
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 Arena *session_arena = NULL;
@@ -28,6 +33,10 @@ typedef struct {
     LSPClient     *lsp;
     CompletionState completion;
     PaletteState   palette;
+    UndoStack      undo;
+    GitState       git;
+    PluginHost     plugins;
+    IPCBridge      ipc;
 
     const char    *filepath;
     char           file_uri[LSP_MAX_URI];
@@ -39,7 +48,10 @@ typedef struct {
     int            hover_row, hover_col;
 
     int            config_poll_counter;
-    int            lsp_change_counter;
+
+    /* LSP time-based debounce: sync buffer after 300ms of idle */
+    bool           lsp_dirty;       /* buffer changed since last sync? */
+    struct timespec lsp_last_edit;  /* timestamp of last edit */
 } EditorState;
 
 static EditorState E;
@@ -49,6 +61,19 @@ static volatile int g_resized = 0;
 static void sigwinch_handler(int sig) {
     (void)sig;
     g_resized = 1;
+}
+
+/* ── Time helpers ───────────────────────────────────────────── */
+static void get_time(struct timespec *ts) {
+    clock_gettime(CLOCK_MONOTONIC, ts);
+}
+
+/* Returns milliseconds elapsed since `since` */
+static long ms_since(struct timespec *since) {
+    struct timespec now;
+    get_time(&now);
+    return (now.tv_sec - since->tv_sec) * 1000 +
+           (now.tv_nsec - since->tv_nsec) / 1000000;
 }
 
 /* ── File loading ───────────────────────────────────────────── */
@@ -118,6 +143,71 @@ static void get_word_at_cursor(char *word, int max_len) {
     free(line);
 }
 
+/* ── Mark buffer as modified (shared helper) ────────────────── */
+static void mark_modified(void) {
+    E.modified = true;
+    E.lsp_dirty = true;
+    get_time(&E.lsp_last_edit);
+    render_set_status(&E.render, "%s [+]",
+                      E.filepath ? E.filepath : "[new file]");
+}
+
+/* ── LSP time-based debounce ────────────────────────────────── */
+static void lsp_debounce_sync(void) {
+    if (!E.lsp || !E.lsp->running || !E.lsp->initialized) return;
+    if (!E.lsp_dirty) return;
+
+    /* Sync after 300ms of idle */
+    if (ms_since(&E.lsp_last_edit) >= 300) {
+        char *text = buffer_get_text(E.buf);
+        if (text) {
+            lsp_send_did_change(E.lsp, E.file_uri, text);
+            free(text);
+        }
+        E.lsp_dirty = false;
+    }
+}
+
+/* ── Request completion (auto-trigger) ──────────────────────── */
+static bool is_identifier_char(int key) {
+    return (key >= 'a' && key <= 'z') || (key >= 'A' && key <= 'Z') ||
+           (key >= '0' && key <= '9') || key == '_';
+}
+
+static bool is_completion_trigger(int key) {
+    return key == '.' || key == '>' || key == ':' || key == '/';
+}
+
+static void maybe_request_completion(int key) {
+    if (!E.lsp || !E.lsp->running || !E.lsp->initialized ||
+        !E.cfg.lsp_completion)
+        return;
+
+    if (is_completion_trigger(key)) {
+        /* Always trigger on special characters */
+        lsp_request_completion(E.lsp, E.file_uri, E.cy, E.cx);
+    } else if (is_identifier_char(key)) {
+        /* Trigger on identifier chars if we have at least 2 chars typed */
+        char word[128];
+        get_word_at_cursor(word, sizeof(word));
+        if ((int)strlen(word) >= 2) {
+            lsp_request_completion(E.lsp, E.file_uri, E.cy, E.cx);
+        }
+    }
+}
+
+/* ── Update completion filter (shared for backspace + delete) ── */
+static void update_completion_on_edit(void) {
+    if (!E.completion.visible) return;
+
+    char word[128];
+    get_word_at_cursor(word, sizeof(word));
+    completion_update_filter(&E.completion, word);
+    if (E.completion.filtered_count == 0)
+        completion_hide(&E.completion);
+    E.render.full_redraw = true;
+}
+
 /* ── Palette command callbacks ──────────────────────────────── */
 
 static void cmd_save(void *ctx) {
@@ -126,9 +216,15 @@ static void cmd_save(void *ctx) {
         if (buffer_save(E.buf, E.filepath) == 0) {
             render_set_status(&E.render, "Saved  %s", E.filepath);
             E.modified = false;
+
+            /* Fire shell hook */
+            if (E.cfg.hook_on_save[0])
+                plugin_run_hook(E.cfg.hook_on_save, E.filepath);
         } else {
             render_set_status(&E.render, "ERROR: could not save  %s", E.filepath);
         }
+    } else {
+        render_set_status(&E.render, "No file path — use :save <path>");
     }
 }
 
@@ -203,6 +299,28 @@ static void cmd_lsp_restart(void *ctx) {
             render_set_status(&E.render, "LSP: restarting %s...", server);
         }
     }
+}
+
+static void cmd_toggle_blame(void *ctx) {
+    (void)ctx;
+    E.git.blame_visible = !E.git.blame_visible;
+    if (E.git.blame_visible && E.git.repo_open && E.filepath) {
+        git_refresh_blame(&E.git, E.filepath);
+    }
+    E.render.full_redraw = true;
+    render_set_status(&E.render, "Blame: %s",
+                      E.git.blame_visible ? "on" : "off");
+}
+
+static void cmd_toggle_timeline(void *ctx) {
+    (void)ctx;
+    E.git.timeline_visible = !E.git.timeline_visible;
+    if (E.git.timeline_visible && E.git.repo_open && E.filepath) {
+        git_refresh_log(&E.git, E.filepath);
+    }
+    E.render.full_redraw = true;
+    render_set_status(&E.render, "Timeline: %s",
+                      E.git.timeline_visible ? "on" : "off");
 }
 
 /* ── Hover rendering ────────────────────────────────────────── */
@@ -304,16 +422,6 @@ static void render_hover(void) {
 
 /* ── LSP helpers ────────────────────────────────────────────── */
 
-static void lsp_sync_buffer(void) {
-    if (!E.lsp || !E.lsp->running || !E.lsp->initialized) return;
-
-    char *text = buffer_get_text(E.buf);
-    if (text) {
-        lsp_send_did_change(E.lsp, E.file_uri, text);
-        free(text);
-    }
-}
-
 static void lsp_update_diagnostics(void) {
     if (!E.lsp || !E.lsp->diagnostics_ready) return;
 
@@ -331,10 +439,6 @@ static void lsp_update_diagnostics(void) {
     }
     E.lsp->diagnostics_ready = false;
     E.render.full_redraw = true;
-}
-
-static bool is_completion_trigger(int key) {
-    return key == '.' || key == '>' || key == ':' || key == '/';
 }
 
 /* ══════════════════════════════════════════════════════════════
@@ -368,6 +472,27 @@ int main(int argc, char **argv) {
     render_init(&E.render, term_cols, term_rows);
     render_set_theme(&E.render, &E.theme);
 
+    /* ── Initialize undo ──────────────────────────────────── */
+    undo_init(&E.undo);
+
+    /* ── Initialize git ───────────────────────────────────── */
+    char cwd[1024];
+    bool has_cwd = (getcwd(cwd, sizeof(cwd)) != NULL);
+    if (has_cwd) {
+        git_state_init(&E.git, cwd);
+        if (E.git.repo_open && E.filepath) {
+            git_refresh_diff(&E.git, E.filepath);
+            git_refresh_branch(&E.git);
+        }
+    }
+
+    /* ── Initialize plugins ───────────────────────────────── */
+    plugin_host_init(&E.plugins);
+
+    /* ── Initialize IPC (try to connect to forge-net) ─────── */
+    ipc_init(&E.ipc);
+    /* Don't connect yet — forge-net may not be running */
+
     /* ── Initialize completion ────────────────────────────── */
     completion_init(&E.completion);
 
@@ -381,6 +506,8 @@ int main(int argc, char **argv) {
     palette_add_command(&E.palette, "Open File",         "Open a file",            "",        cmd_open_file, NULL);
     palette_add_command(&E.palette, "Format File",       "Format with formatter",  "",        cmd_format, NULL);
     palette_add_command(&E.palette, "Restart LSP",       "Restart language server", "",       cmd_lsp_restart, NULL);
+    palette_add_command(&E.palette, "Toggle Blame",      "Show/hide git blame",    "",        cmd_toggle_blame, NULL);
+    palette_add_command(&E.palette, "Toggle Timeline",   "Show/hide git timeline", "Ctrl+T",  cmd_toggle_timeline, NULL);
 
     /* ── Start LSP ────────────────────────────────────────── */
     E.lsp = NULL;
@@ -394,10 +521,15 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (E.filepath)
-        render_set_status(&E.render, "%s", E.filepath);
-    else
+    if (E.filepath) {
+        if (E.git.repo_open)
+            render_set_status(&E.render, "%s  [%s]",
+                              E.filepath, E.git.branch);
+        else
+            render_set_status(&E.render, "%s", E.filepath);
+    } else {
         render_set_status(&E.render, "[new file]   ^S save   ^Q quit   ^P palette");
+    }
 
     /* Initial full clear */
     (void)write(STDOUT_FILENO, "\x1b[2J\x1b[H", 7);
@@ -407,6 +539,8 @@ int main(int argc, char **argv) {
     E.running  = true;
     E.modified = false;
     E.show_hover = false;
+    E.lsp_dirty = false;
+    get_time(&E.lsp_last_edit);
 
     /* Send didOpen once LSP initializes — checked in poll loop */
     bool lsp_did_open_sent = false;
@@ -432,6 +566,9 @@ int main(int argc, char **argv) {
                 render_set_status(&E.render, "config reloaded");
             }
         }
+
+        /* LSP time-based debounce — sync if idle for 300ms */
+        lsp_debounce_sync();
 
         /* Poll LSP */
         if (E.lsp && E.lsp->running) {
@@ -511,11 +648,12 @@ int main(int argc, char **argv) {
 
         int key = input_read_key();
 
-        /* Dismiss hover on any key */
+        /* Dismiss hover on any key — but DON'T consume the key!
+           Re-process it below instead of `continue`. */
         if (E.show_hover) {
             E.show_hover = false;
             E.render.full_redraw = true;
-            continue;
+            /* Fall through to process the key normally */
         }
 
         /* ── Palette takes priority ──────────────────────── */
@@ -547,6 +685,10 @@ int main(int argc, char **argv) {
                     E.cx = 0;
                     E.cy = 0;
 
+                    /* Reset undo for new file */
+                    undo_free(&E.undo);
+                    undo_init(&E.undo);
+
                     /* Restart LSP for new file */
                     if (E.lsp) { lsp_stop(E.lsp); E.lsp = NULL; }
                     lsp_did_open_sent = false;
@@ -559,6 +701,16 @@ int main(int argc, char **argv) {
                                                 sizeof(E.file_uri));
                         }
                     }
+
+                    /* Refresh git for new file */
+                    if (E.git.repo_open) {
+                        git_refresh_diff(&E.git, E.filepath);
+                        git_refresh_branch(&E.git);
+                    }
+
+                    /* Fire on_open hook */
+                    if (E.cfg.hook_on_open[0])
+                        plugin_run_hook(E.cfg.hook_on_open, E.filepath);
 
                     E.modified = false;
                     render_set_status(&E.render, "%s", E.filepath);
@@ -591,6 +743,16 @@ int main(int argc, char **argv) {
                     int prefix_len = E.cx - E.completion.anchor_cx;
                     if (prefix_len > 0) {
                         size_t pos = buffer_get_offset(E.buf, E.cx, E.cy);
+                        char *deleted = buffer_get_line(E.buf, E.cy);
+                        /* Record the delete for undo */
+                        if (deleted) {
+                            int dstart = E.completion.anchor_cx;
+                            if (dstart >= 0 && dstart + prefix_len <= (int)strlen(deleted)) {
+                                undo_record(&E.undo, UNDO_DELETE, pos - prefix_len,
+                                            deleted + dstart, prefix_len, E.cx, E.cy);
+                            }
+                            free(deleted);
+                        }
                         buffer_delete(E.buf, pos - prefix_len, prefix_len);
                         E.cx -= prefix_len;
                     }
@@ -602,10 +764,9 @@ int main(int argc, char **argv) {
                     size_t pos = buffer_get_offset(E.buf, E.cx, E.cy);
                     int tlen = (int)strlen(text);
                     buffer_insert(E.buf, pos, text, tlen);
+                    undo_record(&E.undo, UNDO_INSERT, pos, text, tlen, E.cx, E.cy);
                     E.cx += tlen;
-                    E.modified = true;
-                    render_set_status(&E.render, "%s [+]",
-                                      E.filepath ? E.filepath : "[new file]");
+                    mark_modified();
                 }
                 completion_hide(&E.completion);
                 E.render.full_redraw = true;
@@ -651,6 +812,60 @@ int main(int argc, char **argv) {
             continue;
         }
 
+        /* ── Ctrl+T: Toggle Git Timeline ─────────────────── */
+        if (key == KEY_CTRL_T) {
+            cmd_toggle_timeline(NULL);
+            continue;
+        }
+
+        /* ── Ctrl+Z: Undo ────────────────────────────────── */
+        if (key == (KEY_CTRL_A + 25)) {  /* Ctrl+Z = 26 */
+            UndoEntry *e = undo_pop(&E.undo);
+            if (e) {
+                if (e->type == UNDO_INSERT) {
+                    /* Was an insert: delete the text to undo */
+                    buffer_delete(E.buf, e->pos, e->len);
+                } else {
+                    /* Was a delete: re-insert the text to undo */
+                    buffer_insert(E.buf, e->pos, e->text, e->len);
+                }
+                E.cx = e->cx;
+                E.cy = e->cy;
+                clamp_cx(&E.cx, E.cy);
+                E.render.full_redraw = true;
+                E.lsp_dirty = true;
+                get_time(&E.lsp_last_edit);
+                render_set_status(&E.render, "Undo");
+            } else {
+                render_set_status(&E.render, "Nothing to undo");
+            }
+            continue;
+        }
+
+        /* ── Ctrl+Y: Redo ────────────────────────────────── */
+        if (key == (KEY_CTRL_A + 24)) {  /* Ctrl+Y = 25 */
+            UndoEntry *e = undo_redo(&E.undo);
+            if (e) {
+                if (e->type == UNDO_INSERT) {
+                    /* Was an insert: re-insert */
+                    buffer_insert(E.buf, e->pos, e->text, e->len);
+                } else {
+                    /* Was a delete: re-delete */
+                    buffer_delete(E.buf, e->pos, e->len);
+                }
+                E.cx = e->cx;
+                E.cy = e->cy;
+                clamp_cx(&E.cx, E.cy);
+                E.render.full_redraw = true;
+                E.lsp_dirty = true;
+                get_time(&E.lsp_last_edit);
+                render_set_status(&E.render, "Redo");
+            } else {
+                render_set_status(&E.render, "Nothing to redo");
+            }
+            continue;
+        }
+
         /* ── Quit ─────────────────────────────────────────── */
         if (key == KEY_CTRL_Q) {
             E.running = false;
@@ -658,9 +873,19 @@ int main(int argc, char **argv) {
         /* ── Save ─────────────────────────────────────────── */
         } else if (key == KEY_CTRL_S) {
             cmd_save(NULL);
+            /* Immediately sync LSP buffer on save */
+            if (E.lsp && E.lsp->running && E.lsp->initialized) {
+                char *text = buffer_get_text(E.buf);
+                if (text) {
+                    lsp_send_did_change(E.lsp, E.file_uri, text);
+                    free(text);
+                }
+                E.lsp_dirty = false;
+            }
+            /* Refresh git diff after save */
+            if (E.git.repo_open && E.filepath)
+                git_refresh_diff(&E.git, E.filepath);
             E.render.full_redraw = true;
-            render_frame(&E.render, E.buf, &E.ui, E.cx, E.cy);
-            continue;
 
         /* ── Navigation ───────────────────────────────────── */
         } else if (key == KEY_ARROW_UP) {
@@ -728,53 +953,67 @@ int main(int argc, char **argv) {
             insert_buf[ilen] = '\0';
 
             buffer_insert(E.buf, pos, insert_buf, ilen);
+            undo_record(&E.undo, UNDO_INSERT, pos, insert_buf, ilen, E.cx, E.cy);
             E.cy++;
             E.cx = indent;
-            E.modified = true;
-            E.lsp_change_counter++;
-            render_set_status(&E.render, "%s [+]",
-                              E.filepath ? E.filepath : "[new file]");
+            mark_modified();
 
         /* ── Backspace ────────────────────────────────────── */
         } else if (key == KEY_BACKSPACE) {
             size_t pos = buffer_get_offset(E.buf, E.cx, E.cy);
             if (pos > 0) {
+                /* Get the character being deleted for undo */
+                char *text = buffer_get_text(E.buf);
+                char deleted_char = text ? text[pos - 1] : '\0';
+                free(text);
+
+                int old_cx = E.cx, old_cy = E.cy;
                 buffer_delete(E.buf, pos - 1, 1);
+
                 if (E.cx > 0) {
                     E.cx--;
                 } else if (E.cy > 0) {
                     E.cy--;
                     E.cx = line_len(E.buf, E.cy);
                 }
-                E.modified = true;
-                E.lsp_change_counter++;
-                render_set_status(&E.render, "%s [+]",
-                                  E.filepath ? E.filepath : "[new file]");
+
+                /* Record for undo (try merging consecutive backspaces) */
+                if (!undo_try_merge(&E.undo, UNDO_DELETE, pos - 1,
+                                    &deleted_char, 1, old_cx, old_cy)) {
+                    undo_record(&E.undo, UNDO_DELETE, pos - 1,
+                                &deleted_char, 1, old_cx, old_cy);
+                }
+
+                mark_modified();
             }
 
             /* Update completion filter if visible */
-            if (E.completion.visible) {
-                char word[128];
-                get_word_at_cursor(word, sizeof(word));
-                completion_update_filter(&E.completion, word);
-                if (E.completion.filtered_count == 0)
-                    completion_hide(&E.completion);
-                E.render.full_redraw = true;
-            }
+            update_completion_on_edit();
 
         /* ── Delete (forward) ─────────────────────────────── */
         } else if (key == KEY_DELETE) {
             size_t pos = buffer_get_offset(E.buf, E.cx, E.cy);
-            char *text = buffer_get_text(E.buf);
-            size_t tlen = text ? strlen(text) : 0;
-            free(text);
+            size_t tlen = buffer_total_len(E.buf);  /* No alloc! */
             if (pos < tlen) {
+                /* Get the character being deleted for undo */
+                char *text = buffer_get_text(E.buf);
+                char deleted_char = text ? text[pos] : '\0';
+                free(text);
+
                 buffer_delete(E.buf, pos, 1);
-                E.modified = true;
-                E.lsp_change_counter++;
-                render_set_status(&E.render, "%s [+]",
-                                  E.filepath ? E.filepath : "[new file]");
+
+                /* Record for undo */
+                if (!undo_try_merge(&E.undo, UNDO_DELETE, pos,
+                                    &deleted_char, 1, E.cx, E.cy)) {
+                    undo_record(&E.undo, UNDO_DELETE, pos,
+                                &deleted_char, 1, E.cx, E.cy);
+                }
+
+                mark_modified();
             }
+
+            /* FIX: Update completion filter on forward delete too */
+            update_completion_on_edit();
 
         /* ── Tab ──────────────────────────────────────────── */
         } else if (key == '\t') {
@@ -794,8 +1033,9 @@ int main(int argc, char **argv) {
                     size_t pos = buffer_get_offset(E.buf, E.cx, E.cy);
                     int tlen = (int)strlen(ins);
                     buffer_insert(E.buf, pos, ins, tlen);
+                    undo_record(&E.undo, UNDO_INSERT, pos, ins, tlen, E.cx, E.cy);
                     E.cx += tlen;
-                    E.modified = true;
+                    mark_modified();
                 }
                 completion_hide(&E.completion);
                 E.render.full_redraw = true;
@@ -803,17 +1043,19 @@ int main(int argc, char **argv) {
                 int spaces = E.cfg.tab_width - (E.cx % E.cfg.tab_width);
                 size_t pos = buffer_get_offset(E.buf, E.cx, E.cy);
                 if (E.cfg.use_spaces) {
-                    for (int i = 0; i < spaces; i++)
-                        buffer_insert(E.buf, pos + i, " ", 1);
+                    char tab_buf[16];
+                    for (int i = 0; i < spaces && i < 15; i++)
+                        tab_buf[i] = ' ';
+                    tab_buf[spaces] = '\0';
+                    buffer_insert(E.buf, pos, tab_buf, spaces);
+                    undo_record(&E.undo, UNDO_INSERT, pos, tab_buf, spaces, E.cx, E.cy);
                     E.cx += spaces;
                 } else {
                     buffer_insert(E.buf, pos, "\t", 1);
+                    undo_record(&E.undo, UNDO_INSERT, pos, "\t", 1, E.cx, E.cy);
                     E.cx++;
                 }
-                E.modified = true;
-                E.lsp_change_counter++;
-                render_set_status(&E.render, "%s [+]",
-                                  E.filepath ? E.filepath : "[new file]");
+                mark_modified();
             }
 
         /* ── Printable characters ─────────────────────────── */
@@ -821,17 +1063,17 @@ int main(int argc, char **argv) {
             char c = (char)key;
             size_t pos = buffer_get_offset(E.buf, E.cx, E.cy);
             buffer_insert(E.buf, pos, &c, 1);
-            E.cx++;
-            E.modified = true;
-            E.lsp_change_counter++;
-            render_set_status(&E.render, "%s [+]",
-                              E.filepath ? E.filepath : "[new file]");
 
-            /* Trigger completion on specific characters */
-            if (E.lsp && E.lsp->running && E.lsp->initialized &&
-                E.cfg.lsp_completion && is_completion_trigger(key)) {
-                lsp_request_completion(E.lsp, E.file_uri, E.cy, E.cx);
+            /* Try merging with previous undo entry for word-level undo */
+            if (!undo_try_merge(&E.undo, UNDO_INSERT, pos, &c, 1, E.cx, E.cy)) {
+                undo_record(&E.undo, UNDO_INSERT, pos, &c, 1, E.cx, E.cy);
             }
+
+            E.cx++;
+            mark_modified();
+
+            /* Auto-trigger completion on identifier chars and trigger chars */
+            maybe_request_completion(key);
 
             /* Update completion filter if visible */
             if (E.completion.visible) {
@@ -840,12 +1082,6 @@ int main(int argc, char **argv) {
                 completion_update_filter(&E.completion, word);
                 E.render.full_redraw = true;
             }
-        }
-
-        /* Sync buffer to LSP periodically (every 5 edits) */
-        if (E.lsp_change_counter >= 5) {
-            E.lsp_change_counter = 0;
-            lsp_sync_buffer();
         }
     }
 
@@ -856,11 +1092,19 @@ int main(int argc, char **argv) {
         lsp_stop(E.lsp);
     }
 
+    /* Fire on_close hook */
+    if (E.cfg.hook_on_close[0] && E.filepath)
+        plugin_run_hook(E.cfg.hook_on_close, E.filepath);
+
     (void)write(STDOUT_FILENO, "\x1b[?25h", 6);     /* show cursor  */
     (void)write(STDOUT_FILENO, "\x1b[2J\x1b[H", 7); /* clear screen */
     (void)write(STDOUT_FILENO, "\x1b[0m", 4);        /* reset colors */
 
     render_free(&E.render);
+    undo_free(&E.undo);
+    git_state_free(&E.git);
+    plugin_host_free(&E.plugins);
+    ipc_free(&E.ipc);
     buffer_free(E.buf);
     arena_free(session_arena);
 

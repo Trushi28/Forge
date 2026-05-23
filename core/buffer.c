@@ -384,6 +384,10 @@ static size_t doc_len(Buffer *b) {
     return (b->root != b->nil) ? b->root->subtree_len : 0;
 }
 
+size_t buffer_total_len(Buffer *b) {
+    return doc_len(b);
+}
+
 char *buffer_get_text(Buffer *b) {
     cache_rebuild(b);
     size_t len  = doc_len(b);

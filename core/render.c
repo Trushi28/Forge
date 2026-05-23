@@ -86,6 +86,7 @@ void render_init(RenderState *r, int width, int height) {
     r->status_msg[0] = '\0';
     r->full_redraw   = true;
     r->theme         = NULL;
+    r->git           = NULL;
     r->diag_count    = 0;
     alloc_cell_bufs(r);
 }
@@ -468,7 +469,14 @@ static void statusbar_widget_render(Widget *self, RenderState *r, Buffer *b) {
         stream_str(r, msg);
 
         char right[128];
-        int rl = snprintf(right, sizeof(right), " %s │ Ln %d, Col %d  ",
+        const char *branch = (r->git && r->git->repo_open && r->git->branch[0])
+                               ? r->git->branch : NULL;
+        int rl;
+        if (branch)
+            rl = snprintf(right, sizeof(right), "  %s │ %s │ Ln %d, Col %d  ",
+                          branch, t->name, cy + 1, cx + 1);
+        else
+            rl = snprintf(right, sizeof(right), " %s │ Ln %d, Col %d  ",
                           t->name, cy + 1, cx + 1);
 
         int left_used = 9 + 3 + (int)strlen(msg);
@@ -641,7 +649,7 @@ void render_frame(RenderState *r, Buffer *b, UIRegistry *ui,
                 stream_append(r, "~    ", 5);
             }
 
-            /* ── Diagnostic marker after gutter ─────────────*/
+            /* ── Diagnostic / Git diff marker after gutter ──*/
             int diag = render_get_diag_severity(r, logical);
             if (diag == DIAG_ERROR) {
                 stream_fg(r, t->error);
@@ -651,6 +659,25 @@ void render_frame(RenderState *r, Buffer *b, UIRegistry *ui,
                 stream_fg(r, t->warning);
                 stream_bg(r, row_bg);
                 stream_str(r, "▲");
+            } else if (r->git && r->git->repo_open) {
+                /* Show git diff marker if no diagnostic */
+                GitDiffStatus ds = git_line_diff_status(r->git, logical);
+                if (ds == GIT_DIFF_ADDED) {
+                    stream_fg(r, t->hint);  /* green */
+                    stream_bg(r, row_bg);
+                    stream_str(r, "┃");
+                } else if (ds == GIT_DIFF_MODIFIED) {
+                    stream_fg(r, t->warning);  /* yellow */
+                    stream_bg(r, row_bg);
+                    stream_str(r, "┃");
+                } else if (ds == GIT_DIFF_DELETED) {
+                    stream_fg(r, t->error);  /* red */
+                    stream_bg(r, row_bg);
+                    stream_str(r, "▁");
+                } else {
+                    stream_bg(r, row_bg);
+                    stream_append(r, " ", 1);
+                }
             } else {
                 stream_bg(r, row_bg);
                 stream_append(r, " ", 1);

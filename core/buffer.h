@@ -44,5 +44,6 @@ char   *buffer_get_line  (Buffer *b, int line_idx); /* caller frees */
 size_t  buffer_get_offset(Buffer *b, int cx, int cy);
 size_t  buffer_line_count(Buffer *b);
 int     buffer_save      (Buffer *b, const char *path);
+size_t  buffer_total_len (Buffer *b);  /* total byte length, no allocation */
 
 #endif
