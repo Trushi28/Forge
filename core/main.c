@@ -54,6 +54,12 @@ typedef struct {
     /* LSP time-based debounce: sync buffer after 300ms of idle */
     bool           lsp_dirty;       /* buffer changed since last sync? */
     struct timespec lsp_last_edit;  /* timestamp of last edit */
+
+    /* Guild panel */
+    bool           guild_panel_visible;
+    char           guild_chat_input[512];
+    int            guild_chat_input_len;
+    int            guild_ipc_timer;    /* countdown for IPC reconnect */
 } EditorState;
 
 static EditorState E;
@@ -331,6 +337,139 @@ static void cmd_toggle_timeline(void *ctx) {
                       E.git.timeline_visible ? "on" : "off");
 }
 
+/* ── Guild commands ──────────────────────────────────────────── */
+
+static void cmd_toggle_guild(void *ctx) {
+    (void)ctx;
+    E.guild_panel_visible = !E.guild_panel_visible;
+    E.render.full_redraw = true;
+    if (E.guild_panel_visible) {
+        if (!E.ipc.connected)
+            ipc_try_connect(&E.ipc);
+        render_set_status(&E.render, "Guild panel — %s",
+                          E.ipc.connected ? "connected" : "connecting...");
+    } else {
+        render_set_status(&E.render, "Guild panel closed");
+    }
+}
+
+static void cmd_guild_ping(void *ctx) {
+    (void)ctx;
+    if (!E.ipc.connected) {
+        render_set_status(&E.render, "Not connected to forge-net");
+        return;
+    }
+    char json[512];
+    int len = snprintf(json, sizeof(json),
+        "{\"type\":\"PING\",\"target\":\"all\",\"file\":\"%s\",\"line\":%d}",
+        E.filepath ? E.filepath : "", E.cy + 1);
+    ipc_send(&E.ipc, json, len);
+    render_set_status(&E.render, "Pinged all peers at line %d", E.cy + 1);
+}
+
+static void cmd_guild_share(void *ctx) {
+    (void)ctx;
+    if (!E.ipc.connected) {
+        render_set_status(&E.render, "Not connected to forge-net");
+        return;
+    }
+    if (!E.filepath) {
+        render_set_status(&E.render, "No file to share");
+        return;
+    }
+    const char *basename = strrchr(E.filepath, '/');
+    basename = basename ? basename + 1 : E.filepath;
+    char json[1024];
+    int len = snprintf(json, sizeof(json),
+        "{\"type\":\"FILE_SHARE\",\"name\":\"%s\",\"data_b64\":\"\"}", basename);
+    ipc_send(&E.ipc, json, len);
+    render_set_status(&E.render, "Shared: %s", basename);
+}
+
+static void cmd_guild_collab(void *ctx) {
+    (void)ctx;
+    if (!E.ipc.connected) {
+        render_set_status(&E.render, "Not connected to forge-net");
+        return;
+    }
+    render_set_status(&E.render, "Collab: use :collab <peer> in palette");
+}
+
+/* ── Guild panel rendering ───────────────────────────────────── */
+
+static void render_guild_panel(void) {
+    if (!E.guild_panel_visible) return;
+
+    ForgeTheme *t = E.render.theme;
+    if (!t) return;
+
+    int panel_width = 35;
+    int panel_x = E.render.width - panel_width;
+    if (panel_x < 30) return;
+
+    int panel_height = E.render.height - 1;
+    char buf[8192];
+    int blen = 0;
+
+    /* Panel background */
+    for (int y = 0; y < panel_height && blen < (int)sizeof(buf) - 256; y++) {
+        blen += snprintf(buf + blen, sizeof(buf) - blen,
+            "\x1b[%d;%dH\x1b[48;2;%u;%u;%um",
+            y + 1, panel_x, t->gutter_bg.r, t->gutter_bg.g, t->gutter_bg.b);
+        for (int x = 0; x < panel_width && blen < (int)sizeof(buf) - 4; x++)
+            buf[blen++] = ' ';
+    }
+
+    /* Header */
+    blen += snprintf(buf + blen, sizeof(buf) - blen,
+        "\x1b[1;%dH\x1b[38;2;%u;%u;%um\x1b[1m ⚡ GUILD\x1b[0m",
+        panel_x, t->accent.r, t->accent.g, t->accent.b);
+
+    /* Connection status */
+    blen += snprintf(buf + blen, sizeof(buf) - blen,
+        "\x1b[2;%dH\x1b[48;2;%u;%u;%um\x1b[38;2;%u;%u;%um %s",
+        panel_x, t->gutter_bg.r, t->gutter_bg.g, t->gutter_bg.b,
+        t->gutter_fg.r, t->gutter_fg.g, t->gutter_fg.b,
+        E.ipc.connected ? "● Connected" : "○ Disconnected");
+
+    /* Divider */
+    blen += snprintf(buf + blen, sizeof(buf) - blen,
+        "\x1b[3;%dH\x1b[38;2;%u;%u;%um",
+        panel_x, t->gutter_fg.r, t->gutter_fg.g, t->gutter_fg.b);
+    for (int i = 0; i < panel_width && blen < (int)sizeof(buf) - 8; i++)
+        blen += snprintf(buf + blen, sizeof(buf) - blen, "─");
+
+    /* Peers section */
+    blen += snprintf(buf + blen, sizeof(buf) - blen,
+        "\x1b[4;%dH\x1b[38;2;%u;%u;%um\x1b[1m Peers\x1b[0m",
+        panel_x, t->statusbar_fg.r, t->statusbar_fg.g, t->statusbar_fg.b);
+
+    blen += snprintf(buf + blen, sizeof(buf) - blen,
+        "\x1b[5;%dH\x1b[48;2;%u;%u;%um\x1b[38;2;%u;%u;%um  Scanning LAN...",
+        panel_x, t->gutter_bg.r, t->gutter_bg.g, t->gutter_bg.b,
+        t->comment.r, t->comment.g, t->comment.b);
+
+    /* Commands help */
+    int hr = panel_height - 4;
+    blen += snprintf(buf + blen, sizeof(buf) - blen,
+        "\x1b[%d;%dH\x1b[48;2;%u;%u;%um\x1b[38;2;%u;%u;%um",
+        hr, panel_x, t->gutter_bg.r, t->gutter_bg.g, t->gutter_bg.b,
+        t->gutter_fg.r, t->gutter_fg.g, t->gutter_fg.b);
+    for (int i = 0; i < panel_width && blen < (int)sizeof(buf) - 8; i++)
+        blen += snprintf(buf + blen, sizeof(buf) - blen, "─");
+
+    blen += snprintf(buf + blen, sizeof(buf) - blen,
+        "\x1b[%d;%dH\x1b[38;2;%u;%u;%um :ping  :share  :collab",
+        hr + 1, panel_x, t->comment.r, t->comment.g, t->comment.b);
+    blen += snprintf(buf + blen, sizeof(buf) - blen,
+        "\x1b[%d;%dH :grab  :drop   :chat", hr + 2, panel_x);
+    blen += snprintf(buf + blen, sizeof(buf) - blen,
+        "\x1b[%d;%dH Ctrl+G to close", hr + 3, panel_x);
+
+    blen += snprintf(buf + blen, sizeof(buf) - blen, "\x1b[0m");
+    if (blen > 0) (void)write(STDOUT_FILENO, buf, blen);
+}
+
 /* ── Hover rendering ────────────────────────────────────────── */
 
 static void render_hover(void) {
@@ -538,6 +677,10 @@ int main(int argc, char **argv) {
     palette_add_command(&E.palette, "Restart LSP",       "Restart language server", "",       cmd_lsp_restart, NULL);
     palette_add_command(&E.palette, "Toggle Blame",      "Show/hide git blame",    "",        cmd_toggle_blame, NULL);
     palette_add_command(&E.palette, "Toggle Timeline",   "Show/hide git timeline", "Ctrl+T",  cmd_toggle_timeline, NULL);
+    palette_add_command(&E.palette, "Guild Panel",       "Toggle guild panel",     "Ctrl+G",  cmd_toggle_guild, NULL);
+    palette_add_command(&E.palette, "Ping",              "Ping peers at cursor",   "",         cmd_guild_ping, NULL);
+    palette_add_command(&E.palette, "Share File",        "Share file with guild",  "",         cmd_guild_share, NULL);
+    palette_add_command(&E.palette, "Collab",            "Start collab session",   "",         cmd_guild_collab, NULL);
 
     /* ── Start LSP ────────────────────────────────────────── */
     E.lsp = NULL;
@@ -674,6 +817,28 @@ int main(int argc, char **argv) {
 
         if (E.show_hover) {
             render_hover();
+        }
+
+        /* Guild panel overlay */
+        if (E.guild_panel_visible) {
+            render_guild_panel();
+        }
+
+        /* IPC polling and auto-reconnect */
+        if (E.ipc.connected) {
+            int msgs = ipc_poll(&E.ipc);
+            while (msgs > 0) {
+                char *msg = ipc_read_message(&E.ipc);
+                if (msg) {
+                    /* Handle incoming guild messages */
+                    /* For now, just log them */
+                    free(msg);
+                }
+                msgs--;
+            }
+        } else if (E.guild_panel_visible) {
+            /* Try reconnecting periodically */
+            ipc_try_connect(&E.ipc);
         }
 
         int key = input_read_key();
@@ -828,16 +993,14 @@ int main(int argc, char **argv) {
             continue;
         }
 
-        /* ── Ctrl+G: Go-to-definition ────────────────────── */
+        /* ── Ctrl+G: Go-to-definition / Guild panel ─────── */
         if (key == KEY_CTRL_G) {
             if (E.lsp && E.lsp->running && E.lsp->initialized) {
                 lsp_request_definition(E.lsp, E.file_uri, E.cy, E.cx);
                 render_set_status(&E.render, "Finding definition...");
             } else {
-                /* No LSP: open goto-line instead */
-                palette_show(&E.palette);
-                E.palette.mode = PALETTE_GOTO_LINE;
-                E.render.full_redraw = true;
+                /* No LSP: toggle guild panel */
+                cmd_toggle_guild(NULL);
             }
             continue;
         }

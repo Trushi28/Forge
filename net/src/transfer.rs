@@ -230,3 +230,8 @@ fn base64_decode(input: &str) -> Vec<u8> {
 
     result
 }
+
+/// Public wrapper for base64 decode (used by ipc.rs)
+pub fn base64_decode_pub(input: &str) -> Vec<u8> {
+    base64_decode(input)
+}
