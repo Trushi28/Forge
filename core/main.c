@@ -60,6 +60,11 @@ typedef struct {
     char           guild_chat_input[512];
     int            guild_chat_input_len;
     int            guild_ipc_timer;    /* countdown for IPC reconnect */
+    char           guild_name[128];
+    char           guild_handle[64];
+    char           guild_last_event[256];
+    int            guild_peer_count;
+    int            guild_status_timer;
 } EditorState;
 
 static EditorState E;
@@ -82,6 +87,77 @@ static long ms_since(struct timespec *since) {
     get_time(&now);
     return (now.tv_sec - since->tv_sec) * 1000 +
            (now.tv_nsec - since->tv_nsec) / 1000000;
+}
+
+/* ── Small JSON helpers for forge-net IPC messages ─────────── */
+
+static bool json_get_string(const char *json, const char *key,
+                            char *out, size_t out_sz) {
+    if (!json || !key || !out || out_sz == 0) return false;
+
+    char pattern[96];
+    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+    const char *p = strstr(json, pattern);
+    if (!p) return false;
+    p = strchr(p + strlen(pattern), ':');
+    if (!p) return false;
+    p++;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p != '"') return false;
+    p++;
+
+    size_t n = 0;
+    while (*p && *p != '"' && n + 1 < out_sz) {
+        if (*p == '\\' && p[1]) p++;
+        out[n++] = *p++;
+    }
+    out[n] = '\0';
+    return true;
+}
+
+static bool json_get_int(const char *json, const char *key, int *out) {
+    if (!json || !key || !out) return false;
+
+    char pattern[96];
+    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+    const char *p = strstr(json, pattern);
+    if (!p) return false;
+    p = strchr(p + strlen(pattern), ':');
+    if (!p) return false;
+    p++;
+    while (*p == ' ' || *p == '\t') p++;
+    *out = atoi(p);
+    return true;
+}
+
+static char *base64_encode_bytes(const unsigned char *data, size_t len) {
+    static const char table[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t out_len = ((len + 2) / 3) * 4;
+    char *out = malloc(out_len + 1);
+    if (!out) return NULL;
+
+    size_t i = 0, j = 0;
+    while (i < len) {
+        unsigned octet_a = i < len ? data[i++] : 0;
+        unsigned octet_b = i < len ? data[i++] : 0;
+        unsigned octet_c = i < len ? data[i++] : 0;
+        unsigned triple = (octet_a << 16) | (octet_b << 8) | octet_c;
+
+        out[j++] = table[(triple >> 18) & 0x3F];
+        out[j++] = table[(triple >> 12) & 0x3F];
+        out[j++] = table[(triple >> 6) & 0x3F];
+        out[j++] = table[triple & 0x3F];
+    }
+
+    if (len % 3 == 1) {
+        out[out_len - 2] = '=';
+        out[out_len - 1] = '=';
+    } else if (len % 3 == 2) {
+        out[out_len - 1] = '=';
+    }
+    out[out_len] = '\0';
+    return out;
 }
 
 /* ── File loading ───────────────────────────────────────────── */
@@ -740,9 +816,9 @@ int main(int argc, char **argv) {
     /* ── Load config ──────────────────────────────────────── */
     config_default(&E.cfg);
     config_load(&E.cfg, config_default_path());
-    strncpy(E.guild_name, E.cfg.guild_name, sizeof(E.guild_name) - 1);
-    strncpy(E.guild_handle, E.cfg.guild_handle, sizeof(E.guild_handle) - 1);
-    strncpy(E.guild_last_event, "Not connected", sizeof(E.guild_last_event) - 1);
+    snprintf(E.guild_name, sizeof(E.guild_name), "%s", E.cfg.guild_name);
+    snprintf(E.guild_handle, sizeof(E.guild_handle), "%s", E.cfg.guild_handle);
+    snprintf(E.guild_last_event, sizeof(E.guild_last_event), "Not connected");
 
     /* ── Load theme ───────────────────────────────────────── */
     theme_load(&E.theme, E.cfg.theme_name);

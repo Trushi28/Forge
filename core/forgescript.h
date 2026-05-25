@@ -151,6 +151,10 @@ typedef struct {
     FSScript   scripts[FS_MAX_SCRIPTS];
     int        script_count;
     bool       initialized;
+    char       current_filepath[512];
+    char       current_selection[256];
+    unsigned   executed_handlers;
+    unsigned   failed_loads;
 } ForgeScriptVM;
 
 /* ── Public API ────────────────────────────────────────────── */
@@ -169,6 +173,10 @@ int  fs_vm_load_dir(ForgeScriptVM *vm, const char *dir);
 
 /* Check for modified scripts and hot-reload them */
 int  fs_vm_hot_reload(ForgeScriptVM *vm);
+
+/* Set runtime context exposed to scripts as file / selection */
+void fs_vm_set_context(ForgeScriptVM *vm, const char *filepath,
+                       const char *selection);
 
 /* Fire an event: runs all handlers across all loaded scripts */
 void fs_vm_fire_event(ForgeScriptVM *vm, FSEventType event,

@@ -11,6 +11,15 @@
 /* Forward declaration — defined in plugin.c */
 extern void forge_notify(const char *message);
 
+static void fs_copy(char *dst, size_t dstsz, const char *src) {
+    if (!dst || dstsz == 0) return;
+    if (!src) src = "";
+    size_t n = strlen(src);
+    if (n >= dstsz) n = dstsz - 1;
+    memcpy(dst, src, n);
+    dst[n] = '\0';
+}
+
 /* ══════════════════════════════════════════════════════════════
    ForgeScript — Lexer, Parser, Compiler, and VM
 
@@ -110,11 +119,12 @@ static FSToken next_token(FSLexer *lex) {
     }
 
     /* Identifier / keyword */
-    if (isalpha((unsigned char)c) || c == '_') {
+    if (isalpha((unsigned char)c) || c == '_' || c == '$') {
         int vi = 0;
         while (lex->pos < lex->len &&
                (isalnum((unsigned char)lex->src[lex->pos]) ||
-                lex->src[lex->pos] == '_' || lex->src[lex->pos] == '+') &&
+                lex->src[lex->pos] == '_' || lex->src[lex->pos] == '+' ||
+                lex->src[lex->pos] == '$') &&
                vi < (int)sizeof(tok.value) - 1) {
             tok.value[vi++] = lex->src[lex->pos++];
         }
@@ -165,8 +175,7 @@ static int add_constant(FSScript *sc, const char *str) {
             return i;
     }
     if (sc->const_count >= FS_MAX_CONSTANTS) return 0;
-    strncpy(sc->constants[sc->const_count], str,
-            sizeof(sc->constants[0]) - 1);
+    fs_copy(sc->constants[sc->const_count], sizeof(sc->constants[0]), str);
     return sc->const_count++;
 }
 
@@ -175,6 +184,53 @@ static void emit(FSScript *sc, FSOpCode op, int arg) {
     sc->code[sc->code_len].op = op;
     sc->code[sc->code_len].arg = arg;
     sc->code_len++;
+}
+
+static bool compile_value(FSLexer *lex, FSScript *sc, FSToken tok) {
+    switch (tok.type) {
+        case FS_TOK_STRING: {
+            int ci = add_constant(sc, tok.value);
+            emit(sc, FS_OP_PUSH_STR, ci);
+            return true;
+        }
+        case FS_TOK_IDENT: {
+            if (strcmp(tok.value, "file") == 0 || strcmp(tok.value, "$file") == 0) {
+                emit(sc, FS_OP_GET_FILE, 0);
+            } else {
+                int ci = add_constant(sc, tok.value);
+                emit(sc, FS_OP_GET_VAR, ci);
+            }
+            return true;
+        }
+        case FS_TOK_SELECTION:
+            emit(sc, FS_OP_GET_SELECTION, 0);
+            return true;
+        default:
+            fprintf(stderr, "forgescript:%d: expected expression\n", tok.line);
+            (void)lex;
+            return false;
+    }
+}
+
+static bool compile_expression(FSLexer *lex, FSScript *sc) {
+    FSToken tok = next_token(lex);
+    if (!compile_value(lex, sc, tok)) return false;
+
+    while (1) {
+        int save_pos = lex->pos;
+        int save_line = lex->line;
+        FSToken op = next_token(lex);
+        if (op.type != FS_TOK_PLUS) {
+            lex->pos = save_pos;
+            lex->line = save_line;
+            break;
+        }
+
+        FSToken rhs = next_token(lex);
+        if (!compile_value(lex, sc, rhs)) return false;
+        emit(sc, FS_OP_CONCAT, 0);
+    }
+    return true;
 }
 
 /* Parse and compile a handler body: { stmt; stmt; ... } */
@@ -193,21 +249,15 @@ static bool compile_body(FSLexer *lex, FSScript *sc) {
 
         switch (tok.type) {
             case FS_TOK_RUN: {
-                /* run "command" */
-                FSToken arg = next_token(lex);
-                if (arg.type == FS_TOK_STRING) {
-                    int ci = add_constant(sc, arg.value);
-                    emit(sc, FS_OP_PUSH_STR, ci);
+                /* run "command" or run "command " + file */
+                if (compile_expression(lex, sc)) {
                     emit(sc, FS_OP_CALL_RUN, 0);
                 }
                 break;
             }
             case FS_TOK_NOTIFY: {
-                /* notify "message" */
-                FSToken arg = next_token(lex);
-                if (arg.type == FS_TOK_STRING) {
-                    int ci = add_constant(sc, arg.value);
-                    emit(sc, FS_OP_PUSH_STR, ci);
+                /* notify "message" or notify variable */
+                if (compile_expression(lex, sc)) {
                     emit(sc, FS_OP_CALL_NOTIFY, 0);
                 }
                 break;
@@ -240,10 +290,7 @@ static bool compile_body(FSLexer *lex, FSScript *sc) {
 
                 FSToken eq = next_token(lex);
                 if (eq.type == FS_TOK_EQUALS) {
-                    FSToken val = next_token(lex);
-                    if (val.type == FS_TOK_STRING) {
-                        int ci = add_constant(sc, val.value);
-                        emit(sc, FS_OP_PUSH_STR, ci);
+                    if (compile_expression(lex, sc)) {
                         int vi = add_constant(sc, varname);
                         emit(sc, FS_OP_SET_VAR, vi);
                     }
@@ -276,6 +323,7 @@ static bool compile_script(FSScript *sc, const char *src) {
 
         if (tok.type == FS_TOK_ON) {
             /* on <event> { ... } */
+            if (sc->handler_count >= FS_MAX_HANDLERS) break;
             FSToken event = next_token(&lex);
             FSHandler *h = &sc->handlers[sc->handler_count];
             h->key_combo[0] = '\0';
@@ -294,7 +342,7 @@ static bool compile_script(FSScript *sc, const char *src) {
                     h->event = FS_EVENT_KEYPRESS;
                     /* Next token is the key combo */
                     FSToken key = next_token(&lex);
-                    strncpy(h->key_combo, key.value, sizeof(h->key_combo) - 1);
+                    fs_copy(h->key_combo, sizeof(h->key_combo), key.value);
                     break;
                 }
                 default:
@@ -308,7 +356,6 @@ static bool compile_script(FSScript *sc, const char *src) {
             h->code_len = sc->code_len - h->code_start;
             sc->handler_count++;
 
-            if (sc->handler_count >= FS_MAX_HANDLERS) break;
         }
         /* Skip widget/theme definitions for now */
     }
@@ -318,7 +365,7 @@ static bool compile_script(FSScript *sc, const char *src) {
 
 /* ── VM execution ──────────────────────────────────────────── */
 
-static void vm_exec(FSScript *sc, int start, int len) {
+static void vm_exec(ForgeScriptVM *vm, FSScript *sc, int start, int len) {
     sc->sp = 0;
 
     for (int ip = start; ip < start + len && ip < sc->code_len; ip++) {
@@ -327,8 +374,8 @@ static void vm_exec(FSScript *sc, int start, int len) {
         switch (inst->op) {
             case FS_OP_PUSH_STR:
                 if (sc->sp < FS_MAX_STACK)
-                    strncpy(sc->stack[sc->sp++], sc->constants[inst->arg],
-                            sizeof(sc->stack[0]) - 1);
+                    fs_copy(sc->stack[sc->sp++], sizeof(sc->stack[0]),
+                            sc->constants[inst->arg]);
                 break;
 
             case FS_OP_PUSH_NUM: {
@@ -343,7 +390,10 @@ static void vm_exec(FSScript *sc, int start, int len) {
             case FS_OP_CALL_RUN:
                 if (sc->sp > 0) {
                     sc->sp--;
-                    plugin_run_hook(sc->stack[sc->sp], NULL);
+                    plugin_run_hook(sc->stack[sc->sp],
+                                    vm->current_filepath[0]
+                                        ? vm->current_filepath
+                                        : NULL);
                 }
                 break;
 
@@ -368,31 +418,41 @@ static void vm_exec(FSScript *sc, int start, int len) {
                     char tmp[256];
                     snprintf(tmp, sizeof(tmp), "%s%s",
                              sc->stack[sc->sp - 1], sc->stack[sc->sp]);
-                    strncpy(sc->stack[sc->sp - 1], tmp,
-                            sizeof(sc->stack[0]) - 1);
+                    fs_copy(sc->stack[sc->sp - 1], sizeof(sc->stack[0]), tmp);
                 }
                 break;
 
             case FS_OP_SET_VAR:
-                if (sc->sp > 0 && sc->var_count < FS_MAX_VARS) {
+                if (sc->sp > 0) {
                     sc->sp--;
-                    strncpy(sc->var_names[sc->var_count],
-                            sc->constants[inst->arg],
-                            sizeof(sc->var_names[0]) - 1);
-                    strncpy(sc->var_values[sc->var_count],
-                            sc->stack[sc->sp],
-                            sizeof(sc->var_values[0]) - 1);
-                    sc->var_count++;
+                    const char *name = sc->constants[inst->arg];
+                    int vi = -1;
+                    for (int i = 0; i < sc->var_count; i++) {
+                        if (strcmp(sc->var_names[i], name) == 0) {
+                            vi = i;
+                            break;
+                        }
+                    }
+                    if (vi < 0 && sc->var_count < FS_MAX_VARS) {
+                        vi = sc->var_count++;
+                        fs_copy(sc->var_names[vi], sizeof(sc->var_names[0]),
+                                name);
+                    }
+                    if (vi >= 0) {
+                        fs_copy(sc->var_values[vi], sizeof(sc->var_values[0]),
+                                sc->stack[sc->sp]);
+                    }
                 }
                 break;
 
             case FS_OP_GET_VAR:
                 if (sc->sp < FS_MAX_STACK) {
                     const char *name = sc->constants[inst->arg];
+                    sc->stack[sc->sp][0] = '\0';
                     for (int i = 0; i < sc->var_count; i++) {
                         if (strcmp(sc->var_names[i], name) == 0) {
-                            strncpy(sc->stack[sc->sp], sc->var_values[i],
-                                    sizeof(sc->stack[0]) - 1);
+                            fs_copy(sc->stack[sc->sp], sizeof(sc->stack[0]),
+                                    sc->var_values[i]);
                             break;
                         }
                     }
@@ -401,17 +461,17 @@ static void vm_exec(FSScript *sc, int start, int len) {
                 break;
 
             case FS_OP_GET_FILE:
-                /* TODO: push current filepath from editor state */
                 if (sc->sp < FS_MAX_STACK) {
-                    sc->stack[sc->sp][0] = '\0';
+                    fs_copy(sc->stack[sc->sp], sizeof(sc->stack[0]),
+                            vm->current_filepath);
                     sc->sp++;
                 }
                 break;
 
             case FS_OP_GET_SELECTION:
-                /* TODO: push current selection from editor state */
                 if (sc->sp < FS_MAX_STACK) {
-                    sc->stack[sc->sp][0] = '\0';
+                    fs_copy(sc->stack[sc->sp], sizeof(sc->stack[0]),
+                            vm->current_selection);
                     sc->sp++;
                 }
                 break;
@@ -438,6 +498,13 @@ void fs_vm_free(ForgeScriptVM *vm) {
     vm->initialized = false;
 }
 
+void fs_vm_set_context(ForgeScriptVM *vm, const char *filepath,
+                       const char *selection) {
+    if (!vm) return;
+    fs_copy(vm->current_filepath, sizeof(vm->current_filepath), filepath);
+    fs_copy(vm->current_selection, sizeof(vm->current_selection), selection);
+}
+
 bool fs_vm_load_script(ForgeScriptVM *vm, const char *path) {
     if (!vm || !vm->initialized) return false;
     if (vm->script_count >= FS_MAX_SCRIPTS) return false;
@@ -458,12 +525,17 @@ bool fs_vm_load_script(ForgeScriptVM *vm, const char *path) {
     char *src = malloc((size_t)sz + 1);
     size_t got = fread(src, 1, (size_t)sz, f);
     fclose(f);
+    if (got != (size_t)sz) {
+        free(src);
+        vm->failed_loads++;
+        return false;
+    }
     src[got] = '\0';
 
     /* Compile */
     FSScript *sc = &vm->scripts[vm->script_count];
     memset(sc, 0, sizeof(*sc));
-    strncpy(sc->filepath, path, sizeof(sc->filepath) - 1);
+    fs_copy(sc->filepath, sizeof(sc->filepath), path);
 
     struct stat st;
     if (stat(path, &st) == 0)
@@ -471,6 +543,7 @@ bool fs_vm_load_script(ForgeScriptVM *vm, const char *path) {
 
     if (!compile_script(sc, src)) {
         free(src);
+        vm->failed_loads++;
         return false;
     }
 
@@ -519,8 +592,7 @@ int fs_vm_hot_reload(ForgeScriptVM *vm) {
 
         /* File changed — reload */
         char path[512];
-        strncpy(path, sc->filepath, sizeof(path) - 1);
-        path[511] = '\0';
+        fs_copy(path, sizeof(path), sc->filepath);
 
         FILE *f = fopen(path, "r");
         if (!f) continue;
@@ -528,14 +600,26 @@ int fs_vm_hot_reload(ForgeScriptVM *vm) {
         fseek(f, 0, SEEK_END);
         long sz = ftell(f);
         rewind(f);
+        if (sz <= 0 || sz > 64 * 1024) {
+            fclose(f);
+            continue;
+        }
 
         char *src = malloc((size_t)sz + 1);
+        if (!src) {
+            fclose(f);
+            continue;
+        }
         size_t got = fread(src, 1, (size_t)sz, f);
         fclose(f);
+        if (got != (size_t)sz) {
+            free(src);
+            continue;
+        }
         src[got] = '\0';
 
         memset(sc, 0, sizeof(*sc));
-        strncpy(sc->filepath, path, sizeof(sc->filepath) - 1);
+        fs_copy(sc->filepath, sizeof(sc->filepath), path);
         sc->mtime = st.st_mtime;
 
         if (compile_script(sc, src)) {
@@ -552,7 +636,7 @@ int fs_vm_hot_reload(ForgeScriptVM *vm) {
 void fs_vm_fire_event(ForgeScriptVM *vm, FSEventType event,
                       const char *filepath) {
     if (!vm || !vm->initialized) return;
-    (void)filepath;
+    fs_vm_set_context(vm, filepath, NULL);
 
     for (int i = 0; i < vm->script_count; i++) {
         FSScript *sc = &vm->scripts[i];
@@ -560,8 +644,9 @@ void fs_vm_fire_event(ForgeScriptVM *vm, FSEventType event,
 
         for (int j = 0; j < sc->handler_count; j++) {
             if (sc->handlers[j].event == event) {
-                vm_exec(sc, sc->handlers[j].code_start,
+                vm_exec(vm, sc, sc->handlers[j].code_start,
                         sc->handlers[j].code_len);
+                vm->executed_handlers++;
             }
         }
     }
@@ -577,8 +662,9 @@ void fs_vm_fire_keypress(ForgeScriptVM *vm, const char *key_combo) {
         for (int j = 0; j < sc->handler_count; j++) {
             if (sc->handlers[j].event == FS_EVENT_KEYPRESS &&
                 strcmp(sc->handlers[j].key_combo, key_combo) == 0) {
-                vm_exec(sc, sc->handlers[j].code_start,
+                vm_exec(vm, sc, sc->handlers[j].code_start,
                         sc->handlers[j].code_len);
+                vm->executed_handlers++;
             }
         }
     }

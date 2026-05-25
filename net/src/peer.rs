@@ -6,6 +6,7 @@ use crate::guild::GuildState;
 use crate::ipc::OutgoingMsg;
 use crate::transfer::{FilePool, SharedFile};
 use serde::{Deserialize, Serialize};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -24,6 +25,7 @@ pub struct PeerRuntime {
     pub file_pool: Arc<Mutex<FilePool>>,
     pub collab_mgr: Arc<Mutex<CollabManager>>,
     pub events: broadcast::Sender<OutgoingMsg>,
+    pub listen_port: u16,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,6 +40,13 @@ pub struct PlainHello {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum PeerMsg {
+    #[serde(rename = "PRESENCE")]
+    Presence {
+        from: String,
+        guild: String,
+        file: String,
+    },
+
     #[serde(rename = "CHAT")]
     Chat { from: String, text: String },
 
@@ -107,7 +116,7 @@ impl PeerRuntime {
             guild: gs.guild_name.clone(),
             public_key_b64: self.identity.public_key_b64(),
             fingerprint: self.identity.fingerprint(),
-            addr,
+            addr: addr.or_else(|| local_endpoint(self.listen_port)),
             relay,
         };
         invite.encode()
@@ -124,6 +133,22 @@ impl PeerRuntime {
                 addr.clone(),
                 String::new(),
             );
+        }
+        if let Some(addr) = &invite.addr {
+            let (from, guild) = {
+                let gs = self.guild_state.lock().await;
+                (gs.my_handle.clone(), gs.guild_name.clone())
+            };
+            let _ = self
+                .send_to_addr(
+                    addr,
+                    PeerMsg::Presence {
+                        from,
+                        guild,
+                        file: String::new(),
+                    },
+                )
+                .await;
         }
         Ok(invite)
     }
@@ -148,8 +173,16 @@ impl PeerRuntime {
     pub async fn send_to_handle(&self, handle: &str, msg: PeerMsg) -> Result<(), String> {
         let addr = {
             let gs = self.guild_state.lock().await;
-            gs.find_peer(handle)
-                .map(|p| p.addr.clone())
+            gs.find_peer(handle).map(|p| p.addr.clone())
+        };
+        let addr = if let Some(addr) = addr {
+            addr
+        } else {
+            self.contacts
+                .lock()
+                .await
+                .get(handle)
+                .and_then(|c| c.addr)
                 .ok_or_else(|| format!("peer '{handle}' not found"))?
         };
         self.send_to_addr(&addr, msg).await
@@ -190,6 +223,7 @@ impl PeerRuntime {
             &hello.guild,
             &hello.public_key_b64,
             addr,
+            None,
         )?;
 
         match decision {
@@ -259,6 +293,17 @@ async fn handle_inbound(
 
 async fn handle_peer_msg(msg: PeerMsg, runtime: &PeerRuntime) {
     match msg {
+        PeerMsg::Presence { from, guild, file } => {
+            runtime.guild_state.lock().await.add_or_update_peer(
+                from.clone(),
+                guild,
+                String::new(),
+                file.clone(),
+            );
+            let _ = runtime
+                .events
+                .send(OutgoingMsg::PeerOnline { handle: from, file });
+        }
         PeerMsg::Chat { from, text } => {
             runtime
                 .guild_state
@@ -397,4 +442,16 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+fn local_endpoint(port: u16) -> Option<String> {
+    let socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))).ok()?;
+    if socket.connect("8.8.8.8:80").is_ok()
+        && let Ok(addr) = socket.local_addr()
+        && !addr.ip().is_unspecified()
+        && !addr.ip().is_loopback()
+    {
+        return Some(format!("{}:{port}", addr.ip()));
+    }
+    Some(format!("{}:{port}", IpAddr::V4(Ipv4Addr::LOCALHOST)))
 }

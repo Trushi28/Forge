@@ -97,9 +97,13 @@ impl GuildState {
     pub fn add_peer(&mut self, peer: GuildPeer) {
         // Update if existing, add if new
         if let Some(existing) = self.peers.iter_mut().find(|p| p.handle == peer.handle) {
-            existing.addr = peer.addr;
+            if !peer.addr.is_empty() {
+                existing.addr = peer.addr;
+            }
             existing.last_seen = peer.last_seen;
-            existing.current_file = peer.current_file;
+            if !peer.current_file.is_empty() {
+                existing.current_file = peer.current_file;
+            }
         } else {
             self.peers.push(peer);
         }

@@ -62,7 +62,13 @@ async fn main() {
     let port = gs.port;
     drop(gs);
 
-    match discovery::announce(&handle, &guild_name, port) {
+    match discovery::announce(
+        &handle,
+        &guild_name,
+        port,
+        &identity.public_key_b64(),
+        &identity.fingerprint(),
+    ) {
         Ok(_mdns) => {
             eprintln!("forge-net: mDNS announced");
             // Keep mdns daemon alive by not dropping it
@@ -76,8 +82,9 @@ async fn main() {
 
     // Start mDNS discovery in background
     let gs = guild_state.clone();
+    let cb = contacts.clone();
     tokio::spawn(async move {
-        if let Err(e) = discovery::run_discovery(gs).await {
+        if let Err(e) = discovery::run_discovery(gs, cb).await {
             eprintln!("forge-net: discovery error: {}", e);
         }
     });
@@ -98,6 +105,7 @@ async fn main() {
         file_pool: file_pool.clone(),
         collab_mgr: collab_mgr.clone(),
         events: events.clone(),
+        listen_port: port,
     };
     let peer_listener_runtime = peer_runtime.clone();
     tokio::spawn(async move {

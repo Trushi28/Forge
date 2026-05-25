@@ -35,6 +35,8 @@ pub struct Contact {
     pub public_key_b64: String,
     pub fingerprint: String,
     pub addr: Option<String>,
+    #[serde(default)]
+    pub relay: Option<String>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -172,17 +174,25 @@ impl ContactBook {
         guild: &str,
         public_key_b64: &str,
         addr: Option<String>,
+        relay: Option<String>,
     ) -> Result<TrustDecision, String> {
         let public = decode_public_key(public_key_b64)?;
         let fp = fingerprint(public.as_bytes());
 
-        if let Some(existing) = self.contacts.get(handle) {
+        if let Some(existing) = self.contacts.get_mut(handle) {
             if existing.fingerprint != fp {
                 return Ok(TrustDecision::ChangedKey {
                     expected: existing.fingerprint.clone(),
                     received: fp,
                 });
             }
+            if addr.is_some() {
+                existing.addr = addr;
+            }
+            if relay.is_some() {
+                existing.relay = relay;
+            }
+            self.save().map_err(|e| e.to_string())?;
             return Ok(TrustDecision::Trusted);
         }
 
@@ -194,6 +204,7 @@ impl ContactBook {
                 public_key_b64: public_key_b64.to_string(),
                 fingerprint: fp,
                 addr,
+                relay,
             },
         );
         self.save().map_err(|e| e.to_string())?;
@@ -210,9 +221,14 @@ impl ContactBook {
                 public_key_b64: invite.public_key_b64,
                 fingerprint: invite.fingerprint,
                 addr: invite.addr,
+                relay: invite.relay,
             },
         );
         self.save().map_err(|e| e.to_string())
+    }
+
+    pub fn get(&self, handle: &str) -> Option<Contact> {
+        self.contacts.get(handle).cloned()
     }
 
     pub fn save(&self) -> io::Result<()> {
