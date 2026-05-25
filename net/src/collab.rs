@@ -9,9 +9,9 @@ use std::collections::HashMap;
 /// State of a collab session
 #[derive(Debug, Clone, PartialEq)]
 pub enum SessionState {
-    Pending,    // Invitation sent, waiting for response
-    Active,     // Both peers are actively editing
-    Closed,     // Session has ended
+    Pending, // Invitation sent, waiting for response
+    Active,  // Both peers are actively editing
+    Closed,  // Session has ended
 }
 
 /// A collab session between two peers editing the same file
@@ -128,7 +128,13 @@ impl CollabManager {
     }
 
     /// Accept an incoming session request
-    pub fn accept_session(&mut self, id: u64, file: &str, peer: &GuildPeer, initial_text: &str) -> u64 {
+    pub fn accept_session(
+        &mut self,
+        id: u64,
+        file: &str,
+        peer: &GuildPeer,
+        initial_text: &str,
+    ) -> u64 {
         let session = CollabSession::new_as_responder(id, file, peer, initial_text);
         self.sessions.insert(id, session);
         id
@@ -181,25 +187,13 @@ pub enum CollabMsg {
         initial_text: String,
     },
     #[serde(rename = "COLLAB_ACCEPT")]
-    Accept {
-        session_id: u64,
-        from: String,
-    },
+    Accept { session_id: u64, from: String },
     #[serde(rename = "COLLAB_DECLINE")]
-    Decline {
-        session_id: u64,
-        from: String,
-    },
+    Decline { session_id: u64, from: String },
     #[serde(rename = "COLLAB_OP")]
-    Operation {
-        session_id: u64,
-        op: CrdtOp,
-    },
+    Operation { session_id: u64, op: CrdtOp },
     #[serde(rename = "COLLAB_CLOSE")]
-    Close {
-        session_id: u64,
-        from: String,
-    },
+    Close { session_id: u64, from: String },
     #[serde(rename = "COLLAB_CURSOR")]
     Cursor {
         session_id: u64,

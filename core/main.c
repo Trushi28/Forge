@@ -346,6 +346,10 @@ static void cmd_toggle_guild(void *ctx) {
     if (E.guild_panel_visible) {
         if (!E.ipc.connected)
             ipc_try_connect(&E.ipc);
+        if (E.ipc.connected) {
+            const char *json = "{\"type\":\"GUILD_STATUS\"}";
+            ipc_send(&E.ipc, json, (int)strlen(json));
+        }
         render_set_status(&E.render, "Guild panel — %s",
                           E.ipc.connected ? "connected" : "connecting...");
     } else {
@@ -379,10 +383,58 @@ static void cmd_guild_share(void *ctx) {
     }
     const char *basename = strrchr(E.filepath, '/');
     basename = basename ? basename + 1 : E.filepath;
-    char json[1024];
-    int len = snprintf(json, sizeof(json),
-        "{\"type\":\"FILE_SHARE\",\"name\":\"%s\",\"data_b64\":\"\"}", basename);
+
+    FILE *f = fopen(E.filepath, "rb");
+    if (!f) {
+        render_set_status(&E.render, "Could not read file for sharing");
+        return;
+    }
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        render_set_status(&E.render, "Could not size file for sharing");
+        return;
+    }
+    long file_len = ftell(f);
+    if (file_len < 0 || file_len > 10 * 1024 * 1024) {
+        fclose(f);
+        render_set_status(&E.render, "Share limit is 10MB");
+        return;
+    }
+    rewind(f);
+
+    unsigned char *data = malloc((size_t)file_len);
+    if (!data) {
+        fclose(f);
+        render_set_status(&E.render, "Out of memory sharing file");
+        return;
+    }
+    size_t read_len = fread(data, 1, (size_t)file_len, f);
+    fclose(f);
+    if (read_len != (size_t)file_len) {
+        free(data);
+        render_set_status(&E.render, "Could not read file for sharing");
+        return;
+    }
+
+    char *b64 = base64_encode_bytes(data, read_len);
+    free(data);
+    if (!b64) {
+        render_set_status(&E.render, "Out of memory encoding file");
+        return;
+    }
+
+    size_t json_cap = strlen(basename) + strlen(b64) + 96;
+    char *json = malloc(json_cap);
+    if (!json) {
+        free(b64);
+        render_set_status(&E.render, "Out of memory sharing file");
+        return;
+    }
+    int len = snprintf(json, json_cap,
+        "{\"type\":\"FILE_SHARE\",\"name\":\"%s\",\"data_b64\":\"%s\"}", basename, b64);
+    free(b64);
     ipc_send(&E.ipc, json, len);
+    free(json);
     render_set_status(&E.render, "Shared: %s", basename);
 }
 
@@ -393,6 +445,66 @@ static void cmd_guild_collab(void *ctx) {
         return;
     }
     render_set_status(&E.render, "Collab: use :collab <peer> in palette");
+}
+
+static void handle_net_message(const char *msg) {
+    char type[64];
+    if (!json_get_string(msg, "type", type, sizeof(type)))
+        return;
+
+    if (strcmp(type, "GUILD_STATUS_RESP") == 0) {
+        json_get_string(msg, "guild_name", E.guild_name, sizeof(E.guild_name));
+        json_get_string(msg, "my_handle", E.guild_handle, sizeof(E.guild_handle));
+        json_get_int(msg, "peer_count", &E.guild_peer_count);
+        snprintf(E.guild_last_event, sizeof(E.guild_last_event),
+                 "%d peer%s online", E.guild_peer_count,
+                 E.guild_peer_count == 1 ? "" : "s");
+        E.render.full_redraw = true;
+    } else if (strcmp(type, "CHAT_RECV") == 0 ||
+               strcmp(type, "DM_RECV") == 0) {
+        char from[64], text[128];
+        json_get_string(msg, "from", from, sizeof(from));
+        json_get_string(msg, "text", text, sizeof(text));
+        snprintf(E.guild_last_event, sizeof(E.guild_last_event),
+                 "%s: %s", from, text);
+        render_set_status(&E.render, "%s", E.guild_last_event);
+        E.render.full_redraw = true;
+    } else if (strcmp(type, "PING_RECV") == 0) {
+        char from[64], file[128];
+        int line = 0;
+        json_get_string(msg, "from", from, sizeof(from));
+        json_get_string(msg, "file", file, sizeof(file));
+        json_get_int(msg, "line", &line);
+        snprintf(E.guild_last_event, sizeof(E.guild_last_event),
+                 "Ping from %s: %s:%d", from, file, line);
+        render_set_status(&E.render, "%s", E.guild_last_event);
+        E.render.full_redraw = true;
+    } else if (strcmp(type, "FILE_RECEIVED") == 0) {
+        char from[64], name[128];
+        int size = 0;
+        json_get_string(msg, "from", from, sizeof(from));
+        json_get_string(msg, "name", name, sizeof(name));
+        json_get_int(msg, "size", &size);
+        snprintf(E.guild_last_event, sizeof(E.guild_last_event),
+                 "File from %s: %s (%d bytes)", from, name, size);
+        render_set_status(&E.render, "%s", E.guild_last_event);
+        E.render.full_redraw = true;
+    } else if (strcmp(type, "INVITE_CREATED") == 0) {
+        char fp[128];
+        json_get_string(msg, "fingerprint", fp, sizeof(fp));
+        snprintf(E.guild_last_event, sizeof(E.guild_last_event),
+                 "Invite created; fingerprint %s", fp);
+        render_set_status(&E.render, "%s", E.guild_last_event);
+    } else if (strcmp(type, "TRUST_WARNING") == 0 ||
+               strcmp(type, "ERROR") == 0) {
+        char text[192];
+        if (!json_get_string(msg, "message", text, sizeof(text)))
+            json_get_string(msg, "received", text, sizeof(text));
+        snprintf(E.guild_last_event, sizeof(E.guild_last_event),
+                 "%s", text);
+        render_set_status(&E.render, "forge-net: %s", text);
+        E.render.full_redraw = true;
+    }
 }
 
 /* ── Guild panel rendering ───────────────────────────────────── */
@@ -420,10 +532,14 @@ static void render_guild_panel(void) {
             buf[blen++] = ' ';
     }
 
+    const char *guild_name = E.guild_name[0] ? E.guild_name : E.cfg.guild_name;
+    const char *handle = E.guild_handle[0] ? E.guild_handle : E.cfg.guild_handle;
+
     /* Header */
     blen += snprintf(buf + blen, sizeof(buf) - blen,
-        "\x1b[1;%dH\x1b[38;2;%u;%u;%um\x1b[1m ⚡ GUILD\x1b[0m",
-        panel_x, t->accent.r, t->accent.g, t->accent.b);
+        "\x1b[1;%dH\x1b[38;2;%u;%u;%um\x1b[1m GUILD: %.20s\x1b[0m",
+        panel_x, t->accent.r, t->accent.g, t->accent.b,
+        guild_name[0] ? guild_name : "local");
 
     /* Connection status */
     blen += snprintf(buf + blen, sizeof(buf) - blen,
@@ -432,22 +548,38 @@ static void render_guild_panel(void) {
         t->gutter_fg.r, t->gutter_fg.g, t->gutter_fg.b,
         E.ipc.connected ? "● Connected" : "○ Disconnected");
 
+    blen += snprintf(buf + blen, sizeof(buf) - blen,
+        "\x1b[3;%dH\x1b[48;2;%u;%u;%um\x1b[38;2;%u;%u;%um @%.18s  %d online",
+        panel_x, t->gutter_bg.r, t->gutter_bg.g, t->gutter_bg.b,
+        t->gutter_fg.r, t->gutter_fg.g, t->gutter_fg.b,
+        handle[0] ? handle : "anon", E.guild_peer_count);
+
     /* Divider */
     blen += snprintf(buf + blen, sizeof(buf) - blen,
-        "\x1b[3;%dH\x1b[38;2;%u;%u;%um",
+        "\x1b[4;%dH\x1b[38;2;%u;%u;%um",
         panel_x, t->gutter_fg.r, t->gutter_fg.g, t->gutter_fg.b);
     for (int i = 0; i < panel_width && blen < (int)sizeof(buf) - 8; i++)
         blen += snprintf(buf + blen, sizeof(buf) - blen, "─");
 
     /* Peers section */
     blen += snprintf(buf + blen, sizeof(buf) - blen,
-        "\x1b[4;%dH\x1b[38;2;%u;%u;%um\x1b[1m Peers\x1b[0m",
+        "\x1b[5;%dH\x1b[38;2;%u;%u;%um\x1b[1m Peers\x1b[0m",
         panel_x, t->statusbar_fg.r, t->statusbar_fg.g, t->statusbar_fg.b);
 
     blen += snprintf(buf + blen, sizeof(buf) - blen,
-        "\x1b[5;%dH\x1b[48;2;%u;%u;%um\x1b[38;2;%u;%u;%um  Scanning LAN...",
+        "\x1b[6;%dH\x1b[48;2;%u;%u;%um\x1b[38;2;%u;%u;%um  %s",
         panel_x, t->gutter_bg.r, t->gutter_bg.g, t->gutter_bg.b,
-        t->comment.r, t->comment.g, t->comment.b);
+        t->comment.r, t->comment.g, t->comment.b,
+        E.ipc.connected ? "Encrypted peer sync active" : "Waiting for forge-net...");
+
+    blen += snprintf(buf + blen, sizeof(buf) - blen,
+        "\x1b[8;%dH\x1b[38;2;%u;%u;%um\x1b[1m Activity\x1b[0m",
+        panel_x, t->statusbar_fg.r, t->statusbar_fg.g, t->statusbar_fg.b);
+    blen += snprintf(buf + blen, sizeof(buf) - blen,
+        "\x1b[9;%dH\x1b[48;2;%u;%u;%um\x1b[38;2;%u;%u;%um  %.30s",
+        panel_x, t->gutter_bg.r, t->gutter_bg.g, t->gutter_bg.b,
+        t->comment.r, t->comment.g, t->comment.b,
+        E.guild_last_event[0] ? E.guild_last_event : "No network events yet");
 
     /* Commands help */
     int hr = panel_height - 4;
@@ -608,6 +740,9 @@ int main(int argc, char **argv) {
     /* ── Load config ──────────────────────────────────────── */
     config_default(&E.cfg);
     config_load(&E.cfg, config_default_path());
+    strncpy(E.guild_name, E.cfg.guild_name, sizeof(E.guild_name) - 1);
+    strncpy(E.guild_handle, E.cfg.guild_handle, sizeof(E.guild_handle) - 1);
+    strncpy(E.guild_last_event, "Not connected", sizeof(E.guild_last_event) - 1);
 
     /* ── Load theme ───────────────────────────────────────── */
     theme_load(&E.theme, E.cfg.theme_name);
@@ -830,11 +965,17 @@ int main(int argc, char **argv) {
             while (msgs > 0) {
                 char *msg = ipc_read_message(&E.ipc);
                 if (msg) {
-                    /* Handle incoming guild messages */
-                    /* For now, just log them */
+                    handle_net_message(msg);
                     free(msg);
                 }
                 msgs--;
+            }
+            if (E.guild_panel_visible) {
+                if (E.guild_status_timer-- <= 0) {
+                    const char *json = "{\"type\":\"GUILD_STATUS\"}";
+                    ipc_send(&E.ipc, json, (int)strlen(json));
+                    E.guild_status_timer = 120;
+                }
             }
         } else if (E.guild_panel_visible) {
             /* Try reconnecting periodically */

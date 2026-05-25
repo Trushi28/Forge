@@ -67,7 +67,7 @@ impl GuildState {
 
     /// Load configuration from profile.toml
     pub fn load_config(&mut self) {
-        if let Some(home) = std::env::var("HOME").ok() {
+        if let Ok(home) = std::env::var("HOME") {
             let path = format!("{}/.config/forge/profile.toml", home);
             if let Ok(content) = std::fs::read_to_string(&path) {
                 for line in content.lines() {
@@ -86,8 +86,10 @@ impl GuildState {
                         }
                     }
                 }
-                eprintln!("forge-net: loaded profile: {} in guild '{}'",
-                         self.my_handle, self.guild_name);
+                eprintln!(
+                    "forge-net: loaded profile: {} in guild '{}'",
+                    self.my_handle, self.guild_name
+                );
             }
         }
     }
@@ -101,6 +103,24 @@ impl GuildState {
         } else {
             self.peers.push(peer);
         }
+    }
+
+    pub fn add_or_update_peer(
+        &mut self,
+        handle: String,
+        guild_name: String,
+        addr: String,
+        current_file: String,
+    ) {
+        let peer = GuildPeer {
+            handle,
+            name: guild_name,
+            color: "cyan".to_string(),
+            addr,
+            last_seen: SystemTime::now(),
+            current_file,
+        };
+        self.add_peer(peer);
     }
 
     pub fn remove_peer(&mut self, handle: &str) {
@@ -154,7 +174,8 @@ impl GuildState {
 
     pub fn add_shared_file(&mut self, name: String, from: String, size: usize) {
         // Remove existing with same name from same user
-        self.shared_files.retain(|f| !(f.name == name && f.from == from));
+        self.shared_files
+            .retain(|f| !(f.name == name && f.from == from));
 
         self.shared_files.push(SharedFileEntry {
             name,
@@ -165,7 +186,8 @@ impl GuildState {
     }
 
     pub fn remove_shared_file(&mut self, name: &str, from: &str) {
-        self.shared_files.retain(|f| !(f.name == name && f.from == from));
+        self.shared_files
+            .retain(|f| !(f.name == name && f.from == from));
     }
 
     pub fn peer_count(&self) -> usize {

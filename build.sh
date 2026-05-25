@@ -128,6 +128,13 @@ name = ""
 color = "cyan"
 announce_lan = true
 
+[guild.net]
+mode = "lan+internet"
+relay = "auto"
+registry_url = ""
+trust = "tofu"
+max_file_mb = 10
+
 [hooks]
 # on_save = "echo saved"
 # on_open = ""

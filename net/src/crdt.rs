@@ -36,11 +36,11 @@ pub enum CrdtOp {
         id: CharId,
         value: char,
         parent: Option<CharId>,
+        #[serde(default)]
+        before: Option<CharId>,
     },
     #[serde(rename = "delete")]
-    Delete {
-        id: CharId,
-    },
+    Delete { id: CharId },
 }
 
 /// A collaborative document backed by a sequence CRDT
@@ -67,9 +67,14 @@ impl CollabDoc {
     pub fn from_text(agent: u32, text: &str) -> Self {
         let mut doc = Self::new(agent);
         let mut parent: Option<CharId> = None;
+        let mut initial_seq = 0;
 
         for ch in text.chars() {
-            let id = doc.next_id();
+            initial_seq += 1;
+            let id = CharId {
+                agent: 0,
+                seq: initial_seq,
+            };
             let crdt_char = CrdtChar {
                 id,
                 value: ch,
@@ -96,29 +101,14 @@ impl CollabDoc {
 
     /// Insert a character at a logical position. Returns the operation to broadcast.
     pub fn insert(&mut self, pos: usize, value: char) -> CrdtOp {
-        let parent = if pos == 0 {
-            None
-        } else {
-            // Find the visible character at position pos-1
-            let mut visible_count = 0;
-            let mut parent_id = None;
-            for c in &self.chars {
-                if !c.deleted {
-                    visible_count += 1;
-                    if visible_count == pos {
-                        parent_id = Some(c.id);
-                        break;
-                    }
-                }
-            }
-            parent_id
-        };
+        let (parent, before) = self.neighbor_ids(pos);
 
         let id = self.next_id();
         let op = CrdtOp::Insert {
             id,
             value,
             parent,
+            before,
         };
 
         self.apply_op(&op);
@@ -150,7 +140,12 @@ impl CollabDoc {
     /// Apply a remote operation (or our own, idempotently)
     pub fn apply_op(&mut self, op: &CrdtOp) {
         match op {
-            CrdtOp::Insert { id, value, parent } => {
+            CrdtOp::Insert {
+                id,
+                value,
+                parent,
+                before,
+            } => {
                 // Check if already applied
                 if self.id_index.contains_key(id) {
                     return;
@@ -164,47 +159,7 @@ impl CollabDoc {
                 };
 
                 // Find insertion position
-                let insert_idx = if let Some(parent_id) = parent {
-                    if let Some(&parent_idx) = self.id_index.get(parent_id) {
-                        // Insert after parent, but before any existing children with
-                        // higher agent IDs (for deterministic ordering)
-                        let mut idx = parent_idx + 1;
-                        while idx < self.chars.len() {
-                            if let Some(ref their_parent) = self.chars[idx].parent {
-                                if *their_parent == *parent_id {
-                                    // Same parent — compare agent IDs for ordering
-                                    if self.chars[idx].id.agent > id.agent {
-                                        break;
-                                    }
-                                    if self.chars[idx].id.agent == id.agent
-                                        && self.chars[idx].id.seq > id.seq
-                                    {
-                                        break;
-                                    }
-                                }
-                            }
-                            idx += 1;
-                        }
-                        idx
-                    } else {
-                        self.chars.len()
-                    }
-                } else {
-                    // No parent — insert at beginning, but after any existing
-                    // beginning chars with higher priority
-                    let mut idx = 0;
-                    while idx < self.chars.len() {
-                        if self.chars[idx].parent.is_none() {
-                            if self.chars[idx].id.agent > id.agent {
-                                break;
-                            }
-                        } else {
-                            break;
-                        }
-                        idx += 1;
-                    }
-                    idx
-                };
+                let insert_idx = self.find_insert_idx(id, parent, before);
 
                 self.chars.insert(insert_idx, crdt_char);
 
@@ -225,6 +180,54 @@ impl CollabDoc {
         for (i, c) in self.chars.iter().enumerate() {
             self.id_index.insert(c.id, i);
         }
+    }
+
+    fn neighbor_ids(&self, pos: usize) -> (Option<CharId>, Option<CharId>) {
+        let mut visible_pos = 0;
+        let mut parent = None;
+        let mut before = None;
+
+        for c in &self.chars {
+            if c.deleted {
+                continue;
+            }
+
+            if visible_pos == pos {
+                before = Some(c.id);
+                break;
+            }
+
+            parent = Some(c.id);
+            visible_pos += 1;
+        }
+
+        (parent, before)
+    }
+
+    fn find_insert_idx(
+        &self,
+        id: &CharId,
+        parent: &Option<CharId>,
+        before: &Option<CharId>,
+    ) -> usize {
+        let lower_bound = parent
+            .and_then(|parent_id| self.id_index.get(&parent_id).copied().map(|idx| idx + 1))
+            .unwrap_or(0);
+        let upper_bound = before
+            .and_then(|before_id| self.id_index.get(&before_id).copied())
+            .unwrap_or(self.chars.len());
+
+        let mut idx = lower_bound.min(self.chars.len());
+        let end = upper_bound.min(self.chars.len());
+        while idx < end {
+            let candidate = self.chars[idx].id;
+            if candidate.agent > id.agent || (candidate.agent == id.agent && candidate.seq > id.seq)
+            {
+                break;
+            }
+            idx += 1;
+        }
+        idx
     }
 
     /// Get the current text content

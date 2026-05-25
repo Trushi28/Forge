@@ -12,27 +12,23 @@ use tokio::sync::Mutex;
 const SERVICE_TYPE: &str = "_forge._tcp.local.";
 
 /// Announce our presence on the LAN via mDNS
-pub fn announce(handle: &str, guild: &str, port: u16) -> Result<ServiceDaemon, Box<dyn std::error::Error>> {
+pub fn announce(
+    handle: &str,
+    guild: &str,
+    port: u16,
+) -> Result<ServiceDaemon, Box<dyn std::error::Error>> {
     let mdns = ServiceDaemon::new()?;
 
     let host = format!("{}.local.", handle);
-    let properties = [
-        ("guild", guild),
-        ("handle", handle),
-        ("version", "0.1"),
-    ];
+    let properties = [("guild", guild), ("handle", handle), ("version", "0.1")];
 
-    let service = ServiceInfo::new(
-        SERVICE_TYPE,
-        handle,
-        &host,
-        "",
-        port,
-        &properties[..],
-    )?;
+    let service = ServiceInfo::new(SERVICE_TYPE, handle, &host, "", port, &properties[..])?;
 
     mdns.register(service)?;
-    eprintln!("forge-net: announced as '{}' in guild '{}' on port {}", handle, guild, port);
+    eprintln!(
+        "forge-net: announced as '{}' in guild '{}' on port {}",
+        handle, guild, port
+    );
 
     Ok(mdns)
 }
@@ -51,10 +47,12 @@ pub async fn run_discovery(
             Ok(event) => {
                 match event {
                     ServiceEvent::ServiceResolved(info) => {
-                        let handle = info.get_property_val_str("handle")
+                        let handle = info
+                            .get_property_val_str("handle")
                             .unwrap_or_default()
                             .to_string();
-                        let guild_name = info.get_property_val_str("guild")
+                        let guild_name = info
+                            .get_property_val_str("guild")
                             .unwrap_or_default()
                             .to_string();
 
@@ -70,7 +68,10 @@ pub async fn run_discovery(
                             }
                         }
 
-                        let addr = info.get_addresses().iter().next()
+                        let addr = info
+                            .get_addresses()
+                            .iter()
+                            .next()
                             .map(|a| a.to_string())
                             .unwrap_or_default();
                         let port = info.get_port();
@@ -93,9 +94,7 @@ pub async fn run_discovery(
                     }
                     ServiceEvent::ServiceRemoved(_service_type, fullname) => {
                         // Extract handle from fullname
-                        let handle = fullname.split('.').next()
-                            .unwrap_or("")
-                            .to_string();
+                        let handle = fullname.split('.').next().unwrap_or("").to_string();
 
                         if !handle.is_empty() {
                             let mut gs = guild_state.lock().await;
