@@ -1,5 +1,6 @@
 CC      = gcc
-CFLAGS  = -Wall -Wextra -std=c11 -O2 -Wno-unused-result -Wno-format-truncation -D_GNU_SOURCE
+CFLAGS  = -Wall -Wextra -std=c11 -O2 -Wno-unused-result -Wno-format-truncation \
+          -Wno-missing-field-initializers -D_GNU_SOURCE
 SRCDIR  = core
 BUILDDIR = build
 TARGET  = forge
@@ -50,4 +51,3 @@ debug: $(BUILDDIR) $(TARGET)
 clean:
 	rm -rf $(BUILDDIR) $(TARGET)
 	rm -f $(SRCDIR)/*.o
-
