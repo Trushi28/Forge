@@ -54,6 +54,25 @@ typedef struct {
     int   lang_rust_indent;
     char  lang_rust_formatter[256];
     char  lang_rust_lsp[64];
+    
+    /* Slot-based UI widgets config */
+    char  gutter_widgets[8][64];
+    int   gutter_widget_count;
+    
+    char  statusbar_widgets[8][64];
+    int   statusbar_widget_count;
+    
+    char  bottombar_widgets[8][64];
+    int   bottombar_widget_count;
+    
+    char  topbar_widgets[8][64];
+    int   topbar_widget_count;
+    bool  topbar_visible;
+    
+    char  right_panel_widgets[8][64];
+    int   right_panel_widget_count;
+    bool  right_panel_visible;
+    int   right_panel_width;
 
     /* Internal */
     char  filepath[FORGE_MAX_PATH];

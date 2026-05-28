@@ -353,7 +353,7 @@ async fn handle_peer_msg(msg: PeerMsg, runtime: &PeerRuntime) {
                 .add_shared_file(name.clone(), from.clone(), size);
             let _ = runtime
                 .events
-                .send(OutgoingMsg::FileReceived { name, from, size });
+                .send(OutgoingMsg::FileReceived { name, from, size, data_b64: None });
         }
         PeerMsg::FileDrop { from, name } => {
             runtime.file_pool.lock().await.remove_file(&from, &name);
@@ -392,9 +392,29 @@ async fn handle_peer_msg(msg: PeerMsg, runtime: &PeerRuntime) {
             from: _,
             op_json,
         } => {
+            // Apply the remote op to the local CRDT session and get the edit position
+            let mut cm = runtime.collab_mgr.lock().await;
+            let mut edit_info = None;
+            if let Some(session) = cm.get_session(session_id) {
+                if let Ok(op) = serde_json::from_str(&op_json) {
+                    let (pos, is_insert, text_len) = session.apply_remote_get_edit(&op);
+                    // Build a simple position-annotated op_json for the C editor
+                    let annotated = format!(
+                        "{{\"pos\":{},\"is_insert\":{},\"text_len\":{},\"raw\":{}}}",
+                        pos,
+                        if is_insert { "true" } else { "false" },
+                        text_len,
+                        op_json
+                    );
+                    edit_info = Some(annotated);
+                }
+            }
+            drop(cm);
+
+            let final_json = edit_info.unwrap_or(op_json);
             let _ = runtime.events.send(OutgoingMsg::CrdtRemote {
                 session_id,
-                op_json,
+                op_json: final_json,
             });
         }
         PeerMsg::Cursor { .. } => {}

@@ -88,6 +88,36 @@ impl CollabSession {
         self.doc.apply_op(op);
     }
 
+    /// Apply a remote operation and return the logical character offset
+    /// where the edit occurred, plus whether it was an insert (true) or delete (false).
+    /// Returns (position, is_insert, text_len).
+    pub fn apply_remote_get_edit(&mut self, op: &CrdtOp) -> (usize, bool, usize) {
+        let before = self.doc.text();
+        self.doc.apply_op(op);
+        let after = self.doc.text();
+
+        // Find the divergence point
+        let before_bytes = before.as_bytes();
+        let after_bytes = after.as_bytes();
+        let mut pos = 0;
+        while pos < before_bytes.len() && pos < after_bytes.len() && before_bytes[pos] == after_bytes[pos] {
+            pos += 1;
+        }
+
+        if after.len() > before.len() {
+            // Insertion
+            let inserted_len = after.len() - before.len();
+            (pos, true, inserted_len)
+        } else if after.len() < before.len() {
+            // Deletion
+            let deleted_len = before.len() - after.len();
+            (pos, false, deleted_len)
+        } else {
+            // Same length — replacement or no-op
+            (pos, true, 0)
+        }
+    }
+
     /// Get the current document text
     pub fn text(&self) -> String {
         self.doc.text()

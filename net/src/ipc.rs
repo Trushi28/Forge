@@ -126,6 +126,8 @@ pub enum OutgoingMsg {
         name: String,
         from: String,
         size: usize,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        data_b64: Option<String>,
     },
 
     #[serde(rename = "STATUS_RESP")]
@@ -371,21 +373,66 @@ pub async fn handle_connection(
                 let mut cm = collab_mgr.lock().await;
                 if let Some(session) = cm.get_session(session_id) {
                     let peer = session.peer_handle.clone();
-                    if let Ok(op) = serde_json::from_str(&op_json) {
-                        session.apply_remote(&op);
-                        eprintln!("forge-net: applied CRDT op on session {}", session_id);
+
+                    // Try to parse as a simple local edit: {"pos":N,"is_insert":bool,"text":"..."}
+                    #[derive(serde::Deserialize)]
+                    struct SimpleEdit {
+                        pos: usize,
+                        is_insert: bool,
+                        text: String,
                     }
-                    drop(cm);
-                    let _ = peer_runtime
-                        .send_to_handle(
-                            &peer,
-                            PeerMsg::CollabOp {
-                                session_id,
-                                from: guild_state.lock().await.my_handle.clone(),
-                                op_json,
-                            },
-                        )
-                        .await;
+
+                    if let Ok(edit) = serde_json::from_str::<SimpleEdit>(&op_json) {
+                        // Apply the simple edit to the CRDT session and produce CrdtOp(s)
+                        let mut ops_to_send = Vec::new();
+                        if edit.is_insert {
+                            for (i, ch) in edit.text.chars().enumerate() {
+                                let op = session.local_insert(edit.pos + i, ch);
+                                ops_to_send.push(op);
+                            }
+                        } else {
+                            let del_len = if edit.text.is_empty() { 1 } else { edit.text.len() };
+                            for _ in 0..del_len {
+                                if let Some(op) = session.local_delete(edit.pos) {
+                                    ops_to_send.push(op);
+                                }
+                            }
+                        }
+
+                        // Broadcast each op to the peer
+                        for op in &ops_to_send {
+                            if let Ok(serialized) = serde_json::to_string(op) {
+                                drop(cm);
+                                let _ = peer_runtime
+                                    .send_to_handle(
+                                        &peer,
+                                        PeerMsg::CollabOp {
+                                            session_id,
+                                            from: guild_state.lock().await.my_handle.clone(),
+                                            op_json: serialized,
+                                        },
+                                    )
+                                    .await;
+                                cm = collab_mgr.lock().await;
+                            }
+                        }
+                        eprintln!("forge-net: applied {} local edits on session {}", ops_to_send.len(), session_id);
+                    } else if let Ok(op) = serde_json::from_str(&op_json) {
+                        // Legacy: raw CrdtOp format
+                        session.apply_remote(&op);
+                        eprintln!("forge-net: applied raw CRDT op on session {}", session_id);
+                        drop(cm);
+                        let _ = peer_runtime
+                            .send_to_handle(
+                                &peer,
+                                PeerMsg::CollabOp {
+                                    session_id,
+                                    from: guild_state.lock().await.my_handle.clone(),
+                                    op_json,
+                                },
+                            )
+                            .await;
+                    }
                 }
             }
 
@@ -431,10 +478,12 @@ pub async fn handle_connection(
                 let pool = file_pool.lock().await;
                 let key = format!("{}:{}", from, name);
                 if let Some(file) = pool.files.get(&key) {
+                    let data_b64 = crate::transfer::base64_encode_pub(&file.data);
                     let resp = OutgoingMsg::FileReceived {
                         name: file.name.clone(),
                         from: file.from.clone(),
                         size: file.size,
+                        data_b64: Some(data_b64),
                     };
                     let _ = write_message(&mut writer, &resp).await;
                     eprintln!("forge-net: file grabbed: {}", name);

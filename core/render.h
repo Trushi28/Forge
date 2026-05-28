@@ -5,6 +5,7 @@
 #include "git.h"
 #include "ui.h"
 #include "theme.h"
+#include "config.h"
 #include <stdbool.h>
 #include <stdarg.h>
 
@@ -50,6 +51,10 @@ typedef struct RenderState {
 
     /* Git state pointer (set by main, read by widgets) */
     GitState  *git;
+
+    /* Config and LSP Client pointers */
+    ForgeConfig *cfg;
+    struct LSPClient *lsp;
 } RenderState;
 
 void ui_register_builtins(UIRegistry *ui);

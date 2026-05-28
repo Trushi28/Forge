@@ -149,13 +149,14 @@ int render_get_diag_severity(RenderState *r, int line) {
 
 /* ── Scroll adjustment ───────────────────────────────────────*/
 
-static void adjust_scroll(RenderState *r, int cx, int cy, int text_rows) {
+static void adjust_scroll(RenderState *r, UIRegistry *ui, int cx, int cy, int text_rows) {
     if (cy < r->scroll_row)
         r->scroll_row = cy;
     if (cy >= r->scroll_row + text_rows)
         r->scroll_row = cy - text_rows + 1;
 
-    int text_cols = r->width - GUTTER_WIDTH;
+    int gutter_w = ui->slots[SLOT_GUTTER].visible ? ui->slots[SLOT_GUTTER].width : 0;
+    int text_cols = r->width - gutter_w;
     if (cx < r->scroll_col)
         r->scroll_col = cx;
     if (cx >= r->scroll_col + text_cols)
@@ -398,6 +399,11 @@ static void gutter_widget_render(Widget *self, RenderState *r, Buffer *b) {
     (void)self;
     int text_rows = r->height - 1;
     size_t total_lines = buffer_line_count(b);
+    int gutter_w = GUTTER_WIDTH; /* default; overridden if cfg available */
+    if (r->cfg) {
+        /* Dynamically compute gutter width from config widget list */
+        gutter_w = 5; /* base: 4 digits + 1 separator */
+    }
 
     for (int y = 0; y < text_rows; y++) {
         int logical = r->scroll_row + y;
@@ -406,14 +412,15 @@ static void gutter_widget_render(Widget *self, RenderState *r, Buffer *b) {
         if ((size_t)logical < total_lines) {
             int line_no = logical + 1;
             unsigned n = (unsigned)(line_no < 1 ? 1 : line_no > 9999 ? 9999 : line_no);
-            row[4] = ' ';
-            row[3] = (char)('0' + n % 10); n /= 10;
-            row[2] = n ? (char)('0' + n % 10) : ' '; n /= 10;
-            row[1] = n ? (char)('0' + n % 10) : ' '; n /= 10;
-            row[0] = n ? (char)('0' + n % 10) : ' ';
+            row[gutter_w - 1] = ' ';
+            row[gutter_w - 2] = (char)('0' + n % 10); n /= 10;
+            row[gutter_w - 3] = n ? (char)('0' + n % 10) : ' '; n /= 10;
+            row[gutter_w - 4] = n ? (char)('0' + n % 10) : ' '; n /= 10;
+            if (gutter_w >= 5)
+                row[gutter_w - 5] = n ? (char)('0' + n % 10) : ' ';
         } else {
             row[0] = '~';
-            for (int i = 1; i < 5; i++) row[i] = ' ';
+            for (int i = 1; i < gutter_w; i++) row[i] = ' ';
         }
     }
 }
@@ -422,6 +429,7 @@ static void content_widget_render(Widget *self, RenderState *r, Buffer *b) {
     (void)self;
     int text_rows = r->height - 1;
     size_t total_lines = buffer_line_count(b);
+    int gutter_w = GUTTER_WIDTH;
 
     for (int y = 0; y < text_rows; y++) {
         int logical = r->scroll_row + y;
@@ -430,12 +438,12 @@ static void content_widget_render(Widget *self, RenderState *r, Buffer *b) {
         if ((size_t)logical < total_lines) {
             char *line = buffer_get_line(b, logical);
             if (line) {
-                int text_cols = r->width - GUTTER_WIDTH;
+                int text_cols = r->width - gutter_w;
                 int llen      = (int)strlen(line);
                 int avail     = llen - r->scroll_col;
                 if (avail > 0) {
                     int copy = avail < text_cols ? avail : text_cols;
-                    memcpy(row + GUTTER_WIDTH, line + r->scroll_col, copy);
+                    memcpy(row + gutter_w, line + r->scroll_col, copy);
                 }
                 free(line);
             }
@@ -453,6 +461,14 @@ static void statusbar_widget_render(Widget *self, RenderState *r, Buffer *b) {
 
     if (r->theme) {
         ForgeTheme *t = r->theme;
+
+        /* ── Config-driven statusbar: iterate r->cfg->statusbar_widgets ── */
+        /* Build left and right sections from widget names */
+        char left_buf[512] = "";
+        char right_buf[256] = "";
+        int left_len = 0, right_len = 0;
+
+        /* Always show the mode indicator as leftmost */
         stream_bg(r, t->statusbar_accent);
         stream_fg(r, t->statusbar_bg);
         stream_str(r, ESC_BOLD);
@@ -462,29 +478,52 @@ static void statusbar_widget_render(Widget *self, RenderState *r, Buffer *b) {
         stream_bg(r, t->statusbar_bg);
         stream_fg(r, t->statusbar_accent);
         stream_str(r, " │ ");
+        left_len = 9 + 3;
 
-        stream_fg(r, t->statusbar_fg);
-        stream_bg(r, t->statusbar_bg);
-        const char *msg = r->status_msg[0] ? r->status_msg : "ready";
-        stream_str(r, msg);
+        /* Iterate config widgets for left-side items */
+        if (r->cfg) {
+            for (int i = 0; i < r->cfg->statusbar_widget_count; i++) {
+                const char *wname = r->cfg->statusbar_widgets[i];
+                if (strcmp(wname, "mode_indicator") == 0) {
+                    /* Already rendered above */
+                } else if (strcmp(wname, "filename") == 0) {
+                    const char *msg = r->status_msg[0] ? r->status_msg : "ready";
+                    int n = snprintf(left_buf + left_len - 12, sizeof(left_buf) - left_len, "%s", msg);
+                    (void)n;
+                    stream_fg(r, t->statusbar_fg);
+                    stream_bg(r, t->statusbar_bg);
+                    stream_str(r, msg);
+                    left_len += (int)strlen(msg);
+                } else if (strcmp(wname, "lsp_status") == 0) {
+                    if (r->lsp) {
+                        /* LSP status shown as part of right section */
+                    }
+                }
+                /* git_branch and cursor_pos are right-aligned below */
+            }
+        } else {
+            stream_fg(r, t->statusbar_fg);
+            stream_bg(r, t->statusbar_bg);
+            const char *msg = r->status_msg[0] ? r->status_msg : "ready";
+            stream_str(r, msg);
+            left_len += (int)strlen(msg);
+        }
 
-        char right[128];
+        /* Right section: git_branch, theme, cursor_pos */
         const char *branch = (r->git && r->git->repo_open && r->git->branch[0])
                                ? r->git->branch : NULL;
-        int rl;
         if (branch)
-            rl = snprintf(right, sizeof(right), "  %s │ %s │ Ln %d, Col %d  ",
+            right_len = snprintf(right_buf, sizeof(right_buf), "  %s │ %s │ Ln %d, Col %d  ",
                           branch, t->name, cy + 1, cx + 1);
         else
-            rl = snprintf(right, sizeof(right), " %s │ Ln %d, Col %d  ",
+            right_len = snprintf(right_buf, sizeof(right_buf), " %s │ Ln %d, Col %d  ",
                           t->name, cy + 1, cx + 1);
 
-        int left_used = 9 + 3 + (int)strlen(msg);
-        int pad = r->width - left_used - rl;
+        int pad = r->width - left_len - right_len;
         for (int i = 0; i < pad; i++) stream_append(r, " ", 1);
 
         stream_fg(r, t->statusbar_fg);
-        stream_append(r, right, rl < (int)sizeof(right) - 1 ? rl : (int)sizeof(right) - 1);
+        stream_append(r, right_buf, right_len < (int)sizeof(right_buf) - 1 ? right_len : (int)sizeof(right_buf) - 1);
     } else {
         stream_str(r, "\x1b[7m\x1b[1m");
 
@@ -744,7 +783,7 @@ void render_frame(RenderState *r, Buffer *b, UIRegistry *ui,
     /* Reduce text area when timeline is visible */
     if (r->git && r->git->timeline_visible && r->git->commit_count > 0)
         text_rows -= TIMELINE_HEIGHT;
-    adjust_scroll(r, cx, cy, text_rows);
+    adjust_scroll(r, ui, cx, cy, text_rows);
 
     r->out_len = 0;
     stream_str(r, ESC_HIDE_CURSOR);
@@ -837,7 +876,8 @@ void render_frame(RenderState *r, Buffer *b, UIRegistry *ui,
             /* Background for this row */
             ThemeColor row_bg = is_cursor_row ? t->line_highlight : t->bg;
 
-            /* ── Gutter ─────────────────────────────────────*/
+            /* ── Gutter (dynamic width from slot bounds) ────*/
+            int gutter_w = ui->slots[SLOT_GUTTER].visible ? ui->slots[SLOT_GUTTER].width : GUTTER_WIDTH;
             stream_bg(r, t->gutter_bg);
             if (is_cursor_row)
                 stream_fg(r, t->gutter_active);
@@ -845,11 +885,12 @@ void render_frame(RenderState *r, Buffer *b, UIRegistry *ui,
                 stream_fg(r, t->gutter_fg);
 
             if ((size_t)logical < total_lines) {
-                stream_append(r, row, GUTTER_WIDTH);
+                stream_append(r, row, gutter_w);
             } else {
                 /* Past EOF: dim tilde */
                 stream_fg(r, t->gutter_fg);
-                stream_append(r, "~    ", 5);
+                stream_str(r, "~");
+                for (int gi = 1; gi < gutter_w; gi++) stream_append(r, " ", 1);
             }
 
             /* ── Diagnostic / Git diff marker after gutter ──*/
@@ -903,7 +944,7 @@ void render_frame(RenderState *r, Buffer *b, UIRegistry *ui,
                     highlight_line("", 0, &dummy, &in_block_comment);
                 }
 
-                int text_cols = r->width - GUTTER_WIDTH - 1; /* -1 for diag col */
+                int text_cols = r->width - gutter_w - 1; /* -1 for diag col */
                 int start_col = r->scroll_col;
                 ThemeColor prev_color = t->fg;
                 bool first = true;
@@ -937,7 +978,7 @@ void render_frame(RenderState *r, Buffer *b, UIRegistry *ui,
                 if (line) free(line);
             } else {
                 /* Past EOF: fill with background */
-                int fill = r->width - GUTTER_WIDTH - 1;
+                int fill = r->width - gutter_w - 1;
                 stream_bg(r, row_bg);
                 for (int x = 0; x < fill; x++)
                     stream_append(r, " ", 1);
@@ -951,9 +992,10 @@ void render_frame(RenderState *r, Buffer *b, UIRegistry *ui,
             else
                 stream_str(r, "\x1b[2;37m");
 
-            stream_append(r, row, GUTTER_WIDTH);
+            int gutter_w_fb = ui->slots[SLOT_GUTTER].visible ? ui->slots[SLOT_GUTTER].width : GUTTER_WIDTH;
+            stream_append(r, row, gutter_w_fb);
             stream_str(r, ESC_RESET);
-            stream_append(r, row + GUTTER_WIDTH, r->width - GUTTER_WIDTH);
+            stream_append(r, row + gutter_w_fb, r->width - gutter_w_fb);
         }
 
         memcpy(r->front_buffer[y], row, r->width);
@@ -964,7 +1006,8 @@ void render_frame(RenderState *r, Buffer *b, UIRegistry *ui,
 
     /* ── Place cursor ────────────────────────────────────────*/
     int screen_row = cy - r->scroll_row + 1;
-    int screen_col = cx - r->scroll_col + GUTTER_WIDTH + 1 + 1; /* +1 for diag col */
+    int final_gutter_w = ui->slots[SLOT_GUTTER].visible ? ui->slots[SLOT_GUTTER].width : GUTTER_WIDTH;
+    int screen_col = cx - r->scroll_col + final_gutter_w + 1 + 1; /* +1 for diag col */
     stream_printf(r, "\x1b[%d;%dH", screen_row, screen_col);
     stream_str(r, ESC_SHOW_CURSOR);
 

@@ -74,6 +74,11 @@ typedef struct {
   int search_saved_cx; /* cursor pos when search began */
   int search_saved_cy;
   bool search_found;
+
+  /* Collaboration state */
+  bool collab_active;
+  int  collab_session_id;
+  char collab_peer[64];
 } EditorState;
 
 static EditorState E;
@@ -199,6 +204,52 @@ static Buffer *load_file(const char *path) {
   Buffer *b = buffer_new(data, got);
   free(data);
   return b;
+}
+
+/* ── Base64 decode helper ────────────────────────────────────────── */
+static unsigned char *base64_decode_bytes(const char *input, size_t *out_len) {
+  static const int decode_table[256] = {
+    ['A']=0,['B']=1,['C']=2,['D']=3,['E']=4,['F']=5,['G']=6,['H']=7,
+    ['I']=8,['J']=9,['K']=10,['L']=11,['M']=12,['N']=13,['O']=14,['P']=15,
+    ['Q']=16,['R']=17,['S']=18,['T']=19,['U']=20,['V']=21,['W']=22,['X']=23,
+    ['Y']=24,['Z']=25,
+    ['a']=26,['b']=27,['c']=28,['d']=29,['e']=30,['f']=31,['g']=32,['h']=33,
+    ['i']=34,['j']=35,['k']=36,['l']=37,['m']=38,['n']=39,['o']=40,['p']=41,
+    ['q']=42,['r']=43,['s']=44,['t']=45,['u']=46,['v']=47,['w']=48,['x']=49,
+    ['y']=50,['z']=51,
+    ['0']=52,['1']=53,['2']=54,['3']=55,['4']=56,['5']=57,['6']=58,['7']=59,
+    ['8']=60,['9']=61,['+']=62,['/']=63
+  };
+  size_t ilen = strlen(input);
+  if (ilen == 0) { *out_len = 0; return malloc(1); }
+  size_t max_out = (ilen * 3) / 4;
+  unsigned char *out = malloc(max_out + 1);
+  size_t j = 0;
+  for (size_t i = 0; i < ilen; ) {
+    unsigned a = (i < ilen && input[i] != '=') ? decode_table[(unsigned char)input[i++]] : (i++, 0);
+    unsigned b = (i < ilen && input[i] != '=') ? decode_table[(unsigned char)input[i++]] : (i++, 0);
+    unsigned c = (i < ilen && input[i] != '=') ? decode_table[(unsigned char)input[i++]] : (i++, 0);
+    unsigned d = (i < ilen && input[i] != '=') ? decode_table[(unsigned char)input[i++]] : (i++, 0);
+    unsigned triple = (a << 18) | (b << 12) | (c << 6) | d;
+    if (j < max_out) out[j++] = (triple >> 16) & 0xFF;
+    if (j < max_out) out[j++] = (triple >> 8) & 0xFF;
+    if (j < max_out) out[j++] = triple & 0xFF;
+  }
+  /* Adjust for padding */
+  if (ilen >= 2 && input[ilen - 1] == '=') j--;
+  if (ilen >= 3 && input[ilen - 2] == '=') j--;
+  *out_len = j;
+  return out;
+}
+
+/* ── Layout update helper ── recomputes layout from config visibility ─── */
+static void update_layout(void) {
+  bool gutter_visible = E.cfg.show_line_numbers;
+  bool topbar_visible = E.cfg.topbar_visible;
+  bool right_panel_visible = E.guild_panel_visible || E.cfg.right_panel_visible;
+  int right_panel_width = E.cfg.right_panel_width > 0 ? E.cfg.right_panel_width : 35;
+  bool bottombar_visible = E.git.timeline_visible && E.cfg.git_timeline;
+  ui_layout(&E.ui, topbar_visible, gutter_visible, right_panel_visible, right_panel_width, bottombar_visible);
 }
 
 /* ── Cursor helpers ─────────────────────────────────────────── */
@@ -686,6 +737,147 @@ static void cmd_guild_collab(void *ctx) {
   render_set_status(&E.render, "Collab: use :collab <peer> in palette");
 }
 
+/* ── Send a local edit to forge-net when collab is active ──────── */
+static void send_collab_op(int pos, bool is_insert, const char *text, int len) {
+  if (!E.collab_active || !E.ipc.connected) return;
+  /* Build a simple edit message: {pos, is_insert, text} */
+  /* Escape text for JSON */
+  char escaped[2048] = "";
+  int eidx = 0;
+  for (int i = 0; i < len && eidx < (int)sizeof(escaped) - 6; i++) {
+    char c = text[i];
+    if (c == '"' || c == '\\') { escaped[eidx++] = '\\'; escaped[eidx++] = c; }
+    else if (c == '\n') { escaped[eidx++] = '\\'; escaped[eidx++] = 'n'; }
+    else if (c == '\t') { escaped[eidx++] = '\\'; escaped[eidx++] = 't'; }
+    else if (c == '\r') { escaped[eidx++] = '\\'; escaped[eidx++] = 'r'; }
+    else escaped[eidx++] = c;
+  }
+  escaped[eidx] = '\0';
+
+  char op_json[4096];
+  int op_len = snprintf(op_json, sizeof(op_json),
+      "{\"pos\":%d,\"is_insert\":%s,\"text\":\"%s\"}",
+      pos, is_insert ? "true" : "false", escaped);
+
+  char json[8192];
+  /* Escape op_json for the outer JSON string */
+  char op_escaped[4096] = "";
+  int oeidx = 0;
+  for (int i = 0; i < op_len && oeidx < (int)sizeof(op_escaped) - 4; i++) {
+    char c = op_json[i];
+    if (c == '"' || c == '\\') { op_escaped[oeidx++] = '\\'; op_escaped[oeidx++] = c; }
+    else op_escaped[oeidx++] = c;
+  }
+  op_escaped[oeidx] = '\0';
+
+  int jlen = snprintf(json, sizeof(json),
+      "{\"type\":\"COLLAB_OP\",\"session_id\":%d,\"op_json\":\"%s\"}",
+      E.collab_session_id, op_escaped);
+  ipc_send(&E.ipc, json, jlen);
+}
+
+/* ── Guild Layer colon-command dispatcher ──────────────────────── */
+static void handle_guild_command(const char *cmd) {
+  /* :collab <peer> — start collab session with peer */
+  if (strncmp(cmd, ":collab_accept", 14) == 0) {
+    if (E.collab_session_id > 0 && E.ipc.connected) {
+      char json[256];
+      int len = snprintf(json, sizeof(json),
+          "{\"type\":\"COLLAB_ACCEPT\",\"session_id\":%d}", E.collab_session_id);
+      ipc_send(&E.ipc, json, len);
+      E.collab_active = true;
+      render_set_status(&E.render, "✦ COLLAB — accepted session with %s", E.collab_peer);
+    } else {
+      render_set_status(&E.render, "No pending collab request");
+    }
+    return;
+  }
+
+  if (strncmp(cmd, ":collab ", 7) == 0) {
+    const char *peer = cmd + 7;
+    while (*peer == ' ') peer++;
+    if (*peer && E.ipc.connected) {
+      char json[512];
+      int len = snprintf(json, sizeof(json),
+          "{\"type\":\"COLLAB_START\",\"peer\":\"%s\",\"file\":\"%s\"}",
+          peer, E.filepath ? E.filepath : "");
+      ipc_send(&E.ipc, json, len);
+      render_set_status(&E.render, "Collab request sent to %s", peer);
+    } else if (!E.ipc.connected) {
+      render_set_status(&E.render, "Not connected to forge-net");
+    }
+    return;
+  }
+
+  if (strncmp(cmd, ":ping", 5) == 0) {
+    const char *target = cmd + 5;
+    while (*target == ' ') target++;
+    if (!*target) target = "all";
+    cmd_guild_ping(NULL);
+    return;
+  }
+
+  if (strcmp(cmd, ":share") == 0) {
+    cmd_guild_share(NULL);
+    return;
+  }
+
+  if (strncmp(cmd, ":grab ", 6) == 0) {
+    /* :grab <peer> <file> */
+    char peer[64] = "", file[128] = "";
+    if (sscanf(cmd + 6, "%63s %127s", peer, file) >= 2 && E.ipc.connected) {
+      char json[512];
+      int len = snprintf(json, sizeof(json),
+          "{\"type\":\"FILE_GRAB\",\"from\":\"%s\",\"name\":\"%s\"}", peer, file);
+      ipc_send(&E.ipc, json, len);
+      render_set_status(&E.render, "Grabbing %s from %s...", file, peer);
+    } else {
+      render_set_status(&E.render, "Usage: :grab <peer> <file>");
+    }
+    return;
+  }
+
+  if (strncmp(cmd, ":drop ", 6) == 0) {
+    const char *file = cmd + 6;
+    while (*file == ' ') file++;
+    if (*file && E.ipc.connected) {
+      char json[512];
+      int len = snprintf(json, sizeof(json),
+          "{\"type\":\"FILE_DROP\",\"name\":\"%s\"}", file);
+      ipc_send(&E.ipc, json, len);
+      render_set_status(&E.render, "Dropped: %s", file);
+    }
+    return;
+  }
+
+  if (strncmp(cmd, ":save ", 6) == 0) {
+    const char *path = cmd + 6;
+    while (*path == ' ') path++;
+    if (*path) {
+      E.filepath = path;
+      cmd_save(NULL);
+    } else {
+      render_set_status(&E.render, "Usage: :save <path>");
+    }
+    return;
+  }
+
+  if (strncmp(cmd, ":chat ", 6) == 0) {
+    const char *text = cmd + 6;
+    while (*text == ' ') text++;
+    if (*text && E.ipc.connected) {
+      char json[1024];
+      int len = snprintf(json, sizeof(json),
+          "{\"type\":\"CHAT_SEND\",\"guild\":\"\",\"text\":\"%s\"}", text);
+      ipc_send(&E.ipc, json, len);
+      render_set_status(&E.render, "Chat: %s", text);
+    }
+    return;
+  }
+
+  render_set_status(&E.render, "Unknown guild command: %s", cmd);
+}
+
 static void handle_net_message(const char *msg) {
   char type[64];
   if (!json_get_string(msg, "type", type, sizeof(type)))
@@ -716,15 +908,115 @@ static void handle_net_message(const char *msg) {
              "Ping from %s: %s:%d", from, file, line);
     render_set_status(&E.render, "%s", E.guild_last_event);
     E.render.full_redraw = true;
+  } else if (strcmp(type, "COLLAB_REQUEST") == 0) {
+    /* Incoming collab request from a peer */
+    char from[64], file[128];
+    int session_id = 0;
+    json_get_string(msg, "from", from, sizeof(from));
+    json_get_string(msg, "file", file, sizeof(file));
+    json_get_int(msg, "session_id", &session_id);
+    E.collab_session_id = session_id;
+    snprintf(E.collab_peer, sizeof(E.collab_peer), "%s", from);
+    snprintf(E.guild_last_event, sizeof(E.guild_last_event),
+             "Collab request from %s on %s — :collab_accept to join", from, file);
+    render_set_status(&E.render, "%s", E.guild_last_event);
+    E.render.full_redraw = true;
+  } else if (strcmp(type, "COLLAB_ACCEPTED") == 0) {
+    /* Our collab request was accepted — activate live editing */
+    int session_id = 0;
+    char peer[64];
+    json_get_int(msg, "session_id", &session_id);
+    json_get_string(msg, "peer", peer, sizeof(peer));
+    E.collab_active = true;
+    E.collab_session_id = session_id;
+    snprintf(E.collab_peer, sizeof(E.collab_peer), "%s", peer);
+    snprintf(E.guild_last_event, sizeof(E.guild_last_event),
+             "Collab active with %s (session %d)", peer, session_id);
+    render_set_status(&E.render, "✦ COLLAB ACTIVE with %s", peer);
+    E.render.full_redraw = true;
+  } else if (strcmp(type, "COLLAB_DECLINED") == 0) {
+    E.collab_active = false;
+    E.collab_session_id = 0;
+    E.collab_peer[0] = '\0';
+    render_set_status(&E.render, "Collab request declined");
+    E.render.full_redraw = true;
+  } else if (strcmp(type, "CRDT_REMOTE") == 0) {
+    /* Incoming CRDT operation from remote peer — apply to buffer */
+    int session_id = 0;
+    char op_json[4096];
+    json_get_int(msg, "session_id", &session_id);
+    if (session_id == E.collab_session_id && E.collab_active) {
+      if (json_get_string(msg, "op_json", op_json, sizeof(op_json))) {
+        /* Parse the operation: expect {"pos":N,"is_insert":true/false,"text":"..."} */
+        int pos = 0;
+        char text[1024] = "";
+        json_get_int(op_json, "pos", &pos);
+        json_get_string(op_json, "text", text, sizeof(text));
+        /* Check for "is_insert" (simple string check for "true") */
+        const char *p = strstr(op_json, "\"is_insert\"");
+        bool is_insert = (p && strstr(p, "true"));
+        if (is_insert && text[0]) {
+          buffer_insert(E.buf, (size_t)pos, text, (int)strlen(text));
+          /* Adjust cursor if insertion is before our position */
+          size_t cur_off = buffer_get_offset(E.buf, E.cx, E.cy);
+          if ((size_t)pos <= cur_off) {
+            int new_row, new_col;
+            offset_to_rowcol(cur_off + strlen(text), &new_row, &new_col);
+            E.cy = new_row;
+            E.cx = new_col;
+          }
+        } else if (!is_insert) {
+          int del_len = (int)strlen(text);
+          if (del_len == 0) del_len = 1;
+          size_t cur_off = buffer_get_offset(E.buf, E.cx, E.cy);
+          buffer_delete(E.buf, (size_t)pos, del_len);
+          /* Adjust cursor if deletion is before our position */
+          if ((size_t)pos < cur_off) {
+            size_t shift = (size_t)del_len;
+            if (shift > cur_off - (size_t)pos) shift = cur_off - (size_t)pos;
+            int new_row, new_col;
+            offset_to_rowcol(cur_off - shift, &new_row, &new_col);
+            E.cy = new_row;
+            E.cx = new_col;
+          }
+        }
+        E.render.full_redraw = true;
+        render_set_status(&E.render, "✦ COLLAB — remote edit from %s", E.collab_peer);
+      }
+    }
   } else if (strcmp(type, "FILE_RECEIVED") == 0) {
-    char from[64], name[128];
+    char from[64], name[128], data_b64[1024 * 1024];
     int size = 0;
     json_get_string(msg, "from", from, sizeof(from));
     json_get_string(msg, "name", name, sizeof(name));
     json_get_int(msg, "size", &size);
-    snprintf(E.guild_last_event, sizeof(E.guild_last_event),
-             "File from %s: %s (%d bytes)", from, name, size);
-    render_set_status(&E.render, "%s", E.guild_last_event);
+    /* If data_b64 is present, decode and open the file */
+    if (json_get_string(msg, "data_b64", data_b64, sizeof(data_b64)) && data_b64[0]) {
+      size_t decoded_len = 0;
+      unsigned char *decoded = base64_decode_bytes(data_b64, &decoded_len);
+      if (decoded && decoded_len > 0) {
+        /* Write to a temp file and open it */
+        char tmppath[512];
+        snprintf(tmppath, sizeof(tmppath), "/tmp/forge_grab_%s", name);
+        FILE *f = fopen(tmppath, "wb");
+        if (f) {
+          fwrite(decoded, 1, decoded_len, f);
+          fclose(f);
+          buffer_free(E.buf);
+          E.buf = load_file(tmppath);
+          E.filepath = NULL; /* grabbed file, no save path */
+          E.cx = 0;
+          E.cy = 0;
+          E.modified = false;
+          render_set_status(&E.render, "Grabbed: %s from %s (%zu bytes)", name, from, decoded_len);
+        }
+        free(decoded);
+      }
+    } else {
+      snprintf(E.guild_last_event, sizeof(E.guild_last_event),
+               "File from %s: %s (%d bytes)", from, name, size);
+      render_set_status(&E.render, "%s", E.guild_last_event);
+    }
     E.render.full_redraw = true;
   } else if (strcmp(type, "INVITE_CREATED") == 0) {
     char fp[128];
@@ -1012,6 +1304,8 @@ int main(int argc, char **argv) {
   ui_register_builtins(&E.ui);
   render_init(&E.render, term_cols, term_rows);
   render_set_theme(&E.render, &E.theme);
+  E.render.cfg = &E.cfg;
+  E.render.lsp = (struct LSPClient *)E.lsp;
 
   /* ── Initialize undo ──────────────────────────────────── */
   undo_init(&E.undo);
@@ -1120,7 +1414,13 @@ int main(int argc, char **argv) {
   E.modified = false;
   E.show_hover = false;
   E.lsp_dirty = false;
+  E.collab_active = false;
+  E.collab_session_id = 0;
+  E.collab_peer[0] = '\0';
   get_time(&E.lsp_last_edit);
+
+  /* Apply initial layout from config */
+  update_layout();
 
   /* Send didOpen once LSP initializes — checked in poll loop */
   bool lsp_did_open_sent = false;
@@ -1134,6 +1434,7 @@ int main(int argc, char **argv) {
         render_resize(&E.render, term_cols, term_rows);
         render_set_theme(&E.render, &E.theme);
         ui_resize(&E.ui, term_cols, term_rows);
+        update_layout();
       }
     }
 
@@ -1274,6 +1575,13 @@ int main(int argc, char **argv) {
       /* Check if palette produced a result */
       if (E.palette.accepted) {
         E.palette.accepted = false;
+
+        /* Check if input starts with ':' — dispatch as Guild command */
+        if (E.palette.input[0] == ':') {
+          handle_guild_command(E.palette.input);
+          E.render.full_redraw = true;
+          continue;
+        }
 
         if (E.palette.mode == PALETTE_GOTO_LINE || E.palette.goto_line > 0) {
           int target = E.palette.goto_line - 1;
@@ -1946,6 +2254,7 @@ int main(int argc, char **argv) {
       E.cy++;
       E.cx = indent;
       mark_modified();
+      send_collab_op((int)pos, true, insert_buf, ilen);
 
       /* ── Backspace ────────────────────────────────────── */
     } else if (key == KEY_BACKSPACE) {
@@ -1979,6 +2288,7 @@ int main(int argc, char **argv) {
         }
 
         mark_modified();
+        send_collab_op((int)(pos - 1), false, &deleted_char, 1);
       }
 
       /* Update completion filter if visible */
@@ -2005,6 +2315,7 @@ int main(int argc, char **argv) {
         }
 
         mark_modified();
+        send_collab_op((int)pos, false, &deleted_char, 1);
       }
 
       /* Update completion filter on forward delete too */
@@ -2050,6 +2361,8 @@ int main(int argc, char **argv) {
           E.cx++;
         }
         mark_modified();
+        send_collab_op((int)pos, true, E.cfg.use_spaces ? "    " : "\t",
+                       E.cfg.use_spaces ? spaces : 1);
       }
 
       /* ── Printable characters ─────────────────────────── */
@@ -2065,6 +2378,7 @@ int main(int argc, char **argv) {
 
       E.cx++;
       mark_modified();
+      send_collab_op((int)pos, true, &c, 1);
 
       /* Auto-trigger completion on identifier chars and trigger chars */
       maybe_request_completion(key);

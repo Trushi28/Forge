@@ -8,40 +8,57 @@
      rows 2..H-1      : CONTENT  (full width; GUTTER is virtual inside it)
      row H            : STATUSBAR (height 1, handled by render_frame directly)
    RIGHT_PANEL and BOTTOMBAR default hidden.                           */
-static void layout(UIRegistry *ui) {
+void ui_layout(UIRegistry *ui, bool topbar_visible, bool gutter_visible, bool right_panel_visible, int right_panel_width, bool bottombar_visible) {
     int W = ui->term_w, H = ui->term_h;
 
-    /* TOPBAR – hidden for now */
-    ui->slots[SLOT_TOPBAR].row    = 1;
-    ui->slots[SLOT_TOPBAR].col    = 1;
-    ui->slots[SLOT_TOPBAR].width  = W;
-    ui->slots[SLOT_TOPBAR].height = 0;
-    ui->slots[SLOT_TOPBAR].visible = false;
+    int top_h = topbar_visible ? 1 : 0;
+    int status_h = 1;
+    int bottom_h = bottombar_visible ? 3 : 0;
 
-    /* CONTENT – fills everything except the status row */
-    ui->slots[SLOT_CONTENT].row    = 1;
-    ui->slots[SLOT_CONTENT].col    = 1;
-    ui->slots[SLOT_CONTENT].width  = W;
-    ui->slots[SLOT_CONTENT].height = H - 1;
-    ui->slots[SLOT_CONTENT].visible = true;
+    int right_w = right_panel_visible ? (right_panel_width > 0 ? right_panel_width : 35) : 0;
+    int gutter_w = gutter_visible ? 5 : 0;
 
-    /* GUTTER – virtual column inside CONTENT, managed by render */
-    ui->slots[SLOT_GUTTER].row    = 1;
-    ui->slots[SLOT_GUTTER].col    = 1;
-    ui->slots[SLOT_GUTTER].width  = 5;
-    ui->slots[SLOT_GUTTER].height = H - 1;
-    ui->slots[SLOT_GUTTER].visible = true;
+    /* TOPBAR */
+    ui->slots[SLOT_TOPBAR].row     = 1;
+    ui->slots[SLOT_TOPBAR].col     = 1;
+    ui->slots[SLOT_TOPBAR].width   = W;
+    ui->slots[SLOT_TOPBAR].height  = top_h;
+    ui->slots[SLOT_TOPBAR].visible = topbar_visible;
 
-    /* STATUSBAR – bottom row, handled directly by render_frame */
-    ui->slots[SLOT_STATUSBAR].row    = H;
-    ui->slots[SLOT_STATUSBAR].col    = 1;
-    ui->slots[SLOT_STATUSBAR].width  = W;
-    ui->slots[SLOT_STATUSBAR].height = 1;
+    /* STATUSBAR */
+    ui->slots[SLOT_STATUSBAR].row     = H - bottom_h;
+    ui->slots[SLOT_STATUSBAR].col     = 1;
+    ui->slots[SLOT_STATUSBAR].width   = W - right_w;
+    ui->slots[SLOT_STATUSBAR].height  = status_h;
     ui->slots[SLOT_STATUSBAR].visible = true;
 
-    /* RIGHT_PANEL, BOTTOMBAR – hidden */
-    ui->slots[SLOT_RIGHT_PANEL].visible = false;
-    ui->slots[SLOT_BOTTOMBAR].visible   = false;
+    /* BOTTOMBAR */
+    ui->slots[SLOT_BOTTOMBAR].row     = H - bottom_h + 1;
+    ui->slots[SLOT_BOTTOMBAR].col     = 1;
+    ui->slots[SLOT_BOTTOMBAR].width   = W - right_w;
+    ui->slots[SLOT_BOTTOMBAR].height  = bottom_h;
+    ui->slots[SLOT_BOTTOMBAR].visible = bottombar_visible;
+
+    /* RIGHT_PANEL */
+    ui->slots[SLOT_RIGHT_PANEL].row     = 1;
+    ui->slots[SLOT_RIGHT_PANEL].col     = W - right_w + 1;
+    ui->slots[SLOT_RIGHT_PANEL].width   = right_w;
+    ui->slots[SLOT_RIGHT_PANEL].height  = H;
+    ui->slots[SLOT_RIGHT_PANEL].visible = right_panel_visible;
+
+    /* CONTENT */
+    ui->slots[SLOT_CONTENT].row     = top_h + 1;
+    ui->slots[SLOT_CONTENT].col     = gutter_w + 1;
+    ui->slots[SLOT_CONTENT].width   = W - right_w - gutter_w;
+    ui->slots[SLOT_CONTENT].height  = H - top_h - status_h - bottom_h;
+    ui->slots[SLOT_CONTENT].visible = true;
+
+    /* GUTTER */
+    ui->slots[SLOT_GUTTER].row     = top_h + 1;
+    ui->slots[SLOT_GUTTER].col     = 1;
+    ui->slots[SLOT_GUTTER].width   = gutter_w;
+    ui->slots[SLOT_GUTTER].height  = H - top_h - status_h - bottom_h;
+    ui->slots[SLOT_GUTTER].visible = gutter_visible;
 }
 
 void ui_init(UIRegistry *ui, int term_w, int term_h) {
@@ -51,13 +68,13 @@ void ui_init(UIRegistry *ui, int term_w, int term_h) {
     ui->focused = NULL;
     for (int i = 0; i < SLOT_COUNT; i++)
         ui->slots[i].widget_count = 0;
-    layout(ui);
+    ui_layout(ui, false, true, false, 35, false);
 }
 
 void ui_resize(UIRegistry *ui, int term_w, int term_h) {
     ui->term_w = term_w;
     ui->term_h = term_h;
-    layout(ui);
+    ui_layout(ui, false, true, false, 35, false);
 }
 
 void ui_register_widget(UIRegistry *ui, SlotId slot_id, Widget *w) {

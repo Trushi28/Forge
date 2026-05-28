@@ -57,6 +57,30 @@ void config_default(ForgeConfig *cfg) {
             sizeof(cfg->lang_rust_formatter) - 1);
     strncpy(cfg->lang_rust_lsp, "rust-analyzer",
             sizeof(cfg->lang_rust_lsp) - 1);
+
+    /* Slot-based UI defaults */
+    cfg->gutter_widget_count = 3;
+    strcpy(cfg->gutter_widgets[0], "line_numbers");
+    strcpy(cfg->gutter_widgets[1], "git_diff_gutter");
+    strcpy(cfg->gutter_widgets[2], "diagnostics_gutter");
+
+    cfg->statusbar_widget_count = 5;
+    strcpy(cfg->statusbar_widgets[0], "mode_indicator");
+    strcpy(cfg->statusbar_widgets[1], "filename");
+    strcpy(cfg->statusbar_widgets[2], "git_branch");
+    strcpy(cfg->statusbar_widgets[3], "lsp_status");
+    strcpy(cfg->statusbar_widgets[4], "cursor_pos");
+
+    cfg->bottombar_widget_count = 1;
+    strcpy(cfg->bottombar_widgets[0], "git_timeline");
+
+    cfg->topbar_widget_count = 0;
+    cfg->topbar_visible = false;
+
+    cfg->right_panel_widget_count = 1;
+    strcpy(cfg->right_panel_widgets[0], "guild_panel");
+    cfg->right_panel_visible = false;
+    cfg->right_panel_width = 35;
 }
 
 /* ══════════════════════════════════════════════════════════════
@@ -103,6 +127,25 @@ static void set_string(char *dst, size_t dstsz, const char *src) {
 static bool parse_bool(const char *val) {
     return (strcmp(val, "true") == 0 || strcmp(val, "1") == 0 ||
             strcmp(val, "yes") == 0);
+}
+
+static int parse_string_array(const char *val, char out[][64], int max_sz) {
+    int count = 0;
+    const char *p = val;
+    while (*p && count < max_sz) {
+        while (*p && *p != '"' && *p != '\'') p++;
+        if (!*p) break;
+        char quote = *p;
+        p++;
+        int len = 0;
+        while (*p && *p != quote && len < 63) {
+            out[count][len++] = *p++;
+        }
+        out[count][len] = '\0';
+        count++;
+        if (*p == quote) p++;
+    }
+    return count;
 }
 
 static void apply_setting(ForgeConfig *cfg, const char *section,
@@ -193,6 +236,39 @@ static void apply_setting(ForgeConfig *cfg, const char *section,
                        sizeof(cfg->lang_rust_formatter), val);
         else if (strcmp(key, "lsp") == 0)
             set_string(cfg->lang_rust_lsp, sizeof(cfg->lang_rust_lsp), val);
+    }
+    /* [ui.slots.topbar] */
+    else if (strcmp(section, "ui.slots.topbar") == 0) {
+        if (strcmp(key, "widgets") == 0)
+            cfg->topbar_widget_count = parse_string_array(val, cfg->topbar_widgets, 8);
+        else if (strcmp(key, "visible") == 0)
+            cfg->topbar_visible = parse_bool(val);
+    }
+    /* [ui.slots.gutter] */
+    else if (strcmp(section, "ui.slots.gutter") == 0) {
+        if (strcmp(key, "widgets") == 0)
+            cfg->gutter_widget_count = parse_string_array(val, cfg->gutter_widgets, 8);
+    }
+    /* [ui.slots.statusbar] */
+    else if (strcmp(section, "ui.slots.statusbar") == 0) {
+        if (strcmp(key, "widgets") == 0)
+            cfg->statusbar_widget_count = parse_string_array(val, cfg->statusbar_widgets, 8);
+    }
+    /* [ui.slots.bottombar] */
+    else if (strcmp(section, "ui.slots.bottombar") == 0) {
+        if (strcmp(key, "widgets") == 0)
+            cfg->bottombar_widget_count = parse_string_array(val, cfg->bottombar_widgets, 8);
+        else if (strcmp(key, "visible") == 0)
+            cfg->git_timeline = parse_bool(val);
+    }
+    /* [ui.slots.right_panel] */
+    else if (strcmp(section, "ui.slots.right_panel") == 0) {
+        if (strcmp(key, "widgets") == 0)
+            cfg->right_panel_widget_count = parse_string_array(val, cfg->right_panel_widgets, 8);
+        else if (strcmp(key, "visible") == 0)
+            cfg->right_panel_visible = parse_bool(val);
+        else if (strcmp(key, "width") == 0)
+            cfg->right_panel_width = atoi(val);
     }
 }
 

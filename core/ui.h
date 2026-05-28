@@ -47,6 +47,7 @@ typedef struct {
 
 void ui_init           (UIRegistry *ui, int term_w, int term_h);
 void ui_resize         (UIRegistry *ui, int term_w, int term_h);
+void ui_layout         (UIRegistry *ui, bool topbar_visible, bool gutter_visible, bool right_panel_visible, int right_panel_width, bool bottombar_visible);
 void ui_register_widget(UIRegistry *ui, SlotId slot, Widget *w);
 void ui_dispatch_key   (UIRegistry *ui, int key);
 void ui_render_slots   (UIRegistry *ui, RenderState *r, Buffer *b);
