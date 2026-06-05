@@ -125,7 +125,7 @@ static void test_buffer_insert_end(void) {
 
 static void test_buffer_insert_middle(void) {
     Buffer *b = buffer_new("Helo", 4);
-    buffer_insert(b, 2, "ll", 2);
+    buffer_insert(b, 3, "l", 1);
     char *got = buffer_get_text(b);
     ASSERT_EQ_STR(got, "Hello");
     free(got);

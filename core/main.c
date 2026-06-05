@@ -86,6 +86,12 @@ typedef struct {
   int guild_peer_count;
   int guild_status_timer;
 
+  /* Parsed peer handles from GUILD_STATUS_RESP */
+  #define MAX_GUILD_PEERS 32
+  char guild_peer_handles[32][64];
+  char guild_peer_files[32][128];
+  int guild_peer_handle_count;
+
   /* Incremental search (Ctrl+F / Ctrl+R) */
   bool search_active;
   bool search_forward;
@@ -967,6 +973,44 @@ static void handle_net_message(const char *msg) {
     json_get_string(msg, "guild_name", E.guild_name, sizeof(E.guild_name));
     json_get_string(msg, "my_handle", E.guild_handle, sizeof(E.guild_handle));
     json_get_int(msg, "peer_count", &E.guild_peer_count);
+
+    /* Parse the "peers" array to extract individual handles */
+    E.guild_peer_handle_count = 0;
+    const char *peers_key = strstr(msg, "\"peers\"");
+    if (peers_key) {
+      const char *arr = strchr(peers_key, '[');
+      if (arr) {
+        const char *p = arr + 1;
+        while (*p && *p != ']' && E.guild_peer_handle_count < MAX_GUILD_PEERS) {
+          /* Find the next object '{' */
+          const char *obj = strchr(p, '{');
+          if (!obj || obj > strchr(p, ']' ) ) break;
+          /* Find closing '}' for this object */
+          const char *obj_end = strchr(obj, '}');
+          if (!obj_end) break;
+          /* Extract "handle" from this object */
+          size_t obj_len = (size_t)(obj_end - obj + 1);
+          char obj_buf[512];
+          if (obj_len < sizeof(obj_buf)) {
+            memcpy(obj_buf, obj, obj_len);
+            obj_buf[obj_len] = '\0';
+            int idx = E.guild_peer_handle_count;
+            if (json_get_string(obj_buf, "handle",
+                                E.guild_peer_handles[idx],
+                                sizeof(E.guild_peer_handles[idx]))) {
+              /* Also grab current_file if available */
+              if (!json_get_string(obj_buf, "current_file",
+                                   E.guild_peer_files[idx],
+                                   sizeof(E.guild_peer_files[idx])))
+                E.guild_peer_files[idx][0] = '\0';
+              E.guild_peer_handle_count++;
+            }
+          }
+          p = obj_end + 1;
+        }
+      }
+    }
+
     snprintf(E.guild_last_event, sizeof(E.guild_last_event), "%d peer%s online",
              E.guild_peer_count, E.guild_peer_count == 1 ? "" : "s");
     E.render.full_redraw = true;
@@ -1177,12 +1221,48 @@ static void render_guild_panel(void) {
                    "\x1b[5;%dH\x1b[38;2;%u;%u;%um\x1b[1m Peers\x1b[0m", panel_x,
                    t->statusbar_fg.r, t->statusbar_fg.g, t->statusbar_fg.b);
 
-  blen += snprintf(buf + blen, sizeof(buf) - blen,
-                   "\x1b[6;%dH\x1b[48;2;%u;%u;%um\x1b[38;2;%u;%u;%um  %s",
-                   panel_x, t->gutter_bg.r, t->gutter_bg.g, t->gutter_bg.b,
-                   t->comment.r, t->comment.g, t->comment.b,
-                   E.ipc.connected ? "Encrypted peer sync active"
-                                   : "Waiting for forge-net...");
+  if (E.guild_peer_handle_count > 0 && E.ipc.connected) {
+    /* Show individual peer handles */
+    int max_show = E.guild_peer_handle_count;
+    if (max_show > 8) max_show = 8; /* cap to keep panel tidy */
+    for (int i = 0; i < max_show && blen < (int)sizeof(buf) - 256; i++) {
+      const char *file = E.guild_peer_files[i];
+      const char *basename = "";
+      if (file[0]) {
+        basename = strrchr(file, '/');
+        basename = basename ? basename + 1 : file;
+      }
+      blen += snprintf(buf + blen, sizeof(buf) - blen,
+                       "\x1b[%d;%dH\x1b[48;2;%u;%u;%um\x1b[38;2;%u;%u;%um"
+                       "  ● @%.16s",
+                       6 + i, panel_x,
+                       t->gutter_bg.r, t->gutter_bg.g, t->gutter_bg.b,
+                       t->fg.r, t->fg.g, t->fg.b,
+                       E.guild_peer_handles[i]);
+      if (basename[0]) {
+        blen += snprintf(buf + blen, sizeof(buf) - blen,
+                         "\x1b[38;2;%u;%u;%um %.12s",
+                         t->comment.r, t->comment.g, t->comment.b,
+                         basename);
+      }
+    }
+    if (E.guild_peer_handle_count > max_show) {
+      blen += snprintf(buf + blen, sizeof(buf) - blen,
+                       "\x1b[%d;%dH\x1b[48;2;%u;%u;%um\x1b[38;2;%u;%u;%um"
+                       "  … +%d more",
+                       6 + max_show, panel_x,
+                       t->gutter_bg.r, t->gutter_bg.g, t->gutter_bg.b,
+                       t->comment.r, t->comment.g, t->comment.b,
+                       E.guild_peer_handle_count - max_show);
+    }
+  } else {
+    blen += snprintf(buf + blen, sizeof(buf) - blen,
+                     "\x1b[6;%dH\x1b[48;2;%u;%u;%um\x1b[38;2;%u;%u;%um  %s",
+                     panel_x, t->gutter_bg.r, t->gutter_bg.g, t->gutter_bg.b,
+                     t->comment.r, t->comment.g, t->comment.b,
+                     E.ipc.connected ? "No peers online"
+                                     : "Waiting for forge-net...");
+  }
 
   blen +=
       snprintf(buf + blen, sizeof(buf) - blen,
