@@ -32,6 +32,7 @@ SRCS = $(SRCDIR)/arena.c      \
        $(SRCDIR)/plugin.c     \
        $(SRCDIR)/forgescript.c \
        $(SRCDIR)/ipc.c        \
+       $(SRCDIR)/globals.c    \
        $(SRCDIR)/main.c
 
 OBJS = $(patsubst $(SRCDIR)/%.c,$(BUILDDIR)/%.o,$(SRCS))

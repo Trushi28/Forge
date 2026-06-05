@@ -21,7 +21,7 @@
 #include <time.h>
 #include <unistd.h>
 
-Arena *session_arena = NULL;
+extern Arena *session_arena;
 
 /* ── Multi-buffer entry (one per open file) ─────────────────── */
 
@@ -1838,11 +1838,14 @@ int main(int argc, char **argv) {
 
     /* ── Ctrl+G: Go-to-definition / Guild panel ─────── */
     if (key == KEY_CTRL_G) {
-      if (E.lsp && E.lsp->running && E.lsp->initialized) {
+      if (E.guild_panel_visible) {
+        /* Always allow closing the guild panel */
+        cmd_toggle_guild(NULL);
+      } else if (E.lsp && E.lsp->running && E.lsp->initialized) {
         lsp_request_definition(E.lsp, E.file_uri, E.cy, E.cx);
         render_set_status(&E.render, "Finding definition...");
       } else {
-        /* No LSP: toggle guild panel */
+        /* No LSP: toggle guild panel open */
         cmd_toggle_guild(NULL);
       }
       continue;

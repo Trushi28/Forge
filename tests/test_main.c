@@ -402,6 +402,10 @@ static void test_arena_overflow(void) {
    ═══════════════════════════════════════════════════════════════ */
 
 int main(void) {
+    /* Buffer uses session_arena for PieceNode allocation */
+    extern Arena *session_arena;
+    session_arena = arena_new(1024 * 1024 * 4);
+
     printf("\n" ANSI_BOLD "═══ Forge C Core Test Suite ═══" ANSI_RESET "\n\n");
 
     printf(ANSI_BOLD "── Buffer Tests ──" ANSI_RESET "\n");
@@ -445,5 +449,6 @@ int main(void) {
         printf("  " ANSI_RED "Failed: %d" ANSI_RESET "\n", tests_failed);
     printf(ANSI_BOLD "════════════════════════════════════" ANSI_RESET "\n\n");
 
+    arena_free(session_arena);
     return tests_failed > 0 ? 1 : 0;
 }
