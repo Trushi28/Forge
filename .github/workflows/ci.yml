@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    # ── System dependencies ────────────────────────────────────
+    - name: Install system deps
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential libgit2-dev pkg-config
+
+    # ── Build C core (with git) ────────────────────────────────
+    - name: Build core (with libgit2)
+      run: make -j$(nproc) WITH_GIT=1
+
+    # ── Build C core (without git) ─────────────────────────────
+    - name: Verify build without libgit2
+      run: |
+        make clean
+        make -j$(nproc)
+
+    # ── Build with libgit2 for tests ───────────────────────────
+    - name: Rebuild with libgit2 for tests
+      run: |
+        make clean
+        make -j$(nproc) WITH_GIT=1
+
+    # ── Run C tests ────────────────────────────────────────────
+    - name: Run C core tests
+      run: make test WITH_GIT=1
+
+    # ── Build plugins ──────────────────────────────────────────
+    - name: Build plugins
+      run: make plugins
+
+    # ── Rust toolchain ─────────────────────────────────────────
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache cargo
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          net/target
+        key: ${{ runner.os }}-cargo-${{ hashFiles('net/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-
+
+    # ── Build Rust net ─────────────────────────────────────────
+    - name: Build forge-net
+      run: cd net && cargo build
+
+    # ── Run Rust tests ─────────────────────────────────────────
+    - name: Run Rust tests
+      run: cd net && cargo test
+
+  # ── Build without libgit2 (minimal) ─────────────────────────
+  build-minimal:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install minimal deps
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential
+
+    - name: Build without libgit2
+      run: make -j$(nproc)
+
+    - name: Run tests without libgit2
+      run: make test

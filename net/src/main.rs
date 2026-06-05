@@ -1,11 +1,10 @@
-mod collab;
-mod crdt;
-mod crypto;
-mod discovery;
-mod guild;
-mod ipc;
-mod peer;
-mod transfer;
+use forge_net::collab;
+use forge_net::crypto;
+use forge_net::discovery;
+use forge_net::guild;
+use forge_net::ipc;
+use forge_net::peer;
+use forge_net::transfer;
 
 use std::path::PathBuf;
 use std::sync::Arc;

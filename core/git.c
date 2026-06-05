@@ -2,11 +2,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef HAS_LIBGIT2
+/* ══════════════════════════════════════════════════════════════
+   Full libgit2 implementation
+   ══════════════════════════════════════════════════════════════ */
+
 #include <git2.h>
 
-/* ══════════════════════════════════════════════════════════════
-   Init / Free
-   ══════════════════════════════════════════════════════════════ */
+/* ── Init / Free ───────────────────────────────────────────── */
 
 bool git_state_init(GitState *gs, const char *workdir) {
     memset(gs, 0, sizeof(*gs));
@@ -38,9 +42,7 @@ void git_state_free(GitState *gs) {
     git_libgit2_shutdown();
 }
 
-/* ══════════════════════════════════════════════════════════════
-   Branch
-   ══════════════════════════════════════════════════════════════ */
+/* ── Branch ────────────────────────────────────────────────── */
 
 void git_refresh_branch(GitState *gs) {
     gs->branch[0] = '\0';
@@ -59,14 +61,11 @@ void git_refresh_branch(GitState *gs) {
     }
 }
 
-/* ══════════════════════════════════════════════════════════════
-   Diff — working tree vs HEAD
-   ══════════════════════════════════════════════════════════════ */
+/* ── Diff — working tree vs HEAD ───────────────────────────── */
 
-/* Callback context for diff */
 typedef struct {
     GitState   *gs;
-    const char *target_path;  /* relative path we care about */
+    const char *target_path;
 } DiffCtx;
 
 static int diff_file_cb(const git_diff_delta *delta, float progress, void *payload) {
@@ -85,18 +84,15 @@ static int diff_line_cb(const git_diff_delta *delta, const git_diff_hunk *hunk,
     (void)hunk;
     DiffCtx *ctx = (DiffCtx *)payload;
 
-    /* Only process lines for our target file */
     const char *path = delta->new_file.path ? delta->new_file.path
                                              : delta->old_file.path;
     if (!path || !ctx->target_path) return 0;
 
-    /* Match: the path in delta may be relative to repo root */
     const char *target_base = strrchr(ctx->target_path, '/');
     target_base = target_base ? target_base + 1 : ctx->target_path;
     const char *delta_base = strrchr(path, '/');
     delta_base = delta_base ? delta_base + 1 : path;
 
-    /* Check if it's our file (simple basename match) */
     if (strcmp(target_base, delta_base) != 0 &&
         strcmp(ctx->target_path, path) != 0)
         return 0;
@@ -106,7 +102,7 @@ static int diff_line_cb(const git_diff_delta *delta, const git_diff_hunk *hunk,
     GitDiffLine *dl = &ctx->gs->diff[ctx->gs->diff_count];
 
     if (line->origin == GIT_DIFF_LINE_ADDITION) {
-        dl->line   = line->new_lineno - 1;  /* 0-indexed */
+        dl->line   = line->new_lineno - 1;
         dl->status = GIT_DIFF_ADDED;
         ctx->gs->diff_count++;
     } else if (line->origin == GIT_DIFF_LINE_DELETION) {
@@ -129,7 +125,6 @@ void git_refresh_diff(GitState *gs, const char *filepath) {
     opts.context_lines = 0;
 
     if (git_diff_index_to_workdir(&diff, repo, NULL, &opts) != 0) {
-        /* Try HEAD to workdir instead */
         git_object *head_obj = NULL;
         git_tree *head_tree = NULL;
 
@@ -148,14 +143,12 @@ void git_refresh_diff(GitState *gs, const char *filepath) {
     git_diff_free(diff);
 }
 
-/* ══════════════════════════════════════════════════════════════
-   Log — commit history
-   ══════════════════════════════════════════════════════════════ */
+/* ── Log — commit history ──────────────────────────────────── */
 
 void git_refresh_log(GitState *gs, const char *filepath) {
     gs->commit_count = 0;
     if (!gs->repo_open) return;
-    (void)filepath;  /* For now, get all commits; file-specific filtering TBD */
+    (void)filepath;
 
     git_repository *repo = (git_repository *)gs->repo_handle;
     git_revwalk *walker = NULL;
@@ -173,12 +166,10 @@ void git_refresh_log(GitState *gs, const char *filepath) {
 
         GitCommit *gc = &gs->commits[gs->commit_count];
 
-        /* SHA */
         git_oid_tostr(gc->sha, sizeof(gc->sha), &oid);
         memcpy(gc->short_sha, gc->sha, 7);
         gc->short_sha[7] = '\0';
 
-        /* Message (first line) */
         const char *msg = git_commit_message(commit);
         if (msg) {
             const char *nl = strchr(msg, '\n');
@@ -189,12 +180,10 @@ void git_refresh_log(GitState *gs, const char *filepath) {
             gc->message[mlen] = '\0';
         }
 
-        /* Author */
         const git_signature *sig = git_commit_author(commit);
         if (sig && sig->name)
             snprintf(gc->author, sizeof(gc->author), "%s", sig->name);
 
-        /* Date */
         gc->date = (sig) ? sig->when.time : 0;
 
         gs->commit_count++;
@@ -204,9 +193,7 @@ void git_refresh_log(GitState *gs, const char *filepath) {
     git_revwalk_free(walker);
 }
 
-/* ══════════════════════════════════════════════════════════════
-   File at commit
-   ══════════════════════════════════════════════════════════════ */
+/* ── File at commit ────────────────────────────────────────── */
 
 char *git_file_at_commit(GitState *gs, const char *filepath,
                          const char *sha) {
@@ -225,16 +212,11 @@ char *git_file_at_commit(GitState *gs, const char *filepath,
         return NULL;
     }
 
-    /* Try to find the file in the tree */
     git_tree_entry *entry = NULL;
-
-    /* Try basename first, then full path */
     const char *basename = strrchr(filepath, '/');
     basename = basename ? basename + 1 : filepath;
 
-    /* Walk the tree looking for the file */
     if (git_tree_entry_bypath(&entry, tree, filepath) != 0) {
-        /* Try just the basename */
         if (git_tree_entry_bypath(&entry, tree, basename) != 0) {
             git_tree_free(tree);
             git_commit_free(commit);
@@ -265,9 +247,7 @@ char *git_file_at_commit(GitState *gs, const char *filepath,
     return result;
 }
 
-/* ══════════════════════════════════════════════════════════════
-   Blame
-   ══════════════════════════════════════════════════════════════ */
+/* ── Blame ─────────────────────────────────────────────────── */
 
 void git_refresh_blame(GitState *gs, const char *filepath) {
     gs->blame_count = 0;
@@ -278,7 +258,6 @@ void git_refresh_blame(GitState *gs, const char *filepath) {
 
     git_blame_options opts = GIT_BLAME_OPTIONS_INIT;
 
-    /* Try with full path first, then basename */
     if (git_blame_file(&blame, repo, filepath, &opts) != 0) {
         const char *basename = strrchr(filepath, '/');
         basename = basename ? basename + 1 : filepath;
@@ -292,7 +271,6 @@ void git_refresh_blame(GitState *gs, const char *filepath) {
         const git_blame_hunk *hunk = git_blame_get_hunk_byindex(blame, i);
         if (!hunk) continue;
 
-        /* Each hunk covers a range of lines */
         for (size_t line = hunk->final_start_line_number;
              line < hunk->final_start_line_number + hunk->lines_in_hunk &&
              gs->blame_count < GIT_MAX_BLAME_LINES;
@@ -310,7 +288,6 @@ void git_refresh_blame(GitState *gs, const char *filepath) {
 
             bl->date = hunk->final_signature ? hunk->final_signature->when.time : 0;
 
-            /* Get commit message for summary */
             git_commit *commit = NULL;
             if (git_commit_lookup(&commit, repo, &hunk->final_commit_id) == 0) {
                 const char *msg = git_commit_message(commit);
@@ -332,8 +309,53 @@ void git_refresh_blame(GitState *gs, const char *filepath) {
     git_blame_free(blame);
 }
 
+#else /* !HAS_LIBGIT2 */
 /* ══════════════════════════════════════════════════════════════
-   Query
+   No-op stubs when libgit2 is not available.
+   The editor works fine without git features — no diff gutter,
+   no blame, no timeline, no branch display.
+   ══════════════════════════════════════════════════════════════ */
+
+bool git_state_init(GitState *gs, const char *workdir) {
+    (void)workdir;
+    memset(gs, 0, sizeof(*gs));
+    gs->repo_open = false;
+    return false;
+}
+
+void git_state_free(GitState *gs) {
+    gs->repo_open = false;
+}
+
+void git_refresh_branch(GitState *gs) {
+    gs->branch[0] = '\0';
+}
+
+void git_refresh_diff(GitState *gs, const char *filepath) {
+    (void)filepath;
+    gs->diff_count = 0;
+}
+
+void git_refresh_log(GitState *gs, const char *filepath) {
+    (void)filepath;
+    gs->commit_count = 0;
+}
+
+char *git_file_at_commit(GitState *gs, const char *filepath,
+                         const char *sha) {
+    (void)gs; (void)filepath; (void)sha;
+    return NULL;
+}
+
+void git_refresh_blame(GitState *gs, const char *filepath) {
+    (void)filepath;
+    gs->blame_count = 0;
+}
+
+#endif /* HAS_LIBGIT2 */
+
+/* ══════════════════════════════════════════════════════════════
+   Query — works regardless of libgit2 presence
    ══════════════════════════════════════════════════════════════ */
 
 GitDiffStatus git_line_diff_status(GitState *gs, int line) {

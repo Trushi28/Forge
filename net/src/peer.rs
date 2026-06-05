@@ -466,12 +466,12 @@ fn now_secs() -> u64 {
 
 fn local_endpoint(port: u16) -> Option<String> {
     let socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))).ok()?;
-    if socket.connect("8.8.8.8:80").is_ok()
-        && let Ok(addr) = socket.local_addr()
-        && !addr.ip().is_unspecified()
-        && !addr.ip().is_loopback()
-    {
-        return Some(format!("{}:{port}", addr.ip()));
+    if socket.connect("8.8.8.8:80").is_ok() {
+        if let Ok(addr) = socket.local_addr() {
+            if !addr.ip().is_unspecified() && !addr.ip().is_loopback() {
+                return Some(format!("{}:{port}", addr.ip()));
+            }
+        }
     }
     Some(format!("{}:{port}", IpAddr::V4(Ipv4Addr::LOCALHOST)))
 }

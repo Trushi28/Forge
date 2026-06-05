@@ -1,4 +1,7 @@
 #include "plugin.h"
+#include "forge_api.h"
+#include "buffer.h"
+#include "render.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -6,6 +9,7 @@
 #include <sys/wait.h>
 #include <dirent.h>
 #include <dlfcn.h>
+#include <ctype.h>
 
 /* ══════════════════════════════════════════════════════════════
    Global plugin host pointer — used by forge_api functions
@@ -13,6 +17,17 @@
    ══════════════════════════════════════════════════════════════ */
 
 static PluginHost *g_plugin_host = NULL;
+
+/* ══════════════════════════════════════════════════════════════
+   Editor context — set by main.c so plugin API functions can
+   access the active buffer, cursor, render state, etc.
+   ══════════════════════════════════════════════════════════════ */
+
+static EditorContext *g_editor_ctx = NULL;
+
+void plugin_set_editor_context(EditorContext *ctx) {
+    g_editor_ctx = ctx;
+}
 
 /* ══════════════════════════════════════════════════════════════
    Shell hooks — execute shell commands on editor events
@@ -259,17 +274,187 @@ void plugin_register_on_keypress(plugin_keypress_cb cb) {
    function bodies that match the declarations in forge_api.h.
    ══════════════════════════════════════════════════════════════ */
 
-void forge_on_save(plugin_save_cb cb)     { plugin_register_on_save(cb); }
-void forge_on_open(plugin_open_cb cb)     { plugin_register_on_open(cb); }
-void forge_on_close(plugin_close_cb cb)   { plugin_register_on_close(cb); }
+/* ── Event registration ────────────────────────────────────── */
+
+void forge_on_save(forge_save_cb cb)     { plugin_register_on_save(cb); }
+void forge_on_open(forge_open_cb cb)     { plugin_register_on_open(cb); }
+void forge_on_close(forge_close_cb cb)   { plugin_register_on_close(cb); }
+void forge_on_keypress(forge_keypress_cb cb) {
+    /* Cast: forge_keypress_cb uses ForgeBuffer*, plugin_keypress_cb uses void*.
+       They are ABI-compatible (both pointer-sized). */
+    plugin_register_on_keypress((plugin_keypress_cb)cb);
+}
+
+/* ── Editor actions ────────────────────────────────────────── */
 
 void forge_notify(const char *message) {
-    /* For now, print to stderr — in full implementation this would
-       send an IPC message to the editor to update the status bar. */
-    if (message)
+    if (!message) return;
+    if (g_editor_ctx && g_editor_ctx->render) {
+        render_set_status(g_editor_ctx->render, "%s", message);
+    } else {
+        /* Fallback if no editor context yet (e.g. during plugin init) */
         fprintf(stderr, "forge-plugin: %s\n", message);
+    }
+}
+
+void forge_insert(const char *text) {
+    if (!text || !g_editor_ctx || !g_editor_ctx->buf) return;
+    int len = (int)strlen(text);
+    if (len == 0) return;
+
+    size_t pos = buffer_get_offset(g_editor_ctx->buf,
+                                   *g_editor_ctx->cx,
+                                   *g_editor_ctx->cy);
+    buffer_insert(g_editor_ctx->buf, pos, text, len);
+    *g_editor_ctx->cx += len;
+}
+
+void forge_delete(int n) {
+    if (n <= 0 || !g_editor_ctx || !g_editor_ctx->buf) return;
+
+    size_t pos = buffer_get_offset(g_editor_ctx->buf,
+                                   *g_editor_ctx->cx,
+                                   *g_editor_ctx->cy);
+    if (pos == 0) return;
+    size_t del = (size_t)n < pos ? (size_t)n : pos;
+    buffer_delete(g_editor_ctx->buf, pos - del, del);
+    *g_editor_ctx->cx -= (int)del;
+    if (*g_editor_ctx->cx < 0) *g_editor_ctx->cx = 0;
+}
+
+void forge_cursor_move(int col_delta, int row_delta) {
+    if (!g_editor_ctx) return;
+    if (col_delta != 0 && g_editor_ctx->cx) {
+        *g_editor_ctx->cx += col_delta;
+        if (*g_editor_ctx->cx < 0) *g_editor_ctx->cx = 0;
+    }
+    if (row_delta != 0 && g_editor_ctx->cy) {
+        *g_editor_ctx->cy += row_delta;
+        if (*g_editor_ctx->cy < 0) *g_editor_ctx->cy = 0;
+    }
 }
 
 void forge_run(const char *cmd) {
     plugin_run_hook(cmd, NULL);
+}
+
+const char *forge_get_filepath(void) {
+    if (g_editor_ctx && g_editor_ctx->filepath)
+        return *g_editor_ctx->filepath;
+    return NULL;
+}
+
+/* ── Buffer query ──────────────────────────────────────────── */
+
+/* ForgeBuffer is opaque to plugins. The API functions ignore the
+   buf parameter and use the global editor context instead. */
+struct ForgeBuffer { int _unused; };
+
+size_t forge_buffer_line_count(ForgeBuffer *buf) {
+    (void)buf;  /* use editor context's active buffer */
+    if (!g_editor_ctx || !g_editor_ctx->buf) return 0;
+    return buffer_line_count(g_editor_ctx->buf);
+}
+
+char *forge_buffer_get_line(ForgeBuffer *buf, int line) {
+    (void)buf;
+    if (!g_editor_ctx || !g_editor_ctx->buf) return NULL;
+    return buffer_get_line(g_editor_ctx->buf, line);
+}
+
+void forge_buffer_get_cursor(ForgeBuffer *buf, int *line, int *col) {
+    (void)buf;
+    if (!g_editor_ctx) {
+        if (line) *line = 0;
+        if (col) *col = 0;
+        return;
+    }
+    if (line) *line = g_editor_ctx->cy ? *g_editor_ctx->cy : 0;
+    if (col)  *col  = g_editor_ctx->cx ? *g_editor_ctx->cx : 0;
+}
+
+size_t forge_buffer_char_count(ForgeBuffer *buf) {
+    (void)buf;
+    if (!g_editor_ctx || !g_editor_ctx->buf) return 0;
+    return buffer_total_len(g_editor_ctx->buf);
+}
+
+size_t forge_buffer_word_count(ForgeBuffer *buf) {
+    (void)buf;
+    if (!g_editor_ctx || !g_editor_ctx->buf) return 0;
+
+    char *text = buffer_get_text(g_editor_ctx->buf);
+    if (!text) return 0;
+
+    size_t words = 0;
+    bool in_word = false;
+    for (size_t i = 0; text[i]; i++) {
+        if (isspace((unsigned char)text[i])) {
+            in_word = false;
+        } else if (!in_word) {
+            in_word = true;
+            words++;
+        }
+    }
+    free(text);
+    return words;
+}
+
+/* ── Widget API — STUBS ────────────────────────────────────── */
+/*
+ * The widget API is declared in forge_api.h but the render system
+ * does not yet have infrastructure to iterate and draw registered
+ * widgets. These are explicit no-op stubs. Plugins that use the
+ * widget API will get stderr warnings at runtime.
+ *
+ * To fully support widgets, render.c would need a widget registry
+ * and iteration in render_frame(). That is a separate feature.
+ */
+
+struct ForgeWidget {
+    char  name[128];
+    int   slot;
+    int   priority;
+    bool  dirty;
+    void *render_cb;
+    void *key_cb;
+};
+
+ForgeWidget *forge_widget_new(const char *name, int slot, int priority) {
+    ForgeWidget *w = calloc(1, sizeof(ForgeWidget));
+    if (w) {
+        if (name) strncpy(w->name, name, sizeof(w->name) - 1);
+        w->slot = slot;
+        w->priority = priority;
+        w->dirty = true;
+    }
+    fprintf(stderr, "forge: widget_new('%s') — widget rendering not yet supported, "
+                    "widget will not be visible\n", name ? name : "?");
+    return w;
+}
+
+void forge_widget_set_render_cb(ForgeWidget *w, forge_widget_render_cb cb) {
+    if (w) w->render_cb = (void *)cb;
+}
+
+void forge_widget_set_key_cb(ForgeWidget *w, forge_widget_key_cb cb) {
+    if (w) w->key_cb = (void *)cb;
+}
+
+void forge_widget_mark_dirty(ForgeWidget *w) {
+    if (w) w->dirty = true;
+}
+
+void forge_widget_register(ForgeWidget *w) {
+    if (w)
+        fprintf(stderr, "forge: widget_register('%s') — stub, widget not rendered\n",
+                w->name);
+}
+
+void forge_widget_write(ForgeWidget *w, int row, int col,
+                        const char *text, unsigned int fg_color,
+                        unsigned int bg_color) {
+    /* No-op: the render system doesn't support widget draw areas yet */
+    (void)w; (void)row; (void)col; (void)text;
+    (void)fg_color; (void)bg_color;
 }

@@ -192,6 +192,13 @@ static int handle_csi(const char *seq, int slen) {
     int mod = parse_int(&p);
     char letter = *p;
     /* mod=5 Ctrl, mod=6 Ctrl+Shift, mod=2 Shift, mod=3 Alt */
+
+    /* Ctrl+PageUp/Down: ESC [ 5;5~ / ESC [ 6;5~ */
+    if (letter == '~' && (mod == 5 || mod == 6)) {
+      if (n1 == 5) return KEY_CTRL_PAGE_UP;
+      if (n1 == 6) return KEY_CTRL_PAGE_DOWN;
+    }
+
     if (mod == 5 || mod == 6) {
       switch (letter) {
       case 'C':

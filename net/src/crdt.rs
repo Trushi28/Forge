@@ -161,24 +161,22 @@ impl CollabDoc {
                 // Find insertion position
                 let insert_idx = self.find_insert_idx(id, parent, before);
 
-                self.chars.insert(insert_idx, crdt_char);
+                // Incremental index update: bump indices >= insert_idx by 1
+                for idx_val in self.id_index.values_mut() {
+                    if *idx_val >= insert_idx {
+                        *idx_val += 1;
+                    }
+                }
 
-                // Rebuild index (insertion invalidates all indices after insert_idx)
-                self.rebuild_index();
+                // Insert into chars vec and add new index entry
+                self.chars.insert(insert_idx, crdt_char);
+                self.id_index.insert(*id, insert_idx);
             }
             CrdtOp::Delete { id } => {
                 if let Some(&idx) = self.id_index.get(id) {
                     self.chars[idx].deleted = true;
                 }
             }
-        }
-    }
-
-    /// Rebuild the ID → index map
-    fn rebuild_index(&mut self) {
-        self.id_index.clear();
-        for (i, c) in self.chars.iter().enumerate() {
-            self.id_index.insert(c.id, i);
         }
     }
 
@@ -290,4 +288,68 @@ mod tests {
         // Both should converge to the same text
         assert_eq!(doc1.text(), doc2.text());
     }
+
+    #[test]
+    fn test_from_text_roundtrip() {
+        let text = "Hello, World!\nLine 2\nLine 3";
+        let doc = CollabDoc::from_text(1, text);
+        assert_eq!(doc.text(), text);
+        assert_eq!(doc.len(), text.len());
+    }
+
+    #[test]
+    fn test_interleaved_insert_delete() {
+        let mut doc = CollabDoc::from_text(1, "abc");
+        doc.insert(1, 'X');  // aXbc
+        assert_eq!(doc.text(), "aXbc");
+        doc.delete(2);       // aXc
+        assert_eq!(doc.text(), "aXc");
+        doc.insert(3, 'Y');  // aXcY
+        assert_eq!(doc.text(), "aXcY");
+        doc.delete(0);       // XcY
+        assert_eq!(doc.text(), "XcY");
+    }
+
+    #[test]
+    fn test_concurrent_delete() {
+        let mut doc1 = CollabDoc::from_text(1, "abc");
+        let mut doc2 = CollabDoc::from_text(2, "abc");
+
+        let op1 = doc1.delete(0).unwrap();  // agent1 deletes 'a'
+        let op2 = doc2.delete(2).unwrap();  // agent2 deletes 'c'
+
+        doc1.apply_op(&op2);
+        doc2.apply_op(&op1);
+
+        // Both should converge to "b"
+        assert_eq!(doc1.text(), doc2.text());
+        assert_eq!(doc1.text(), "b");
+    }
+
+    #[test]
+    fn test_idempotent_apply() {
+        let mut doc = CollabDoc::from_text(1, "ab");
+        let op = doc.insert(1, 'X');  // aXb
+
+        // Apply the same op again — should be a no-op
+        doc.apply_op(&op);
+        assert_eq!(doc.text(), "aXb");
+    }
+
+    #[test]
+    fn test_stress_many_inserts() {
+        let mut doc = CollabDoc::new(1);
+        for i in 0..200 {
+            doc.insert(i, 'a');
+        }
+        assert_eq!(doc.len(), 200);
+        assert_eq!(doc.text().len(), 200);
+
+        // Delete every other character
+        for i in (0..100).rev() {
+            doc.delete(i * 2);
+        }
+        assert_eq!(doc.len(), 100);
+    }
 }
+

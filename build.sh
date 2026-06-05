@@ -24,6 +24,25 @@ err()  { echo -e "${RED}[FAIL]${NC} $*" >&2; }
 warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
 bold() { echo -e "${BOLD}$*${NC}"; }
 
+# ── Auto-detect libgit2 ────────────────────────────────────────
+HAS_LIBGIT2=0
+detect_libgit2() {
+    if pkg-config --exists libgit2 2>/dev/null || \
+       ldconfig -p 2>/dev/null | grep -q libgit2; then
+        HAS_LIBGIT2=1
+        ok "libgit2 found — git features enabled"
+    else
+        warn "libgit2 not found — building without git features"
+        warn "  Install for git support: sudo apt-get install libgit2-dev"
+    fi
+}
+
+GIT_MAKE_FLAG() {
+    if [ "$HAS_LIBGIT2" -eq 1 ]; then
+        echo "WITH_GIT=1"
+    fi
+}
+
 # ── Dependency checker ─────────────────────────────────────────
 check_deps() {
     local missing=0
@@ -38,42 +57,25 @@ check_deps() {
         fi
     }
 
-    _check_lib() {
-        local name="$1" pkg="$2"
-        if ! pkg-config --exists "$name" 2>/dev/null && \
-           ! ldconfig -p 2>/dev/null | grep -q "${name}"; then
-            err "Missing lib: $pkg"
-            if command -v apt-get &>/dev/null; then
-                warn "  Fix: sudo apt-get install $pkg"
-            elif command -v dnf &>/dev/null; then
-                warn "  Fix: sudo dnf install $pkg"
-            elif command -v pacman &>/dev/null; then
-                warn "  Fix: sudo pacman -S $pkg"
-            fi
-            missing=1
-        else
-            ok "lib: $pkg"
-        fi
-    }
-
     bold "── Checking build dependencies ─────────────────────"
     _check "gcc"   gcc   "sudo apt-get install build-essential"
     _check "make"  make  "sudo apt-get install make"
-    _check_lib "libgit2" "libgit2-dev"
 
     if [ $missing -ne 0 ]; then
         echo ""
-        err "One or more dependencies are missing. Install them and retry."
+        err "Required dependencies are missing. Install them and retry."
         exit 1
     fi
+
+    detect_libgit2
     echo ""
-    ok "All core dependencies present."
+    ok "Core dependencies present."
 }
 
 # ── Build functions ────────────────────────────────────────────
 build_core() {
     log "Building C core…"
-    make -j"$(nproc 2>/dev/null || echo 4)"
+    make -j"$(nproc 2>/dev/null || echo 4)" $(GIT_MAKE_FLAG)
     ok "Core built → ./forge"
 }
 
@@ -102,8 +104,20 @@ build_core_release() {
     CFLAGS="-Wall -Wextra -std=c11 -O3 -DNDEBUG -Wno-unused-result \
             -Wno-format-truncation -Wno-missing-field-initializers \
             -D_GNU_SOURCE -flto" \
-    make -j"$(nproc 2>/dev/null || echo 4)"
+    make -j"$(nproc 2>/dev/null || echo 4)" $(GIT_MAKE_FLAG)
     ok "Core built (release) → ./forge"
+}
+
+run_tests() {
+    log "Running C core tests…"
+    make test $(GIT_MAKE_FLAG)
+    log "Running Rust net tests…"
+    if command -v cargo &>/dev/null && [ -f net/Cargo.toml ]; then
+        cd net && cargo test && cd ..
+        ok "All tests passed."
+    else
+        warn "Rust/cargo not found — skipping net tests."
+    fi
 }
 
 build_net_release() {
@@ -228,10 +242,13 @@ print_usage() {
     echo "  ./build.sh all          Build core + forge-net"
     echo "  ./build.sh release      Optimised release build"
     echo "  ./build.sh plugins      Build example plugins (.so)"
+    echo "  ./build.sh test         Run all tests (C + Rust)"
     echo "  ./build.sh install      Install to ~/.local/bin"
     echo "  ./build.sh setup        Create ~/.config/forge defaults"
     echo "  ./build.sh clean        Remove all build artefacts"
     echo "  ./build.sh deps         Check build dependencies"
+    echo ""
+    echo "  libgit2 is auto-detected. Without it, git features are disabled."
     echo ""
     echo "Quick start (no Rust needed):"
     echo "  ./build.sh deps && ./build.sh && ./forge <file>"
@@ -265,6 +282,10 @@ case "${1:-core}" in
         ;;
     plugins)
         build_plugins
+        ;;
+    test)
+        check_deps
+        run_tests
         ;;
     install)
         check_deps

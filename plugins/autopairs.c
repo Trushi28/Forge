@@ -2,8 +2,8 @@
  * autopairs.c — Auto-close brackets, quotes, and parentheses
  *
  * When a user types an opening bracket/quote, automatically insert
- * the matching closing character. When backspace deletes an opening
- * char next to its pair, delete both.
+ * the matching closing character and position the cursor between
+ * the pair.
  *
  * Build: gcc -shared -fPIC -o autopairs.so autopairs.c
  */
@@ -38,8 +38,9 @@ static void handle_keypress(int key, ForgeBuffer *buf) {
         if (closer) {
             char close_str[2] = { closer, '\0' };
             forge_insert(close_str);
-            /* Note: cursor management would move cursor back one
-               position in the full implementation */
+            /* Move cursor back so it sits between the pair:
+               typing '(' inserts ')' then moves left → cursor is at (|) */
+            forge_cursor_move(-1, 0);
         }
     }
 }

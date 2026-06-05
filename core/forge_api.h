@@ -81,6 +81,9 @@ void forge_run(const char *cmd);
 /* Get the current file path (NULL if no file open) */
 const char *forge_get_filepath(void);
 
+/* Move the cursor by a relative offset (e.g., -1 to move left one char) */
+void forge_cursor_move(int col_delta, int row_delta);
+
 /* ── Buffer query ──────────────────────────────────────────── */
 
 /* Get the total number of lines in the buffer */

@@ -3,12 +3,30 @@
 
 #include <stdbool.h>
 #include <sys/types.h>
+#include <stddef.h>
+
+/* Forward declarations — avoid pulling in full headers */
+struct Buffer;
+struct RenderState;
 
 /* ── Shell hooks ────────────────────────────────────────────── */
 
 /* Execute a shell hook command. $FILE is replaced with filepath.
    Non-blocking: fires and forgets. */
 void plugin_run_hook(const char *command, const char *filepath);
+
+/* ── Editor context — exposes editor state to plugin API ───── */
+
+typedef struct {
+    struct Buffer      *buf;       /* active buffer */
+    int                *cx;        /* pointer to cursor column */
+    int                *cy;        /* pointer to cursor row */
+    struct RenderState *render;    /* for forge_notify → status bar */
+    const char        **filepath;  /* pointer to current filepath */
+} EditorContext;
+
+/* Set the editor context. Must be called before plugins fire events. */
+void plugin_set_editor_context(EditorContext *ctx);
 
 /* ── Loaded plugin info ─────────────────────────────────────── */
 
@@ -83,3 +101,4 @@ void plugin_register_on_close(plugin_close_cb cb);
 void plugin_register_on_keypress(plugin_keypress_cb cb);
 
 #endif
+

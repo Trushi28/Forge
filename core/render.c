@@ -807,6 +807,73 @@ void render_frame(RenderState *r, Buffer *b, UIRegistry *ui,
             memset(r->front_buffer[y], 0, r->width + 1);
     }
 
+    /* ── Tab bar (when multiple buffers open) ──────────────── */
+    bool show_tabs = r->tab_count > 1;
+    if (show_tabs) {
+        text_rows--;  /* reserve top row for tab bar */
+
+        stream_printf(r, "\x1b[1;1H");
+        if (r->theme) {
+            ForgeTheme *t = r->theme;
+            stream_bg(r, t->gutter_bg);
+            int col_used = 0;
+            for (int i = 0; i < r->tab_count && i < 32; i++) {
+                bool active = (i == r->active_tab);
+                if (active) {
+                    stream_bg(r, t->statusbar_accent);
+                    stream_fg(r, t->statusbar_bg);
+                    stream_str(r, ESC_BOLD);
+                } else {
+                    stream_bg(r, t->gutter_bg);
+                    stream_fg(r, t->gutter_fg);
+                }
+                const char *name = r->tab_names[i][0] ? r->tab_names[i] : "[scratch]";
+                char tab_label[80];
+                int tl = snprintf(tab_label, sizeof(tab_label), " %s ", name);
+                stream_append(r, tab_label, tl < (int)sizeof(tab_label) ? tl : (int)sizeof(tab_label) - 1);
+                col_used += tl;
+
+                if (active)
+                    stream_str(r, ESC_RESET);
+
+                /* Separator */
+                stream_bg(r, t->gutter_bg);
+                stream_fg(r, t->gutter_fg);
+                if (i < r->tab_count - 1) {
+                    stream_str(r, "│");
+                    col_used++;
+                }
+            }
+            /* Fill remainder of tab bar */
+            stream_bg(r, t->gutter_bg);
+            for (int i = col_used; i < r->width; i++)
+                stream_append(r, " ", 1);
+            stream_str(r, ESC_RESET);
+        } else {
+            /* Fallback: no theme */
+            stream_str(r, "\x1b[7m");
+            int col_used = 0;
+            for (int i = 0; i < r->tab_count && i < 32; i++) {
+                bool active = (i == r->active_tab);
+                const char *name = r->tab_names[i][0] ? r->tab_names[i] : "[scratch]";
+                char tab_label[80];
+                int tl;
+                if (active)
+                    tl = snprintf(tab_label, sizeof(tab_label), "[%s]", name);
+                else
+                    tl = snprintf(tab_label, sizeof(tab_label), " %s ", name);
+                stream_append(r, tab_label, tl < (int)sizeof(tab_label) ? tl : (int)sizeof(tab_label) - 1);
+                col_used += tl;
+            }
+            for (int i = col_used; i < r->width; i++)
+                stream_append(r, " ", 1);
+            stream_str(r, ESC_RESET);
+        }
+    }
+
+    /* Offset row indices when tab bar is present */
+    int row_offset = show_tabs ? 1 : 0;
+
     size_t total_lines = buffer_line_count(b);
 
     /* Track block comment state across lines */
@@ -863,8 +930,7 @@ void render_frame(RenderState *r, Buffer *b, UIRegistry *ui,
         if (memcmp(r->front_buffer[y], r->back_buffer[y], r->width) == 0
             && !r->theme)
             continue;
-
-        stream_printf(r, "\x1b[%d;1H", y + 1);
+        stream_printf(r, "\x1b[%d;1H", y + 1 + row_offset);
 
         int logical = r->scroll_row + y;
         int is_cursor_row = (logical == cy);
@@ -1005,7 +1071,7 @@ void render_frame(RenderState *r, Buffer *b, UIRegistry *ui,
     blame_render(r, cy);
 
     /* ── Place cursor ────────────────────────────────────────*/
-    int screen_row = cy - r->scroll_row + 1;
+    int screen_row = cy - r->scroll_row + 1 + row_offset;
     int final_gutter_w = ui->slots[SLOT_GUTTER].visible ? ui->slots[SLOT_GUTTER].width : GUTTER_WIDTH;
     int screen_col = cx - r->scroll_col + final_gutter_w + 1 + 1; /* +1 for diag col */
     stream_printf(r, "\x1b[%d;%dH", screen_row, screen_col);

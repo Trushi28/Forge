@@ -1,0 +1,67 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    # ── System dependencies ────────────────────────────────────
+    - name: Install system deps
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential libgit2-dev pkg-config
+
+    # ── Build C core (release) ─────────────────────────────────
+    - name: Build core (release)
+      run: |
+        CFLAGS="-Wall -Wextra -std=c11 -O3 -DNDEBUG -Wno-unused-result \
+                -Wno-format-truncation -Wno-missing-field-initializers \
+                -D_GNU_SOURCE -DHAS_LIBGIT2 -flto" \
+        make -j$(nproc) WITH_GIT=1
+
+    # ── Build plugins ──────────────────────────────────────────
+    - name: Build plugins
+      run: make plugins
+
+    # ── Run tests ──────────────────────────────────────────────
+    - name: Run C core tests
+      run: make test WITH_GIT=1
+
+    # ── Rust ───────────────────────────────────────────────────
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Build forge-net (release)
+      run: cd net && cargo build --release
+
+    - name: Run Rust tests
+      run: cd net && cargo test
+
+    # ── Package ────────────────────────────────────────────────
+    - name: Package release artifacts
+      run: |
+        mkdir -p dist
+        cp forge dist/
+        cp net/target/release/forge-net dist/ 2>/dev/null || true
+        cp build/autopairs.so dist/ 2>/dev/null || true
+        cp build/indent.so dist/ 2>/dev/null || true
+        cp build/statusbar.so dist/ 2>/dev/null || true
+        cp README.md dist/ 2>/dev/null || true
+        tar czf forge-linux-x86_64.tar.gz -C dist .
+
+    # ── Create GitHub Release ──────────────────────────────────
+    - name: Create Release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: forge-linux-x86_64.tar.gz
+        generate_release_notes: true

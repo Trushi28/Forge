@@ -23,10 +23,36 @@
 
 Arena *session_arena = NULL;
 
-/* ── Global editor state ────────────────────────────────────── */
+/* ── Multi-buffer entry (one per open file) ─────────────────── */
+
+#define MAX_BUFFERS 32
 
 typedef struct {
+  Buffer    *buf;
+  char       filepath[1024];
+  char       file_uri[LSP_MAX_URI];
+  int        cx, cy;
+  bool       modified;
+  UndoStack  undo;
+  GitState   git;
+} BufferEntry;
+
+typedef struct {
+  /* ── Multi-buffer ────────────────────────────────────────── */
+  BufferEntry buffers[MAX_BUFFERS];
+  int buffer_count;
+  int active_buf;
+
+  /* ── Active buffer shortcuts (point into buffers[active_buf]) */
   Buffer *buf;
+  const char *filepath;
+  char file_uri[LSP_MAX_URI];
+  int cx, cy;
+  bool modified;
+  UndoStack undo;
+  GitState git;
+
+  /* ── Shared state ────────────────────────────────────────── */
   RenderState render;
   UIRegistry ui;
   ForgeConfig cfg;
@@ -34,17 +60,11 @@ typedef struct {
   LSPClient *lsp;
   CompletionState completion;
   PaletteState palette;
-  UndoStack undo;
-  GitState git;
   PluginHost plugins;
   ForgeScriptVM scripts;
   IPCBridge ipc;
 
-  const char *filepath;
-  char file_uri[LSP_MAX_URI];
-  int cx, cy;
   bool running;
-  bool modified;
   bool show_hover;
   char hover_text[4096];
   int hover_row, hover_col;
@@ -82,6 +102,66 @@ typedef struct {
 } EditorState;
 
 static EditorState E;
+
+/* ── Buffer switching ───────────────────────────────────────── */
+
+/* Save current editor state into the active BufferEntry */
+static void save_active_buffer(void) {
+  if (E.buffer_count == 0) return;
+  BufferEntry *be = &E.buffers[E.active_buf];
+  be->buf      = E.buf;
+  be->cx       = E.cx;
+  be->cy       = E.cy;
+  be->modified = E.modified;
+  be->undo     = E.undo;
+  be->git      = E.git;
+  if (E.filepath)
+    snprintf(be->filepath, sizeof(be->filepath), "%s", E.filepath);
+  memcpy(be->file_uri, E.file_uri, sizeof(be->file_uri));
+}
+
+/* Load a BufferEntry into the active editor state */
+static void load_buffer(int idx) {
+  if (idx < 0 || idx >= E.buffer_count) return;
+  BufferEntry *be = &E.buffers[idx];
+  E.active_buf = idx;
+  E.buf        = be->buf;
+  E.cx         = be->cx;
+  E.cy         = be->cy;
+  E.modified   = be->modified;
+  E.undo       = be->undo;
+  E.git        = be->git;
+  E.filepath   = be->filepath;
+  memcpy(E.file_uri, be->file_uri, sizeof(E.file_uri));
+}
+
+/* Switch to a different buffer index */
+static void switch_buffer(int idx) {
+  if (idx < 0 || idx >= E.buffer_count || idx == E.active_buf) return;
+  save_active_buffer();
+  load_buffer(idx);
+  E.render.full_redraw = true;
+}
+
+/* Add a buffer from a Buffer* and filepath. Returns index. */
+static int add_buffer(Buffer *buf, const char *path) {
+  if (E.buffer_count >= MAX_BUFFERS) return -1;
+  int idx = E.buffer_count;
+  BufferEntry *be = &E.buffers[idx];
+  be->buf = buf;
+  be->cx = 0;
+  be->cy = 0;
+  be->modified = false;
+  undo_init(&be->undo);
+  memset(&be->git, 0, sizeof(be->git));
+  if (path)
+    snprintf(be->filepath, sizeof(be->filepath), "%s", path);
+  else
+    be->filepath[0] = '\0';
+  be->file_uri[0] = '\0';
+  E.buffer_count++;
+  return idx;
+}
 
 /* ── Resize signal ──────────────────────────────────────────── */
 static volatile int g_resized = 0;
@@ -1300,6 +1380,10 @@ int main(int argc, char **argv) {
 
   E.buf = E.filepath ? load_file(E.filepath) : buffer_new("", 0);
 
+  /* Register initial buffer in multi-buffer list */
+  add_buffer(E.buf, E.filepath);
+  E.active_buf = 0;
+
   ui_init(&E.ui, term_cols, term_rows);
   ui_register_builtins(&E.ui);
   render_init(&E.render, term_cols, term_rows);
@@ -1324,6 +1408,16 @@ int main(int argc, char **argv) {
 
   /* ── Initialize plugins ───────────────────────────────── */
   plugin_host_init(&E.plugins);
+
+  /* Set editor context so plugin API functions (forge_insert, etc.) work */
+  static EditorContext plugin_ctx;
+  plugin_ctx.buf      = E.buf;
+  plugin_ctx.cx       = &E.cx;
+  plugin_ctx.cy       = &E.cy;
+  plugin_ctx.render   = &E.render;
+  plugin_ctx.filepath = &E.filepath;
+  plugin_set_editor_context(&plugin_ctx);
+
   /* Load plugins from default directories */
   for (int i = 0; i < E.plugins.search_path_count; i++)
     plugin_host_load_dir(&E.plugins, E.plugins.search_paths[i]);
@@ -1505,6 +1599,20 @@ int main(int argc, char **argv) {
     }
 
     /* ── Render ──────────────────────────────────────── */
+    /* Populate tab bar state */
+    E.render.tab_count  = E.buffer_count;
+    E.render.active_tab = E.active_buf;
+    for (int t = 0; t < E.buffer_count && t < 32; t++) {
+      const char *fp = E.buffers[t].filepath;
+      if (fp[0]) {
+        const char *base = strrchr(fp, '/');
+        base = base ? base + 1 : fp;
+        snprintf(E.render.tab_names[t], 64, "%s%s",
+                 base, E.buffers[t].modified ? " ●" : "");
+      } else {
+        snprintf(E.render.tab_names[t], 64, "[scratch]");
+      }
+    }
     render_frame(&E.render, E.buf, &E.ui, E.cx, E.cy);
 
     /* Render overlays */
@@ -1598,15 +1706,23 @@ int main(int argc, char **argv) {
 
         if (E.palette.result_path[0]) {
           /* Open new file */
-          buffer_free(E.buf);
-          E.buf = load_file(E.palette.result_path);
-          E.filepath = E.palette.result_path;
-          E.cx = 0;
-          E.cy = 0;
+          Buffer *newbuf = load_file(E.palette.result_path);
 
-          /* Reset undo for new file */
-          undo_free(&E.undo);
-          undo_init(&E.undo);
+          /* Add as new buffer instead of replacing */
+          int new_idx = add_buffer(newbuf, E.palette.result_path);
+          if (new_idx >= 0) {
+            save_active_buffer();
+            load_buffer(new_idx);
+          } else {
+            /* Fallback: replace current buffer */
+            buffer_free(E.buf);
+            E.buf = newbuf;
+            E.filepath = E.palette.result_path;
+            E.cx = 0;
+            E.cy = 0;
+            undo_free(&E.undo);
+            undo_init(&E.undo);
+          }
 
           /* Restart LSP for new file */
           if (E.lsp) {
@@ -1632,6 +1748,9 @@ int main(int argc, char **argv) {
           /* Fire on_open hook */
           if (E.cfg.hook_on_open[0])
             plugin_run_hook(E.cfg.hook_on_open, E.filepath);
+
+          /* Update plugin context to point to new buffer */
+          plugin_ctx.buf = E.buf;
 
           E.modified = false;
           render_set_status(&E.render, "%s", E.filepath);
@@ -2222,6 +2341,28 @@ int main(int argc, char **argv) {
         E.cy = (int)lc - 1;
       clamp_cx(&E.cx, E.cy);
 
+      /* ── Tab switching (Ctrl+PageUp/Down) ───────────── */
+    } else if (key == KEY_CTRL_PAGE_UP) {
+      if (E.buffer_count > 1) {
+        int prev = (E.active_buf - 1 + E.buffer_count) % E.buffer_count;
+        switch_buffer(prev);
+        /* Update plugin context to point to new buffer */
+        plugin_ctx.buf = E.buf;
+        render_set_status(&E.render, "Tab %d/%d: %s",
+                          E.active_buf + 1, E.buffer_count,
+                          E.filepath ? E.filepath : "[scratch]");
+      }
+
+    } else if (key == KEY_CTRL_PAGE_DOWN) {
+      if (E.buffer_count > 1) {
+        int next = (E.active_buf + 1) % E.buffer_count;
+        switch_buffer(next);
+        plugin_ctx.buf = E.buf;
+        render_set_status(&E.render, "Tab %d/%d: %s",
+                          E.active_buf + 1, E.buffer_count,
+                          E.filepath ? E.filepath : "[scratch]");
+      }
+
     } else if (key == KEY_HOME) {
       E.cx = 0;
 
@@ -2382,6 +2523,9 @@ int main(int argc, char **argv) {
 
       /* Auto-trigger completion on identifier chars and trigger chars */
       maybe_request_completion(key);
+
+      /* Fire keypress to plugins (e.g., autopairs auto-closes brackets) */
+      plugin_on_keypress(&E.plugins, key, E.buf);
 
       /* Update completion filter if visible */
       if (E.completion.visible) {

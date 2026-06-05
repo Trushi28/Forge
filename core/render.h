@@ -55,6 +55,11 @@ typedef struct RenderState {
     /* Config and LSP Client pointers */
     ForgeConfig *cfg;
     struct LSPClient *lsp;
+
+    /* Tab bar state (set by main loop) */
+    int  tab_count;
+    int  active_tab;
+    char tab_names[32][64];  /* basename of each open file */
 } RenderState;
 
 void ui_register_builtins(UIRegistry *ui);

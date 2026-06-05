@@ -40,6 +40,10 @@ enum KeyCode {
   KEY_WORD_LEFT = 1100,
   KEY_WORD_RIGHT,
 
+  /* ── Tab switching (Ctrl+PageUp/Down) ─────────────────── */
+  KEY_CTRL_PAGE_UP = 1150,
+  KEY_CTRL_PAGE_DOWN,
+
   /* ── Mouse events (coordinates in g_mouse_x / g_mouse_y) ── */
   KEY_MOUSE_LEFT = 1200,
   KEY_MOUSE_RIGHT,
