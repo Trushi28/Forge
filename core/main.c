@@ -1521,7 +1521,8 @@ int main(int argc, char **argv) {
 
   /* ── Initialize IPC (try to connect to forge-net) ─────── */
   ipc_init(&E.ipc);
-  /* Don't connect yet — forge-net may not be running */
+  /* Auto-spawn forge-net and begin connecting */
+  ipc_try_connect(&E.ipc);
 
   /* ── Initialize completion ────────────────────────────── */
   completion_init(&E.completion);
@@ -1716,7 +1717,7 @@ int main(int argc, char **argv) {
       render_guild_panel();
     }
 
-    /* IPC polling and auto-reconnect */
+    /* IPC polling and auto-reconnect (always active) */
     if (E.ipc.connected) {
       int msgs = ipc_poll(&E.ipc);
       while (msgs > 0) {
@@ -1734,8 +1735,8 @@ int main(int argc, char **argv) {
           E.guild_status_timer = 120;
         }
       }
-    } else if (E.guild_panel_visible) {
-      /* Try reconnecting periodically */
+    } else {
+      /* Try reconnecting periodically — auto-spawns forge-net if needed */
       ipc_try_connect(&E.ipc);
     }
 
