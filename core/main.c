@@ -21,6 +21,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/inotify.h>
+#include <libgen.h>
 
 extern Arena *session_arena;
 
@@ -1536,6 +1537,32 @@ static void render_references_panel(void) {
   int total_refs = E.lsp->references.count;
   int visible_rows = REFS_PANEL_HEIGHT - 1; // 7 rows
 
+  // Determine git workspace root dynamically once
+  char git_workspace[1024] = {0};
+  bool has_git_workspace = false;
+  if (E.filepath) {
+    char abs_path[1024];
+    if (realpath(E.filepath, abs_path)) {
+      char dir[1024];
+      strcpy(dir, abs_path);
+      while (1) {
+        char *parent = dirname(dir);
+        if (!parent) break;
+        char git_path[1024];
+        snprintf(git_path, sizeof(git_path), "%s/.git", parent);
+        if (access(git_path, F_OK) == 0) {
+          strncpy(git_workspace, parent, sizeof(git_workspace) - 1);
+          has_git_workspace = true;
+          break;
+        }
+        if (strcmp(parent, "/") == 0 || strcmp(parent, ".") == 0) {
+          break;
+        }
+        memmove(dir, parent, strlen(parent) + 1);
+      }
+    }
+  }
+
   // Scroll logic
   static int refs_scroll = 0;
   if (E.refs_selected_idx < refs_scroll) {
@@ -1582,12 +1609,35 @@ static void render_references_panel(void) {
         path += 7;
       }
       const char *display_path = path;
-      const char *workspace = "/home/Trushi/ai/Forge";
-      int ws_len = (int)strlen(workspace);
-      if (strncmp(path, workspace, ws_len) == 0) {
-        display_path = path + ws_len;
-        if (display_path[0] == '/') display_path++;
-      } else {
+      bool matched = false;
+      if (has_git_workspace) {
+        int ws_len = (int)strlen(git_workspace);
+        if (strncmp(path, git_workspace, ws_len) == 0) {
+          display_path = path + ws_len;
+          if (display_path[0] == '/') display_path++;
+          matched = true;
+        }
+      }
+      if (!matched && E.filepath) {
+        int i = 0;
+        while (E.filepath[i] && path[i] && E.filepath[i] == path[i]) {
+          i++;
+        }
+        if (i > 0) {
+          int last_slash_idx = -1;
+          for (int j = i - 1; j >= 0; j--) {
+            if (E.filepath[j] == '/') {
+              last_slash_idx = j;
+              break;
+            }
+          }
+          if (last_slash_idx >= 0) {
+            display_path = path + last_slash_idx + 1;
+            matched = true;
+          }
+        }
+      }
+      if (!matched) {
         const char *base = strrchr(path, '/');
         if (base) display_path = base + 1;
       }
