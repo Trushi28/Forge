@@ -231,12 +231,50 @@ static void theme_tokyo_night(ForgeTheme *t) {
     t->constant         = theme_hex(0xff9e64);
 }
 
+/* ── Dracula ─────────────────────────────────────────────────
+   Popular dark theme with rich purples and greens.
+   Palette from https://draculatheme.com/contribute             */
+
+static void theme_dracula(ForgeTheme *t) {
+    strncpy(t->name, "dracula", sizeof(t->name) - 1);
+
+    t->bg               = theme_hex(0x282a36);  /* Background    */
+    t->fg               = theme_hex(0xf8f8f2);  /* Foreground    */
+    t->accent           = theme_hex(0xbd93f9);  /* Purple        */
+
+    t->gutter_fg        = theme_hex(0x6272a4);  /* Comment       */
+    t->gutter_active    = theme_hex(0xf1fa8c);  /* Yellow        */
+    t->gutter_bg        = theme_hex(0x21222c);  /* Current Line  */
+
+    t->statusbar_bg     = theme_hex(0x44475a);  /* Selection     */
+    t->statusbar_fg     = theme_hex(0xf8f8f2);  /* Foreground    */
+    t->statusbar_accent = theme_hex(0xff79c6);  /* Pink          */
+
+    t->line_highlight   = theme_hex(0x2d2f3d);  /* Slightly lighter */
+    t->selection        = theme_hex(0x44475a);  /* Selection     */
+
+    t->error            = theme_hex(0xff5555);  /* Red           */
+    t->warning          = theme_hex(0xffb86c);  /* Orange        */
+    t->info             = theme_hex(0x8be9fd);  /* Cyan          */
+    t->hint             = theme_hex(0x50fa7b);  /* Green         */
+
+    t->keyword          = theme_hex(0xff79c6);  /* Pink          */
+    t->type_color       = theme_hex(0x8be9fd);  /* Cyan          */
+    t->function_color   = theme_hex(0x50fa7b);  /* Green         */
+    t->string_color     = theme_hex(0xf1fa8c);  /* Yellow        */
+    t->number_color     = theme_hex(0xbd93f9);  /* Purple        */
+    t->comment          = theme_hex(0x6272a4);  /* Comment       */
+    t->operator_color   = theme_hex(0xff79c6);  /* Pink          */
+    t->preprocessor     = theme_hex(0xff5555);  /* Red           */
+    t->constant         = theme_hex(0xbd93f9);  /* Purple        */
+}
+
 /* ══════════════════════════════════════════════════════════════
    Public API
    ══════════════════════════════════════════════════════════════ */
 
 static const char *theme_names[] = {
-    "catppuccin", "light", "gruvbox", "solarized", "tokyo_night", NULL
+    "catppuccin", "dracula", "tokyo_night", "gruvbox", "solarized", "light", NULL
 };
 
 const char **theme_list(void) {
@@ -264,6 +302,10 @@ bool theme_load(ForgeTheme *t, const char *name) {
     }
     if (strcmp(name, "tokyo_night") == 0) {
         theme_tokyo_night(t);
+        return true;
+    }
+    if (strcmp(name, "dracula") == 0) {
+        theme_dracula(t);
         return true;
     }
 

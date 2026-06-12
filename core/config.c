@@ -334,9 +334,15 @@ bool config_poll_reload(ForgeConfig *cfg) {
     if (stat(cfg->filepath, &st) != 0) return false;
     if (st.st_mtime == cfg->last_mtime) return false;
 
-    /* File changed — reload */
+    /* File changed — reload.
+       Save filepath/mtime first: config_default() zeros the struct. */
+    char saved_path[FORGE_MAX_PATH];
+    memcpy(saved_path, cfg->filepath, sizeof(saved_path));
+    time_t saved_mtime = st.st_mtime;
+
     config_default(cfg);
-    config_load(cfg, cfg->filepath);
+    config_load(cfg, saved_path);
+    cfg->last_mtime = saved_mtime;
     return true;
 }
 

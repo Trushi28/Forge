@@ -142,10 +142,15 @@ static void load_buffer(int idx) {
 }
 
 /* Switch to a different buffer index */
+/* Forward declaration — plugin context needs updating on buffer switch */
+static EditorContext *g_plugin_ctx;
+
 static void switch_buffer(int idx) {
   if (idx < 0 || idx >= E.buffer_count || idx == E.active_buf) return;
   save_active_buffer();
   load_buffer(idx);
+  /* Keep plugin context pointing at the active buffer */
+  if (g_plugin_ctx) g_plugin_ctx->buf = E.buf;
   E.render.full_redraw = true;
 }
 
@@ -671,7 +676,54 @@ static void cmd_open_file(void *ctx) {
 
 static void cmd_format(void *ctx) {
   (void)ctx;
-  render_set_status(&E.render, "Format: not yet implemented");
+  if (!E.filepath) {
+    render_set_status(&E.render, "No file path — save first");
+    return;
+  }
+
+  /* Save before formatting */
+  cmd_save(NULL);
+
+  /* Detect formatter from config based on file extension */
+  const char *formatter = NULL;
+  const char *ext = strrchr(E.filepath, '.');
+  if (ext) {
+    if (strcmp(ext, ".c") == 0 || strcmp(ext, ".h") == 0 ||
+        strcmp(ext, ".cpp") == 0 || strcmp(ext, ".cc") == 0 ||
+        strcmp(ext, ".hpp") == 0)
+      formatter = E.cfg.lang_c_formatter;
+    else if (strcmp(ext, ".py") == 0)
+      formatter = E.cfg.lang_python_formatter;
+    else if (strcmp(ext, ".rs") == 0)
+      formatter = E.cfg.lang_rust_formatter;
+  }
+
+  if (!formatter || !formatter[0]) {
+    render_set_status(&E.render, "No formatter configured for this file type");
+    return;
+  }
+
+  /* Run the formatter (blocking — short command) */
+  plugin_run_hook(formatter, E.filepath);
+
+  /* Brief pause to let the formatter finish writing */
+  usleep(200000);
+
+  /* Reload the file from disk */
+  Buffer *newbuf = load_file(E.filepath);
+  buffer_free(E.buf);
+  E.buf = newbuf;
+  E.buffers[E.active_buf].buf = E.buf;
+  if (g_plugin_ctx) g_plugin_ctx->buf = E.buf;
+  E.modified = false;
+  undo_free(&E.undo);
+  undo_init(&E.undo);
+  E.render.full_redraw = true;
+  render_set_status(&E.render, "Formatted: %s", E.filepath);
+
+  /* Re-sync LSP */
+  E.lsp_dirty = true;
+  get_time(&E.lsp_last_edit);
 }
 
 static void cmd_lsp_restart(void *ctx) {
@@ -879,8 +931,8 @@ static void handle_guild_command(const char *cmd) {
     return;
   }
 
-  if (strncmp(cmd, ":collab ", 7) == 0) {
-    const char *peer = cmd + 7;
+  if (strncmp(cmd, ":collab ", 8) == 0) {
+    const char *peer = cmd + 8;
     while (*peer == ' ') peer++;
     if (*peer && E.ipc.connected) {
       char json[512];
@@ -940,7 +992,11 @@ static void handle_guild_command(const char *cmd) {
     const char *path = cmd + 6;
     while (*path == ' ') path++;
     if (*path) {
-      E.filepath = path;
+      /* Copy path into the BufferEntry's stable storage to avoid
+         dangling pointer after palette input is cleared. */
+      BufferEntry *be = &E.buffers[E.active_buf];
+      snprintf(be->filepath, sizeof(be->filepath), "%s", path);
+      E.filepath = be->filepath;
       cmd_save(NULL);
     } else {
       render_set_status(&E.render, "Usage: :save <path>");
@@ -1126,11 +1182,22 @@ static void handle_net_message(const char *msg) {
         if (f) {
           fwrite(decoded, 1, decoded_len, f);
           fclose(f);
-          buffer_free(E.buf);
-          E.buf = load_file(tmppath);
-          E.filepath = NULL; /* grabbed file, no save path */
-          E.cx = 0;
-          E.cy = 0;
+          /* Open grabbed file as a new buffer in the multi-buffer list */
+          Buffer *grabbed = load_file(tmppath);
+          save_active_buffer();
+          int grab_idx = add_buffer(grabbed, NULL);
+          if (grab_idx >= 0) {
+            load_buffer(grab_idx);
+            if (g_plugin_ctx) g_plugin_ctx->buf = E.buf;
+          } else {
+            /* Fallback: replace current buffer */
+            buffer_free(E.buf);
+            E.buf = grabbed;
+            E.buffers[E.active_buf].buf = E.buf;
+            E.filepath = NULL;
+            E.cx = 0;
+            E.cy = 0;
+          }
           E.modified = false;
           render_set_status(&E.render, "Grabbed: %s from %s (%zu bytes)", name, from, decoded_len);
         }
@@ -1430,9 +1497,103 @@ static void lsp_update_diagnostics(void) {
   E.render.full_redraw = true;
 }
 
-/* ══════════════════════════════════════════════════════════════
-   main
-   ══════════════════════════════════════════════════════════════ */
+/* ── Welcome screen ──────────────────────────────────────────── */
+static void render_welcome_screen(void) {
+  if (E.filepath) return; /* only show when no file is open */
+  if (E.modified) return; /* user started typing */
+
+  ForgeTheme *t = E.render.theme;
+  if (!t) return;
+
+  int w = E.render.width;
+  int h = E.render.height;
+
+  /* ASCII art & shortcuts to render */
+  static const char *lines[] = {
+    "",
+    "⚒  F O R G E",
+    "",
+    "A terminal text editor for the guild.",
+    "",
+    "───────────────────────────────────",
+    "",
+    "   Ctrl+P   Command Palette",
+    "   Ctrl+S   Save File",
+    "   Ctrl+F   Find / Search",
+    "   Ctrl+G   Guild Panel",
+    "   Ctrl+T   Git Timeline",
+    "   Ctrl+B   Git Blame",
+    "   Ctrl+Z   Undo",
+    "   Ctrl+Q   Quit",
+    "",
+    "   :collab <peer>   Start collab",
+    "   :chat <text>     Send message",
+    "",
+    "───────────────────────────────────",
+    "",
+    NULL
+  };
+
+  /* Count lines */
+  int line_count = 0;
+  while (lines[line_count]) line_count++;
+
+  /* Center vertically */
+  int start_row = (h - line_count) / 2;
+  if (start_row < 2) start_row = 2;
+
+  char buf[8192];
+  int blen = 0;
+#define WPRINTF(...) blen += snprintf(buf + blen, sizeof(buf) - blen, __VA_ARGS__)
+
+  for (int i = 0; i < line_count && blen < (int)sizeof(buf) - 256; i++) {
+    const char *text = lines[i];
+    int text_len = (int)strlen(text);
+
+    /* Center horizontally (approximate — GUTTER_WIDTH offset) */
+    int pad_left = (w - text_len) / 2;
+    if (pad_left < GUTTER_WIDTH + 2) pad_left = GUTTER_WIDTH + 2;
+
+    WPRINTF("\x1b[%d;%dH", start_row + i, pad_left);
+
+    /* Color: title in accent+bold, shortcuts in fg, separators dim */
+    if (i == 1) {
+      /* Title line */
+      WPRINTF("\x1b[38;2;%u;%u;%um\x1b[1m%s\x1b[0m",
+              t->accent.r, t->accent.g, t->accent.b, text);
+    } else if (i == 3) {
+      /* Subtitle */
+      WPRINTF("\x1b[38;2;%u;%u;%um%s\x1b[0m",
+              t->comment.r, t->comment.g, t->comment.b, text);
+    } else if (i == 5 || i == 19) {
+      /* Separators */
+      WPRINTF("\x1b[38;2;%u;%u;%um%s\x1b[0m",
+              t->gutter_fg.r, t->gutter_fg.g, t->gutter_fg.b, text);
+    } else if (text_len > 0 && (text[3] == 'C' || text[3] == ':')) {
+      /* Shortcut lines: highlight the key combo */
+      /* Find the double-space separator between key and description */
+      const char *sep = strstr(text + 3, "   ");
+      if (sep) {
+        int key_len = (int)(sep - text);
+        WPRINTF("\x1b[38;2;%u;%u;%um\x1b[1m",
+                t->statusbar_accent.r, t->statusbar_accent.g, t->statusbar_accent.b);
+        for (int j = 0; j < key_len; j++) WPRINTF("%c", text[j]);
+        WPRINTF("\x1b[0m\x1b[38;2;%u;%u;%um%s\x1b[0m",
+                t->fg.r, t->fg.g, t->fg.b, sep);
+      } else {
+        WPRINTF("\x1b[38;2;%u;%u;%um%s\x1b[0m",
+                t->fg.r, t->fg.g, t->fg.b, text);
+      }
+    }
+  }
+
+#undef WPRINTF
+
+  if (blen > 0)
+    (void)write(STDOUT_FILENO, buf, blen);
+}
+
+/* ---- main ---- */
 int main(int argc, char **argv) {
   E.filepath = (argc >= 2) ? argv[1] : NULL;
 
@@ -1496,6 +1657,7 @@ int main(int argc, char **argv) {
   plugin_ctx.cy       = &E.cy;
   plugin_ctx.render   = &E.render;
   plugin_ctx.filepath = &E.filepath;
+  g_plugin_ctx = &plugin_ctx;
   plugin_set_editor_context(&plugin_ctx);
 
   /* Load plugins from default directories */
@@ -1716,6 +1878,9 @@ int main(int argc, char **argv) {
     if (E.guild_panel_visible) {
       render_guild_panel();
     }
+
+    /* Welcome screen (no-file splash) */
+    render_welcome_screen();
 
     /* IPC polling and auto-reconnect (always active) */
     if (E.ipc.connected) {
@@ -1971,6 +2136,7 @@ int main(int argc, char **argv) {
           /* Replace buffer with historical content (read-only) */
           buffer_free(E.buf);
           E.buf = buffer_new(content, strlen(content));
+          E.buffers[E.active_buf].buf = E.buf;
           free(content);
           E.git.timeline_viewing = true;
           E.cx = 0;
@@ -1991,6 +2157,7 @@ int main(int argc, char **argv) {
           /* Reload the current file from disk */
           buffer_free(E.buf);
           E.buf = E.filepath ? load_file(E.filepath) : buffer_new("", 0);
+          E.buffers[E.active_buf].buf = E.buf;
           E.git.timeline_viewing = false;
           E.cx = 0;
           E.cy = 0;
@@ -2198,8 +2365,9 @@ int main(int argc, char **argv) {
 
     /* ── Mouse events ────────────────────────────────── */
     if (key == KEY_MOUSE_LEFT) {
-      /* Click to position cursor */
-      int buf_row = E.render.scroll_row + g_mouse_y;
+      /* Click to position cursor — account for tab bar offset */
+      int tab_offset = (E.buffer_count > 1) ? 1 : 0;
+      int buf_row = E.render.scroll_row + (g_mouse_y - tab_offset);
       int buf_col = E.render.scroll_col + (g_mouse_x - GUTTER_WIDTH);
       size_t lc = buffer_line_count(E.buf);
       if (lc > 0) {
@@ -2457,12 +2625,17 @@ int main(int argc, char **argv) {
     } else if (key == '\r' || key == '\n') {
       size_t pos = buffer_get_offset(E.buf, E.cx, E.cy);
 
-      /* Auto-indent: copy leading whitespace from current line */
+      /* Auto-indent: copy leading whitespace from current line,
+         preserving the original whitespace characters (spaces vs tabs) */
       char *curr_line = buffer_get_line(E.buf, E.cy);
       int indent = 0;
+      char indent_chars[256];
       if (curr_line) {
-        while (curr_line[indent] == ' ' || curr_line[indent] == '\t')
+        while ((curr_line[indent] == ' ' || curr_line[indent] == '\t')
+               && indent < (int)sizeof(indent_chars) - 1) {
+          indent_chars[indent] = curr_line[indent];
           indent++;
+        }
         free(curr_line);
       }
 
@@ -2471,7 +2644,7 @@ int main(int argc, char **argv) {
       insert_buf[0] = '\n';
       int ilen = 1;
       for (int i = 0; i < indent && ilen < 255; i++)
-        insert_buf[ilen++] = ' ';
+        insert_buf[ilen++] = indent_chars[i];
       insert_buf[ilen] = '\0';
 
       buffer_insert(E.buf, pos, insert_buf, ilen);
@@ -2638,12 +2811,21 @@ int main(int argc, char **argv) {
   (void)write(STDOUT_FILENO, "\x1b[0m", 4);       /* reset colors */
 
   render_free(&E.render);
-  undo_free(&E.undo);
+
+  /* Free all open buffers and their undo stacks */
+  save_active_buffer();
+  for (int i = 0; i < E.buffer_count; i++) {
+    if (E.buffers[i].buf) {
+      buffer_free(E.buffers[i].buf);
+      E.buffers[i].buf = NULL;
+    }
+    undo_free(&E.buffers[i].undo);
+  }
+
   git_state_free(&E.git);
   plugin_host_free(&E.plugins);
   fs_vm_free(&E.scripts);
   ipc_free(&E.ipc);
-  buffer_free(E.buf);
   arena_free(session_arena);
 
   if (E.modified && E.filepath)

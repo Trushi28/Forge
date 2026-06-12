@@ -101,10 +101,10 @@ build_plugins() {
 build_core_release() {
     log "Building C core (release)…"
     make clean
-    CFLAGS="-Wall -Wextra -std=c11 -O3 -DNDEBUG -Wno-unused-result \
-            -Wno-format-truncation -Wno-missing-field-initializers \
-            -D_GNU_SOURCE -flto" \
-    make -j"$(nproc 2>/dev/null || echo 4)" $(GIT_MAKE_FLAG)
+    make -j"$(nproc 2>/dev/null || echo 4)" $(GIT_MAKE_FLAG) \
+        CFLAGS="-Wall -Wextra -std=c11 -O3 -DNDEBUG -Wno-unused-result \
+                -Wno-format-truncation -Wno-missing-field-initializers \
+                -D_GNU_SOURCE -flto"
     ok "Core built (release) → ./forge"
 }
 

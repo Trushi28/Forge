@@ -150,10 +150,19 @@ int render_get_diag_severity(RenderState *r, int line) {
 /* ── Scroll adjustment ───────────────────────────────────────*/
 
 static void adjust_scroll(RenderState *r, UIRegistry *ui, int cx, int cy, int text_rows) {
-    if (cy < r->scroll_row)
-        r->scroll_row = cy;
-    if (cy >= r->scroll_row + text_rows)
-        r->scroll_row = cy - text_rows + 1;
+    /* Scrolloff: keep cursor this many lines from the viewport edge */
+    int scrolloff = 0;
+    if (r->cfg && r->cfg->scrolloff > 0)
+        scrolloff = r->cfg->scrolloff;
+    /* Clamp scrolloff to half the visible area to avoid jitter */
+    if (scrolloff > text_rows / 2)
+        scrolloff = text_rows / 2;
+
+    if (cy < r->scroll_row + scrolloff)
+        r->scroll_row = cy - scrolloff;
+    if (cy >= r->scroll_row + text_rows - scrolloff)
+        r->scroll_row = cy - text_rows + 1 + scrolloff;
+    if (r->scroll_row < 0) r->scroll_row = 0;
 
     int gutter_w = ui->slots[SLOT_GUTTER].visible ? ui->slots[SLOT_GUTTER].width : 0;
     int text_cols = r->width - gutter_w;
@@ -453,73 +462,57 @@ static void content_widget_render(Widget *self, RenderState *r, Buffer *b) {
 
 static void statusbar_widget_render(Widget *self, RenderState *r, Buffer *b) {
     (void)self;
-    (void)b;
     int cy = r->cy;
     int cx = r->cx;
+    size_t total_lines = b ? buffer_line_count(b) : 0;
 
     stream_printf(r, "\x1b[%d;1H", r->height);
 
     if (r->theme) {
         ForgeTheme *t = r->theme;
 
-        /* ── Config-driven statusbar: iterate r->cfg->statusbar_widgets ── */
-        /* Build left and right sections from widget names */
-        char left_buf[512] = "";
-        char right_buf[256] = "";
-        int left_len = 0, right_len = 0;
-
-        /* Always show the mode indicator as leftmost */
+        /* ── Left: Mode badge ── */
         stream_bg(r, t->statusbar_accent);
         stream_fg(r, t->statusbar_bg);
         stream_str(r, ESC_BOLD);
         stream_str(r, "  FORGE  ");
         stream_str(r, ESC_RESET);
 
-        stream_bg(r, t->statusbar_bg);
+        /* Powerline separator from accent to statusbar bg */
         stream_fg(r, t->statusbar_accent);
-        stream_str(r, " │ ");
-        left_len = 9 + 3;
+        stream_bg(r, t->statusbar_bg);
+        stream_str(r, "\xee\x82\xb0");
+        int left_len = 9 + 1; /* "  FORGE  " + powerline char */
 
-        /* Iterate config widgets for left-side items */
-        if (r->cfg) {
-            for (int i = 0; i < r->cfg->statusbar_widget_count; i++) {
-                const char *wname = r->cfg->statusbar_widgets[i];
-                if (strcmp(wname, "mode_indicator") == 0) {
-                    /* Already rendered above */
-                } else if (strcmp(wname, "filename") == 0) {
-                    const char *msg = r->status_msg[0] ? r->status_msg : "ready";
-                    int n = snprintf(left_buf + left_len - 12, sizeof(left_buf) - left_len, "%s", msg);
-                    (void)n;
-                    stream_fg(r, t->statusbar_fg);
-                    stream_bg(r, t->statusbar_bg);
-                    stream_str(r, msg);
-                    left_len += (int)strlen(msg);
-                } else if (strcmp(wname, "lsp_status") == 0) {
-                    if (r->lsp) {
-                        /* LSP status shown as part of right section */
-                    }
-                }
-                /* git_branch and cursor_pos are right-aligned below */
-            }
-        } else {
-            stream_fg(r, t->statusbar_fg);
-            stream_bg(r, t->statusbar_bg);
-            const char *msg = r->status_msg[0] ? r->status_msg : "ready";
-            stream_str(r, msg);
-            left_len += (int)strlen(msg);
-        }
+        /* ── Left: Status message ── */
+        stream_fg(r, t->statusbar_fg);
+        stream_bg(r, t->statusbar_bg);
+        const char *msg = r->status_msg[0] ? r->status_msg : "ready";
+        stream_str(r, " ");
+        stream_str(r, msg);
+        stream_str(r, " ");
+        left_len += (int)strlen(msg) + 2;
 
-        /* Right section: git_branch, theme, cursor_pos */
+        /* ── Right section ── */
+        char right_buf[256] = "";
+        int right_len = 0;
+
+        /* Git branch */
         const char *branch = (r->git && r->git->repo_open && r->git->branch[0])
                                ? r->git->branch : NULL;
+
+        /* Build right string with richer information */
         if (branch)
-            right_len = snprintf(right_buf, sizeof(right_buf), "  %s │ %s │ Ln %d, Col %d  ",
-                          branch, t->name, cy + 1, cx + 1);
+            right_len = snprintf(right_buf, sizeof(right_buf),
+                "  %s │ %s │ UTF-8 │ %zu lines │ Ln %d, Col %d  ",
+                branch, t->name, total_lines, cy + 1, cx + 1);
         else
-            right_len = snprintf(right_buf, sizeof(right_buf), " %s │ Ln %d, Col %d  ",
-                          t->name, cy + 1, cx + 1);
+            right_len = snprintf(right_buf, sizeof(right_buf),
+                " %s │ UTF-8 │ %zu lines │ Ln %d, Col %d  ",
+                t->name, total_lines, cy + 1, cx + 1);
 
         int pad = r->width - left_len - right_len;
+        if (pad < 0) pad = 0;
         for (int i = 0; i < pad; i++) stream_append(r, " ", 1);
 
         stream_fg(r, t->statusbar_fg);
@@ -819,29 +812,45 @@ void render_frame(RenderState *r, Buffer *b, UIRegistry *ui,
             int col_used = 0;
             for (int i = 0; i < r->tab_count && i < 32; i++) {
                 bool active = (i == r->active_tab);
-                if (active) {
-                    stream_bg(r, t->statusbar_accent);
-                    stream_fg(r, t->statusbar_bg);
-                    stream_str(r, ESC_BOLD);
-                } else {
-                    stream_bg(r, t->gutter_bg);
-                    stream_fg(r, t->gutter_fg);
-                }
                 const char *name = r->tab_names[i][0] ? r->tab_names[i] : "[scratch]";
-                char tab_label[80];
-                int tl = snprintf(tab_label, sizeof(tab_label), " %s ", name);
-                stream_append(r, tab_label, tl < (int)sizeof(tab_label) ? tl : (int)sizeof(tab_label) - 1);
-                col_used += tl;
 
-                if (active)
+                if (active) {
+                    /* Powerline: transition gutter_bg → bg (active body) */
+                    stream_fg(r, t->bg);
+                    stream_bg(r, t->gutter_bg);
+                    stream_str(r, "\xee\x82\xb0");
+                    col_used++;
+
+                    /* Active tab body: use editor bg for "raised" effect */
+                    stream_bg(r, t->bg);
+                    stream_fg(r, t->statusbar_accent);
+                    stream_str(r, ESC_BOLD);
+                    char tab_label[80];
+                    int tl = snprintf(tab_label, sizeof(tab_label), " %s ", name);
+                    stream_append(r, tab_label, tl < (int)sizeof(tab_label) ? tl : (int)sizeof(tab_label) - 1);
+                    col_used += tl;
                     stream_str(r, ESC_RESET);
 
-                /* Separator */
-                stream_bg(r, t->gutter_bg);
-                stream_fg(r, t->gutter_fg);
-                if (i < r->tab_count - 1) {
-                    stream_str(r, "│");
+                    /* Powerline: transition bg → gutter_bg */
+                    stream_fg(r, t->bg);
+                    stream_bg(r, t->gutter_bg);
+                    stream_str(r, "\xee\x82\xb0");
                     col_used++;
+                } else {
+                    /* Inactive tab: dim text on gutter background */
+                    stream_bg(r, t->gutter_bg);
+                    stream_fg(r, t->gutter_fg);
+                    char tab_label[80];
+                    int tl = snprintf(tab_label, sizeof(tab_label), " %s ", name);
+                    stream_append(r, tab_label, tl < (int)sizeof(tab_label) ? tl : (int)sizeof(tab_label) - 1);
+                    col_used += tl;
+
+                    /* Dim separator between inactive tabs */
+                    if (i < r->tab_count - 1 && i + 1 != r->active_tab) {
+                        stream_fg(r, t->gutter_fg);
+                        stream_str(r, "│");
+                        col_used++;
+                    }
                 }
             }
             /* Fill remainder of tab bar */
@@ -879,22 +888,6 @@ void render_frame(RenderState *r, Buffer *b, UIRegistry *ui,
     /* Track block comment state across lines */
     bool in_block_comment = false;
 
-    /* We need to process highlight state from scroll_row=0 to handle
-       block comments that start above the viewport. For efficiency,
-       just scan from the beginning up to scroll_row. */
-    if (r->scroll_row > 0) {
-        for (int y = 0; y < r->scroll_row && (size_t)y < total_lines; y++) {
-            char *line = buffer_get_line(b, y);
-            if (line) {
-                int llen = (int)strlen(line);
-                HighlightKind *hl = malloc(llen * sizeof(HighlightKind));
-                memset(hl, 0, llen * sizeof(HighlightKind));
-                highlight_line(line, llen, hl, &in_block_comment);
-                free(hl);
-                free(line);
-            }
-        }
-    }
 
     /* ── Build back-buffer (text rows) ───────────────────────*/
     r->cx = cx;
