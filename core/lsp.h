@@ -70,6 +70,21 @@ typedef struct {
     bool valid;
 } LSPDefinitionResult;
 
+/* ── References result ──────────────────────────────────────── */
+
+#define LSP_MAX_REFERENCES 128
+
+typedef struct {
+    char uri[LSP_MAX_URI];
+    int  line, col;
+} LSPReferenceLocation;
+
+typedef struct {
+    LSPReferenceLocation locations[LSP_MAX_REFERENCES];
+    int count;
+    bool valid;
+} LSPReferencesResult;
+
 /* ── Pending response types ─────────────────────────────────── */
 
 typedef enum {
@@ -77,6 +92,7 @@ typedef enum {
     LSP_RESP_COMPLETION,
     LSP_RESP_HOVER,
     LSP_RESP_DEFINITION,
+    LSP_RESP_REFERENCES,
     LSP_RESP_INITIALIZE
 } LSPResponseType;
 
@@ -124,6 +140,9 @@ typedef struct {
 
     LSPDefinitionResult definition;
     bool                definition_ready;
+
+    LSPReferencesResult references;
+    bool                references_ready;
 } LSPClient;
 
 /* ── Public API ─────────────────────────────────────────────── */
@@ -147,6 +166,8 @@ void lsp_request_completion(LSPClient *c, const char *uri,
 void lsp_request_hover(LSPClient *c, const char *uri,
                        int line, int col);
 void lsp_request_definition(LSPClient *c, const char *uri,
+                            int line, int col);
+void lsp_request_references(LSPClient *c, const char *uri,
                             int line, int col);
 
 /* Non-blocking poll: read and parse any available responses.

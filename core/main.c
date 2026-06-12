@@ -20,6 +20,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/inotify.h>
 
 extern Arena *session_arena;
 
@@ -70,6 +71,11 @@ typedef struct {
   int hover_row, hover_col;
 
   int config_poll_counter;
+  int config_inotify_fd;
+  int config_watch_fd;
+  bool lsp_did_open_sent;
+  bool refs_panel_visible;
+  int  refs_selected_idx;
 
   /* LSP time-based debounce: sync buffer after 300ms of idle */
   bool lsp_dirty;                /* buffer changed since last sync? */
@@ -105,9 +111,18 @@ typedef struct {
   bool collab_active;
   int  collab_session_id;
   char collab_peer[64];
+  int  collab_peer_cursor_line;
+  int  collab_peer_cursor_col;
+
+  /* Multi-cursor */
+  int extra_cx[16], extra_cy[16];
+  int extra_cursor_count;
 } EditorState;
 
 static EditorState E;
+
+static Buffer *load_file(const char *path);
+static void open_file_at_path(const char *path);
 
 /* ── Buffer switching ───────────────────────────────────────── */
 
@@ -139,6 +154,7 @@ static void load_buffer(int idx) {
   E.git        = be->git;
   E.filepath   = be->filepath;
   memcpy(E.file_uri, be->file_uri, sizeof(E.file_uri));
+  E.extra_cursor_count = 0;
 }
 
 /* Switch to a different buffer index */
@@ -172,6 +188,85 @@ static int add_buffer(Buffer *buf, const char *path) {
   be->file_uri[0] = '\0';
   E.buffer_count++;
   return idx;
+}
+
+static void open_file_at_path(const char *path) {
+  if (!path || !path[0]) return;
+
+  char abs_target[1024];
+  if (!realpath(path, abs_target)) {
+    strncpy(abs_target, path, sizeof(abs_target) - 1);
+    abs_target[sizeof(abs_target) - 1] = '\0';
+  }
+
+  /* Check if already open */
+  int found_idx = -1;
+  for (int i = 0; i < E.buffer_count; i++) {
+    if (!E.buffers[i].filepath[0]) continue;
+    char abs_existing[1024];
+    if (!realpath(E.buffers[i].filepath, abs_existing)) {
+      strncpy(abs_existing, E.buffers[i].filepath, sizeof(abs_existing) - 1);
+      abs_existing[sizeof(abs_existing) - 1] = '\0';
+    }
+    if (strcmp(abs_existing, abs_target) == 0) {
+      found_idx = i;
+      break;
+    }
+  }
+
+  if (found_idx >= 0) {
+    switch_buffer(found_idx);
+  } else {
+    Buffer *newbuf = load_file(abs_target);
+    int new_idx = add_buffer(newbuf, abs_target);
+    if (new_idx >= 0) {
+      save_active_buffer();
+      load_buffer(new_idx);
+      if (g_plugin_ctx) g_plugin_ctx->buf = E.buf;
+    } else {
+      /* Fallback: replace current buffer */
+      buffer_free(E.buf);
+      E.buf = newbuf;
+      snprintf(E.buffers[E.active_buf].filepath, sizeof(E.buffers[E.active_buf].filepath), "%s", abs_target);
+      E.filepath = E.buffers[E.active_buf].filepath;
+      E.cx = 0;
+      E.cy = 0;
+      undo_free(&E.undo);
+      undo_init(&E.undo);
+    }
+
+    /* Restart LSP for new file */
+    if (E.lsp) {
+      lsp_stop(E.lsp);
+      E.lsp = NULL;
+    }
+    E.lsp_did_open_sent = false;
+    if (E.cfg.lsp_auto_detect) {
+      const char *server = lsp_detect_server(E.filepath);
+      if (server) {
+        E.lsp = lsp_start(server, NULL);
+        if (E.lsp)
+          lsp_path_to_uri(E.filepath, E.file_uri, sizeof(E.file_uri));
+      }
+    }
+  }
+
+  /* Refresh git for new file */
+  if (E.git.repo_open) {
+    git_refresh_diff(&E.git, E.filepath);
+    git_refresh_branch(&E.git);
+  }
+
+  /* Fire on_open hook */
+  if (E.cfg.hook_on_open[0])
+    plugin_run_hook(E.cfg.hook_on_open, E.filepath);
+
+  /* Update plugin context to point to new buffer */
+  if (g_plugin_ctx) g_plugin_ctx->buf = E.buf;
+
+  E.modified = false;
+  render_set_status(&E.render, "%s", E.filepath);
+  E.render.full_redraw = true;
 }
 
 /* ── Resize signal ──────────────────────────────────────────── */
@@ -624,6 +719,7 @@ static void cmd_quit(void *ctx) {
 static void cmd_toggle_line_numbers(void *ctx) {
   (void)ctx;
   E.cfg.show_line_numbers = !E.cfg.show_line_numbers;
+  update_layout();
   E.render.full_redraw = true;
   render_set_status(&E.render, "Line numbers: %s",
                     E.cfg.show_line_numbers ? "on" : "off");
@@ -743,8 +839,12 @@ static void cmd_lsp_restart(void *ctx) {
 
 static void cmd_toggle_blame(void *ctx) {
   (void)ctx;
+  if (!E.git.repo_open) {
+    render_set_status(&E.render, "Git not available (build without libgit2)");
+    return;
+  }
   E.git.blame_visible = !E.git.blame_visible;
-  if (E.git.blame_visible && E.git.repo_open && E.filepath) {
+  if (E.git.blame_visible && E.filepath) {
     git_refresh_blame(&E.git, E.filepath);
   }
   E.render.full_redraw = true;
@@ -753,13 +853,28 @@ static void cmd_toggle_blame(void *ctx) {
 
 static void cmd_toggle_timeline(void *ctx) {
   (void)ctx;
+  if (!E.git.repo_open) {
+    render_set_status(&E.render, "Git not available");
+    return;
+  }
   E.git.timeline_visible = !E.git.timeline_visible;
-  if (E.git.timeline_visible && E.git.repo_open && E.filepath) {
+  if (E.git.timeline_visible && E.filepath) {
     git_refresh_log(&E.git, E.filepath);
   }
+  update_layout();
   E.render.full_redraw = true;
   render_set_status(&E.render, "Timeline: %s",
                     E.git.timeline_visible ? "on" : "off");
+}
+
+static void cmd_find_references(void *ctx) {
+  (void)ctx;
+  if (E.lsp && E.lsp->running && E.lsp->initialized) {
+    lsp_request_references(E.lsp, E.file_uri, E.cy, E.cx);
+    render_set_status(&E.render, "Finding references...");
+  } else {
+    render_set_status(&E.render, "No LSP server running");
+  }
 }
 
 /* ── Guild commands ──────────────────────────────────────────── */
@@ -1132,6 +1247,12 @@ static void handle_net_message(const char *msg) {
         char text[1024] = "";
         json_get_int(op_json, "pos", &pos);
         json_get_string(op_json, "text", text, sizeof(text));
+
+        /* Store peer's last known cursor position */
+        int peer_row = 0, peer_col = 0;
+        offset_to_rowcol((size_t)pos, &peer_row, &peer_col);
+        E.collab_peer_cursor_line = peer_row;
+        E.collab_peer_cursor_col = peer_col;
         /* Check for "is_insert" (simple string check for "true") */
         const char *p = strstr(op_json, "\"is_insert\"");
         bool is_insert = (p && strstr(p, "true"));
@@ -1364,6 +1485,154 @@ static void render_guild_panel(void) {
     (void)write(STDOUT_FILENO, buf, blen);
 }
 
+/* ── Find References panel ───────────────────────────────────── */
+
+static char *get_file_line(const char *path, int line_idx) {
+  /* 1. Check if already open in a buffer */
+  for (int i = 0; i < E.buffer_count; i++) {
+    if (E.buffers[i].filepath[0]) {
+      char abs_existing[1024];
+      if (realpath(E.buffers[i].filepath, abs_existing) && strcmp(abs_existing, path) == 0) {
+        return buffer_get_line(E.buffers[i].buf, line_idx);
+      }
+    }
+  }
+
+  /* 2. Read from disk */
+  FILE *f = fopen(path, "r");
+  if (!f) return NULL;
+
+  char *line = NULL;
+  size_t len = 0;
+  ssize_t read_bytes;
+  int current = 0;
+
+  while ((read_bytes = getline(&line, &len, f)) != -1) {
+    if (current == line_idx) {
+      /* Remove trailing newline characters */
+      while (read_bytes > 0 && (line[read_bytes - 1] == '\n' || line[read_bytes - 1] == '\r')) {
+        line[read_bytes - 1] = '\0';
+        read_bytes--;
+      }
+      fclose(f);
+      return line;
+    }
+    current++;
+  }
+
+  free(line);
+  fclose(f);
+  return NULL;
+}
+
+static void render_references_panel(void) {
+  if (!E.refs_panel_visible || !E.lsp || E.lsp->references.count <= 0) return;
+
+  ForgeTheme *t = E.render.theme;
+  if (!t) return;
+
+  int panel_row = E.render.height - REFS_PANEL_HEIGHT;
+  int width = E.render.width;
+  int total_refs = E.lsp->references.count;
+  int visible_rows = REFS_PANEL_HEIGHT - 1; // 7 rows
+
+  // Scroll logic
+  static int refs_scroll = 0;
+  if (E.refs_selected_idx < refs_scroll) {
+    refs_scroll = E.refs_selected_idx;
+  }
+  if (E.refs_selected_idx >= refs_scroll + visible_rows) {
+    refs_scroll = E.refs_selected_idx - visible_rows + 1;
+  }
+  if (refs_scroll < 0) refs_scroll = 0;
+  if (refs_scroll > total_refs - visible_rows) refs_scroll = total_refs - visible_rows;
+  if (refs_scroll < 0) refs_scroll = 0;
+
+  // Render header
+  char header_buf[256];
+  snprintf(header_buf, sizeof(header_buf), "── References (%d of %d) ──", E.refs_selected_idx + 1, total_refs);
+  int header_len = (int)strlen(header_buf);
+
+  // Buffer writing for fast UI update
+  char buf[8192];
+  int blen = 0;
+#define RPRINTF(...) blen += snprintf(buf + blen, sizeof(buf) - blen, __VA_ARGS__)
+
+  RPRINTF("\x1b[s"); // Save cursor position
+  RPRINTF("\x1b[%d;1H", panel_row);
+  RPRINTF("\x1b[38;2;%u;%u;%um\x1b[48;2;%u;%u;%um\x1b[1m", t->accent.r, t->accent.g, t->accent.b, t->gutter_bg.r, t->gutter_bg.g, t->gutter_bg.b);
+  RPRINTF("%s", header_buf);
+  for (int x = header_len; x < width; x++) {
+    RPRINTF("─");
+  }
+  RPRINTF("\x1b[0m");
+
+  // Render references
+  for (int r = 0; r < visible_rows; r++) {
+    int ref_idx = refs_scroll + r;
+    int screen_row = panel_row + 1 + r;
+    RPRINTF("\x1b[%d;1H", screen_row);
+
+    if (ref_idx < total_refs) {
+      LSPReferenceLocation *loc = &E.lsp->references.locations[ref_idx];
+      bool is_selected = (ref_idx == E.refs_selected_idx);
+
+      const char *path = loc->uri;
+      if (strncmp(path, "file://", 7) == 0) {
+        path += 7;
+      }
+      const char *display_path = path;
+      const char *workspace = "/home/Trushi/ai/Forge";
+      int ws_len = (int)strlen(workspace);
+      if (strncmp(path, workspace, ws_len) == 0) {
+        display_path = path + ws_len;
+        if (display_path[0] == '/') display_path++;
+      } else {
+        const char *base = strrchr(path, '/');
+        if (base) display_path = base + 1;
+      }
+
+      char *line_text = get_file_line(path, loc->line);
+      char row_content[512];
+      if (line_text) {
+        char *trimmed = line_text;
+        while (*trimmed == ' ' || *trimmed == '\t') trimmed++;
+        snprintf(row_content, sizeof(row_content), " %s:%d:%d │ %s", display_path, loc->line + 1, loc->col + 1, trimmed);
+        free(line_text);
+      } else {
+        snprintf(row_content, sizeof(row_content), " %s:%d:%d", display_path, loc->line + 1, loc->col + 1);
+      }
+
+      if (is_selected) {
+        RPRINTF("\x1b[38;2;%u;%u;%um\x1b[48;2;%u;%u;%um\x1b[1m", t->bg.r, t->bg.g, t->bg.b, t->accent.r, t->accent.g, t->accent.b);
+      } else {
+        RPRINTF("\x1b[38;2;%u;%u;%um\x1b[48;2;%u;%u;%um", t->fg.r, t->fg.g, t->fg.b, t->bg.r, t->bg.g, t->bg.b);
+      }
+
+      int print_len = (int)strlen(row_content);
+      if (print_len > width) print_len = width;
+      RPRINTF("%.*s", print_len, row_content);
+      for (int x = print_len; x < width; x++) {
+        RPRINTF(" ");
+      }
+      RPRINTF("\x1b[0m");
+    } else {
+      RPRINTF("\x1b[48;2;%u;%u;%um", t->bg.r, t->bg.g, t->bg.b);
+      for (int x = 0; x < width; x++) {
+        RPRINTF(" ");
+      }
+      RPRINTF("\x1b[0m");
+    }
+  }
+
+  RPRINTF("\x1b[u"); // Restore cursor position
+#undef RPRINTF
+
+  if (blen > 0) {
+    (void)write(STDOUT_FILENO, buf, blen);
+  }
+}
+
 /* ── Hover rendering ────────────────────────────────────────── */
 
 static void render_hover(void) {
@@ -1593,6 +1862,373 @@ static void render_welcome_screen(void) {
     (void)write(STDOUT_FILENO, buf, blen);
 }
 
+typedef struct {
+    int cx, cy;
+    size_t offset;
+    int id; /* 0 for primary, 1..N for extras */
+} TempCursor;
+
+static void multi_cursor_insert(const char *text, int len) {
+    int total = E.extra_cursor_count + 1;
+    TempCursor tcs[17];
+    tcs[0].cx = E.cx;
+    tcs[0].cy = E.cy;
+    tcs[0].offset = buffer_get_offset(E.buf, E.cx, E.cy);
+    tcs[0].id = 0;
+    for (int i = 0; i < E.extra_cursor_count; i++) {
+        tcs[i+1].cx = E.extra_cx[i];
+        tcs[i+1].cy = E.extra_cy[i];
+        tcs[i+1].offset = buffer_get_offset(E.buf, E.extra_cx[i], E.extra_cy[i]);
+        tcs[i+1].id = i + 1;
+    }
+    
+    /* Sort by offset ascending */
+    for (int i = 0; i < total - 1; i++) {
+        for (int j = 0; j < total - i - 1; j++) {
+            if (tcs[j].offset > tcs[j+1].offset) {
+                TempCursor tmp = tcs[j];
+                tcs[j] = tcs[j+1];
+                tcs[j+1] = tmp;
+            }
+        }
+    }
+    
+    /* Keep track of final offsets */
+    size_t final_offsets[17];
+    for (int i = 0; i < total; i++) {
+        final_offsets[i] = tcs[i].offset;
+    }
+    
+    /* Apply edits in reverse order */
+    for (int k = total - 1; k >= 0; k--) {
+        size_t pos = tcs[k].offset;
+        buffer_insert(E.buf, pos, text, len);
+        undo_record(&E.undo, UNDO_INSERT, pos, text, len, tcs[k].cx, tcs[k].cy);
+        send_collab_op((int)pos, true, text, len);
+        
+        final_offsets[k] += len;
+        for (int m = k + 1; m < total; m++) {
+            final_offsets[m] += len;
+        }
+    }
+    
+    /* Update cursor coordinates */
+    for (int i = 0; i < total; i++) {
+        int r_row, r_col;
+        offset_to_rowcol(final_offsets[i], &r_row, &r_col);
+        if (tcs[i].id == 0) {
+            E.cy = r_row;
+            E.cx = r_col;
+        } else {
+            int idx = tcs[i].id - 1;
+            E.extra_cy[idx] = r_row;
+            E.extra_cx[idx] = r_col;
+        }
+    }
+    mark_modified();
+}
+
+static void multi_cursor_backspace(void) {
+    int total = E.extra_cursor_count + 1;
+    TempCursor tcs[17];
+    tcs[0].cx = E.cx;
+    tcs[0].cy = E.cy;
+    tcs[0].offset = buffer_get_offset(E.buf, E.cx, E.cy);
+    tcs[0].id = 0;
+    for (int i = 0; i < E.extra_cursor_count; i++) {
+        tcs[i+1].cx = E.extra_cx[i];
+        tcs[i+1].cy = E.extra_cy[i];
+        tcs[i+1].offset = buffer_get_offset(E.buf, E.extra_cx[i], E.extra_cy[i]);
+        tcs[i+1].id = i + 1;
+    }
+    
+    /* Sort by offset ascending */
+    for (int i = 0; i < total - 1; i++) {
+        for (int j = 0; j < total - i - 1; j++) {
+            if (tcs[j].offset > tcs[j+1].offset) {
+                TempCursor tmp = tcs[j];
+                tcs[j] = tcs[j+1];
+                tcs[j+1] = tmp;
+            }
+        }
+    }
+    
+    /* Keep track of final offsets */
+    size_t final_offsets[17];
+    for (int i = 0; i < total; i++) {
+        final_offsets[i] = tcs[i].offset;
+    }
+    
+    /* Apply edits in reverse order */
+    for (int k = total - 1; k >= 0; k--) {
+        size_t pos = tcs[k].offset;
+        if (pos > 0) {
+            char deleted_char;
+            if (tcs[k].cx > 0) {
+                char *ln = buffer_get_line(E.buf, tcs[k].cy);
+                deleted_char = (ln && tcs[k].cx <= (int)strlen(ln)) ? ln[tcs[k].cx - 1] : '\0';
+                free(ln);
+            } else {
+                deleted_char = '\n';
+            }
+            
+            buffer_delete(E.buf, pos - 1, 1);
+            
+            if (!undo_try_merge(&E.undo, UNDO_DELETE, pos - 1, &deleted_char, 1, tcs[k].cx, tcs[k].cy)) {
+                undo_record(&E.undo, UNDO_DELETE, pos - 1, &deleted_char, 1, tcs[k].cx, tcs[k].cy);
+            }
+            send_collab_op((int)(pos - 1), false, &deleted_char, 1);
+            
+            final_offsets[k] -= 1;
+            for (int m = k + 1; m < total; m++) {
+                final_offsets[m] -= 1;
+            }
+        }
+    }
+    
+    /* Update cursor coordinates */
+    for (int i = 0; i < total; i++) {
+        int r_row, r_col;
+        offset_to_rowcol(final_offsets[i], &r_row, &r_col);
+        if (tcs[i].id == 0) {
+            E.cy = r_row;
+            E.cx = r_col;
+        } else {
+            int idx = tcs[i].id - 1;
+            E.extra_cy[idx] = r_row;
+            E.extra_cx[idx] = r_col;
+        }
+    }
+    mark_modified();
+}
+
+static void multi_cursor_delete(void) {
+    int total = E.extra_cursor_count + 1;
+    TempCursor tcs[17];
+    tcs[0].cx = E.cx;
+    tcs[0].cy = E.cy;
+    tcs[0].offset = buffer_get_offset(E.buf, E.cx, E.cy);
+    tcs[0].id = 0;
+    for (int i = 0; i < E.extra_cursor_count; i++) {
+        tcs[i+1].cx = E.extra_cx[i];
+        tcs[i+1].cy = E.extra_cy[i];
+        tcs[i+1].offset = buffer_get_offset(E.buf, E.extra_cx[i], E.extra_cy[i]);
+        tcs[i+1].id = i + 1;
+    }
+    
+    /* Sort by offset ascending */
+    for (int i = 0; i < total - 1; i++) {
+        for (int j = 0; j < total - i - 1; j++) {
+            if (tcs[j].offset > tcs[j+1].offset) {
+                TempCursor tmp = tcs[j];
+                tcs[j] = tcs[j+1];
+                tcs[j+1] = tmp;
+            }
+        }
+    }
+    
+    /* Keep track of final offsets */
+    size_t final_offsets[17];
+    for (int i = 0; i < total; i++) {
+        final_offsets[i] = tcs[i].offset;
+    }
+    
+    /* Apply edits in reverse order */
+    for (int k = total - 1; k >= 0; k--) {
+        size_t pos = tcs[k].offset;
+        size_t tlen = buffer_total_len(E.buf);
+        if (pos < tlen) {
+            char deleted_char;
+            char *ln = buffer_get_line(E.buf, tcs[k].cy);
+            int ll = ln ? (int)strlen(ln) : 0;
+            deleted_char = (ln && tcs[k].cx < ll) ? ln[tcs[k].cx] : '\n';
+            free(ln);
+            
+            buffer_delete(E.buf, pos, 1);
+            
+            if (!undo_try_merge(&E.undo, UNDO_DELETE, pos, &deleted_char, 1, tcs[k].cx, tcs[k].cy)) {
+                undo_record(&E.undo, UNDO_DELETE, pos, &deleted_char, 1, tcs[k].cx, tcs[k].cy);
+            }
+            send_collab_op((int)pos, false, &deleted_char, 1);
+            
+            for (int m = k + 1; m < total; m++) {
+                final_offsets[m] -= 1;
+            }
+        }
+    }
+    
+    /* Update cursor coordinates */
+    for (int i = 0; i < total; i++) {
+        int r_row, r_col;
+        offset_to_rowcol(final_offsets[i], &r_row, &r_col);
+        if (tcs[i].id == 0) {
+            E.cy = r_row;
+            E.cx = r_col;
+        } else {
+            int idx = tcs[i].id - 1;
+            E.extra_cy[idx] = r_row;
+            E.extra_cx[idx] = r_col;
+        }
+    }
+    mark_modified();
+}
+
+static void multi_cursor_tab(void) {
+    int total = E.extra_cursor_count + 1;
+    TempCursor tcs[17];
+    tcs[0].cx = E.cx;
+    tcs[0].cy = E.cy;
+    tcs[0].offset = buffer_get_offset(E.buf, E.cx, E.cy);
+    tcs[0].id = 0;
+    for (int i = 0; i < E.extra_cursor_count; i++) {
+        tcs[i+1].cx = E.extra_cx[i];
+        tcs[i+1].cy = E.extra_cy[i];
+        tcs[i+1].offset = buffer_get_offset(E.buf, E.extra_cx[i], E.extra_cy[i]);
+        tcs[i+1].id = i + 1;
+    }
+    
+    /* Sort by offset ascending */
+    for (int i = 0; i < total - 1; i++) {
+        for (int j = 0; j < total - i - 1; j++) {
+            if (tcs[j].offset > tcs[j+1].offset) {
+                TempCursor tmp = tcs[j];
+                tcs[j] = tcs[j+1];
+                tcs[j+1] = tmp;
+            }
+        }
+    }
+    
+    /* Keep track of final offsets */
+    size_t final_offsets[17];
+    for (int i = 0; i < total; i++) {
+        final_offsets[i] = tcs[i].offset;
+    }
+    
+    /* Apply edits in reverse order */
+    for (int k = total - 1; k >= 0; k--) {
+        size_t pos = tcs[k].offset;
+        if (E.cfg.use_spaces) {
+            int spaces = E.cfg.tab_width - (tcs[k].cx % E.cfg.tab_width);
+            char tab_buf[16];
+            for (int i = 0; i < spaces && i < 15; i++)
+                tab_buf[i] = ' ';
+            tab_buf[spaces] = '\0';
+            buffer_insert(E.buf, pos, tab_buf, spaces);
+            undo_record(&E.undo, UNDO_INSERT, pos, tab_buf, spaces, tcs[k].cx, tcs[k].cy);
+            send_collab_op((int)pos, true, tab_buf, spaces);
+            
+            final_offsets[k] += spaces;
+            for (int m = k + 1; m < total; m++) {
+                final_offsets[m] += spaces;
+            }
+        } else {
+            buffer_insert(E.buf, pos, "\t", 1);
+            undo_record(&E.undo, UNDO_INSERT, pos, "\t", 1, tcs[k].cx, tcs[k].cy);
+            send_collab_op((int)pos, true, "\t", 1);
+            
+            final_offsets[k] += 1;
+            for (int m = k + 1; m < total; m++) {
+                final_offsets[m] += 1;
+            }
+        }
+    }
+    
+    /* Update cursor coordinates */
+    for (int i = 0; i < total; i++) {
+        int r_row, r_col;
+        offset_to_rowcol(final_offsets[i], &r_row, &r_col);
+        if (tcs[i].id == 0) {
+            E.cy = r_row;
+            E.cx = r_col;
+        } else {
+            int idx = tcs[i].id - 1;
+            E.extra_cy[idx] = r_row;
+            E.extra_cx[idx] = r_col;
+        }
+    }
+    mark_modified();
+}
+
+static void multi_cursor_enter(void) {
+    int total = E.extra_cursor_count + 1;
+    TempCursor tcs[17];
+    tcs[0].cx = E.cx;
+    tcs[0].cy = E.cy;
+    tcs[0].offset = buffer_get_offset(E.buf, E.cx, E.cy);
+    tcs[0].id = 0;
+    for (int i = 0; i < E.extra_cursor_count; i++) {
+        tcs[i+1].cx = E.extra_cx[i];
+        tcs[i+1].cy = E.extra_cy[i];
+        tcs[i+1].offset = buffer_get_offset(E.buf, E.extra_cx[i], E.extra_cy[i]);
+        tcs[i+1].id = i + 1;
+    }
+    
+    /* Sort by offset ascending */
+    for (int i = 0; i < total - 1; i++) {
+        for (int j = 0; j < total - i - 1; j++) {
+            if (tcs[j].offset > tcs[j+1].offset) {
+                TempCursor tmp = tcs[j];
+                tcs[j] = tcs[j+1];
+                tcs[j+1] = tmp;
+            }
+        }
+    }
+    
+    /* Keep track of final offsets */
+    size_t final_offsets[17];
+    for (int i = 0; i < total; i++) {
+        final_offsets[i] = tcs[i].offset;
+    }
+    
+    /* Apply edits in reverse order */
+    for (int k = total - 1; k >= 0; k--) {
+        size_t pos = tcs[k].offset;
+        
+        int indent = 0;
+        char indent_chars[256] = "";
+        char *curr_line = buffer_get_line(E.buf, tcs[k].cy);
+        if (curr_line) {
+            while (curr_line[indent] && (curr_line[indent] == ' ' || curr_line[indent] == '\t')
+                   && indent < (int)sizeof(indent_chars) - 1) {
+                indent_chars[indent] = curr_line[indent];
+                indent++;
+            }
+            free(curr_line);
+        }
+        
+        char insert_buf[256];
+        insert_buf[0] = '\n';
+        int ilen = 1;
+        for (int i = 0; i < indent && ilen < 255; i++)
+            insert_buf[ilen++] = indent_chars[i];
+        insert_buf[ilen] = '\0';
+        
+        buffer_insert(E.buf, pos, insert_buf, ilen);
+        undo_record(&E.undo, UNDO_INSERT, pos, insert_buf, ilen, tcs[k].cx, tcs[k].cy);
+        send_collab_op((int)pos, true, insert_buf, ilen);
+        
+        final_offsets[k] += ilen;
+        for (int m = k + 1; m < total; m++) {
+            final_offsets[m] += ilen;
+        }
+    }
+    
+    /* Update cursor coordinates */
+    for (int i = 0; i < total; i++) {
+        int r_row, r_col;
+        offset_to_rowcol(final_offsets[i], &r_row, &r_col);
+        if (tcs[i].id == 0) {
+            E.cy = r_row;
+            E.cx = r_col;
+        } else {
+            int idx = tcs[i].id - 1;
+            E.extra_cy[idx] = r_row;
+            E.extra_cx[idx] = r_col;
+        }
+    }
+    mark_modified();
+}
+
 /* ---- main ---- */
 int main(int argc, char **argv) {
   E.filepath = (argc >= 2) ? argv[1] : NULL;
@@ -1612,6 +2248,12 @@ int main(int argc, char **argv) {
   /* ── Load config ──────────────────────────────────────── */
   config_default(&E.cfg);
   config_load(&E.cfg, config_default_path());
+  E.config_inotify_fd = inotify_init1(IN_NONBLOCK);
+  if (E.config_inotify_fd != -1) {
+    E.config_watch_fd = inotify_add_watch(E.config_inotify_fd, config_default_path(), IN_MODIFY);
+  } else {
+    E.config_watch_fd = -1;
+  }
   snprintf(E.guild_name, sizeof(E.guild_name), "%s", E.cfg.guild_name);
   snprintf(E.guild_handle, sizeof(E.guild_handle), "%s", E.cfg.guild_handle);
   snprintf(E.guild_last_event, sizeof(E.guild_last_event), "Not connected");
@@ -1720,6 +2362,8 @@ int main(int argc, char **argv) {
                       cmd_guild_share, NULL);
   palette_add_command(&E.palette, "Collab", "Start collab session", "",
                       cmd_guild_collab, NULL);
+  palette_add_command(&E.palette, "Find References", "Find references of symbol under cursor", "",
+                      cmd_find_references, NULL);
 
   /* ── Start LSP ────────────────────────────────────────── */
   E.lsp = NULL;
@@ -1754,13 +2398,14 @@ int main(int argc, char **argv) {
   E.collab_active = false;
   E.collab_session_id = 0;
   E.collab_peer[0] = '\0';
+  E.extra_cursor_count = 0;
   get_time(&E.lsp_last_edit);
 
   /* Apply initial layout from config */
   update_layout();
 
   /* Send didOpen once LSP initializes — checked in poll loop */
-  bool lsp_did_open_sent = false;
+  E.lsp_did_open_sent = false;
 
   while (E.running) {
 
@@ -1775,13 +2420,30 @@ int main(int argc, char **argv) {
       }
     }
 
-    /* Periodic config hot-reload */
-    if (++E.config_poll_counter >= 200) {
-      E.config_poll_counter = 0;
-      if (config_poll_reload(&E.cfg)) {
-        theme_load(&E.theme, E.cfg.theme_name);
-        render_set_theme(&E.render, &E.theme);
-        render_set_status(&E.render, "config reloaded");
+    /* Config hot-reload using inotify or fallback timer */
+    if (E.config_inotify_fd != -1) {
+      char ibuf[4096] __attribute__ ((aligned(__alignof__(struct inotify_event))));
+      ssize_t ilen = read(E.config_inotify_fd, ibuf, sizeof(ibuf));
+      if (ilen > 0) {
+        if (config_poll_reload(&E.cfg)) {
+          theme_load(&E.theme, E.cfg.theme_name);
+          render_set_theme(&E.render, &E.theme);
+          render_set_status(&E.render, "config reloaded");
+          /* Re-add watch in case inode changed */
+          if (E.config_watch_fd != -1) {
+            inotify_rm_watch(E.config_inotify_fd, E.config_watch_fd);
+          }
+          E.config_watch_fd = inotify_add_watch(E.config_inotify_fd, config_default_path(), IN_MODIFY);
+        }
+      }
+    } else {
+      if (++E.config_poll_counter >= 200) {
+        E.config_poll_counter = 0;
+        if (config_poll_reload(&E.cfg)) {
+          theme_load(&E.theme, E.cfg.theme_name);
+          render_set_theme(&E.render, &E.theme);
+          render_set_status(&E.render, "config reloaded");
+        }
       }
     }
 
@@ -1793,11 +2455,11 @@ int main(int argc, char **argv) {
       lsp_poll(E.lsp);
 
       /* Send didOpen after initialization */
-      if (E.lsp->initialized && !lsp_did_open_sent && E.filepath) {
+      if (E.lsp->initialized && !E.lsp_did_open_sent && E.filepath) {
         char *text = buffer_get_text(E.buf);
         lsp_send_did_open(E.lsp, E.file_uri, lsp_language_id(E.filepath), text);
         free(text);
-        lsp_did_open_sent = true;
+        E.lsp_did_open_sent = true;
         render_set_status(&E.render, "%s  [%s]", E.filepath,
                           E.lsp->server_name);
       }
@@ -1827,7 +2489,13 @@ int main(int argc, char **argv) {
       /* Process definition results */
       if (E.lsp->definition_ready) {
         if (E.lsp->definition.valid) {
-          /* For now, handle same-file jumps only */
+          const char *target_path = E.lsp->definition.uri;
+          if (strncmp(target_path, "file://", 7) == 0) {
+            target_path += 7;
+          }
+          if (!E.filepath || strcmp(target_path, E.filepath) != 0) {
+            open_file_at_path(target_path);
+          }
           E.cy = E.lsp->definition.line;
           E.cx = E.lsp->definition.col;
           clamp_cx(&E.cx, E.cy);
@@ -1835,6 +2503,20 @@ int main(int argc, char **argv) {
           E.render.full_redraw = true;
         }
         E.lsp->definition_ready = false;
+      }
+
+      /* Process references results */
+      if (E.lsp->references_ready) {
+        if (E.lsp->references.valid) {
+          E.refs_panel_visible = true;
+          E.render.refs_panel_visible = true;
+          E.refs_selected_idx = 0;
+          render_set_status(&E.render, "Found %d references", E.lsp->references.count);
+        } else {
+          render_set_status(&E.render, "No references found");
+        }
+        E.lsp->references_ready = false;
+        E.render.full_redraw = true;
       }
 
       /* Process diagnostics */
@@ -1855,6 +2537,14 @@ int main(int argc, char **argv) {
       } else {
         snprintf(E.render.tab_names[t], 64, "[scratch]");
       }
+    }
+    E.render.collab_active = E.collab_active;
+    E.render.collab_peer_cursor_line = E.collab_peer_cursor_line;
+    E.render.collab_peer_cursor_col = E.collab_peer_cursor_col;
+    E.render.extra_cursor_count = E.extra_cursor_count;
+    for (int i = 0; i < E.extra_cursor_count; i++) {
+      E.render.extra_cx[i] = E.extra_cx[i];
+      E.render.extra_cy[i] = E.extra_cy[i];
     }
     render_frame(&E.render, E.buf, &E.ui, E.cx, E.cy);
 
@@ -1881,6 +2571,10 @@ int main(int argc, char **argv) {
 
     /* Welcome screen (no-file splash) */
     render_welcome_screen();
+
+    if (E.refs_panel_visible) {
+      render_references_panel();
+    }
 
     /* IPC polling and auto-reconnect (always active) */
     if (E.ipc.connected) {
@@ -1951,57 +2645,8 @@ int main(int argc, char **argv) {
         }
 
         if (E.palette.result_path[0]) {
-          /* Open new file */
-          Buffer *newbuf = load_file(E.palette.result_path);
-
-          /* Add as new buffer instead of replacing */
-          int new_idx = add_buffer(newbuf, E.palette.result_path);
-          if (new_idx >= 0) {
-            save_active_buffer();
-            load_buffer(new_idx);
-          } else {
-            /* Fallback: replace current buffer */
-            buffer_free(E.buf);
-            E.buf = newbuf;
-            E.filepath = E.palette.result_path;
-            E.cx = 0;
-            E.cy = 0;
-            undo_free(&E.undo);
-            undo_init(&E.undo);
-          }
-
-          /* Restart LSP for new file */
-          if (E.lsp) {
-            lsp_stop(E.lsp);
-            E.lsp = NULL;
-          }
-          lsp_did_open_sent = false;
-          if (E.cfg.lsp_auto_detect) {
-            const char *server = lsp_detect_server(E.filepath);
-            if (server) {
-              E.lsp = lsp_start(server, NULL);
-              if (E.lsp)
-                lsp_path_to_uri(E.filepath, E.file_uri, sizeof(E.file_uri));
-            }
-          }
-
-          /* Refresh git for new file */
-          if (E.git.repo_open) {
-            git_refresh_diff(&E.git, E.filepath);
-            git_refresh_branch(&E.git);
-          }
-
-          /* Fire on_open hook */
-          if (E.cfg.hook_on_open[0])
-            plugin_run_hook(E.cfg.hook_on_open, E.filepath);
-
-          /* Update plugin context to point to new buffer */
-          plugin_ctx.buf = E.buf;
-
-          E.modified = false;
-          render_set_status(&E.render, "%s", E.filepath);
+          open_file_at_path(E.palette.result_path);
           E.palette.result_path[0] = '\0';
-          E.render.full_redraw = true;
         }
       }
       E.render.full_redraw = true;
@@ -2062,6 +2707,49 @@ int main(int argc, char **argv) {
         continue;
       }
       /* Other keys: fall through to normal handling, but update filter */
+    }
+
+    /* ── References panel keys ───────────────────────── */
+    if (E.refs_panel_visible) {
+      if (key == KEY_ARROW_UP) {
+        if (E.refs_selected_idx > 0) {
+          E.refs_selected_idx--;
+        }
+        E.render.full_redraw = true;
+        continue;
+      }
+      if (key == KEY_ARROW_DOWN) {
+        if (E.refs_selected_idx < E.lsp->references.count - 1) {
+          E.refs_selected_idx++;
+        }
+        E.render.full_redraw = true;
+        continue;
+      }
+      if (key == KEY_ESC) {
+        E.refs_panel_visible = false;
+        E.render.refs_panel_visible = false;
+        E.render.full_redraw = true;
+        continue;
+      }
+      if (key == '\r' || key == '\n') {
+        int idx = E.refs_selected_idx;
+        if (idx >= 0 && idx < E.lsp->references.count) {
+          LSPReferenceLocation *loc = &E.lsp->references.locations[idx];
+          const char *target_path = loc->uri;
+          if (strncmp(target_path, "file://", 7) == 0) {
+            target_path += 7;
+          }
+          if (!E.filepath || strcmp(target_path, E.filepath) != 0) {
+            open_file_at_path(target_path);
+          }
+          E.cy = loc->line;
+          E.cx = loc->col;
+          clamp_cx(&E.cx, E.cy);
+          render_set_status(&E.render, "Jumped to reference %d: Ln %d, Col %d", idx + 1, E.cy + 1, E.cx + 1);
+        }
+        E.render.full_redraw = true;
+        continue;
+      }
     }
 
     /* ── Ctrl+P: Command Palette ─────────────────────── */
@@ -2385,6 +3073,39 @@ int main(int argc, char **argv) {
       continue;
     }
 
+    if (key == KEY_ALT_MOUSE_LEFT) {
+      int tab_offset = (E.buffer_count > 1) ? 1 : 0;
+      int buf_row = E.render.scroll_row + (g_mouse_y - tab_offset);
+      int buf_col = E.render.scroll_col + (g_mouse_x - GUTTER_WIDTH);
+      size_t lc = buffer_line_count(E.buf);
+      if (lc > 0) {
+        if ((size_t)buf_row >= lc)
+          buf_row = (int)lc - 1;
+        if (buf_row < 0)
+          buf_row = 0;
+        if (buf_col < 0)
+          buf_col = 0;
+        int target_cx = buf_col;
+        int target_cy = buf_row;
+        clamp_cx(&target_cx, target_cy);
+
+        int exists = (target_cx == E.cx && target_cy == E.cy);
+        for (int i = 0; i < E.extra_cursor_count; i++) {
+          if (E.extra_cx[i] == target_cx && E.extra_cy[i] == target_cy) {
+            exists = 1;
+            break;
+          }
+        }
+        if (!exists && E.extra_cursor_count < 16) {
+          E.extra_cx[E.extra_cursor_count] = target_cx;
+          E.extra_cy[E.extra_cursor_count] = target_cy;
+          E.extra_cursor_count++;
+          E.render.full_redraw = true;
+        }
+      }
+      continue;
+    }
+
     if (key == KEY_MOUSE_SCROLL_UP) {
       if (E.cy > 0) {
         int move = 3;
@@ -2405,6 +3126,41 @@ int main(int argc, char **argv) {
           E.cy = (int)lc - 1;
         clamp_cx(&E.cx, E.cy);
         E.render.full_redraw = true;
+      }
+      continue;
+    }
+
+    if (key == KEY_ESC) {
+      if (E.extra_cursor_count > 0) {
+        E.extra_cursor_count = 0;
+        E.render.full_redraw = true;
+        continue;
+      }
+    }
+
+    if (key == KEY_CTRL_ALT_UP || key == KEY_CTRL_ALT_DOWN) {
+      if (E.extra_cursor_count < 16) {
+        int last_cy = (E.extra_cursor_count > 0) ? E.extra_cy[E.extra_cursor_count - 1] : E.cy;
+        int last_cx = (E.extra_cursor_count > 0) ? E.extra_cx[E.extra_cursor_count - 1] : E.cx;
+        int new_cy = (key == KEY_CTRL_ALT_UP) ? last_cy - 1 : last_cy + 1;
+        int new_cx = last_cx;
+        size_t lc = buffer_line_count(E.buf);
+        if (new_cy >= 0 && (size_t)new_cy < lc) {
+          clamp_cx(&new_cx, new_cy);
+          int exists = (new_cx == E.cx && new_cy == E.cy);
+          for (int i = 0; i < E.extra_cursor_count; i++) {
+            if (E.extra_cx[i] == new_cx && E.extra_cy[i] == new_cy) {
+              exists = 1;
+              break;
+            }
+          }
+          if (!exists) {
+            E.extra_cx[E.extra_cursor_count] = new_cx;
+            E.extra_cy[E.extra_cursor_count] = new_cy;
+            E.extra_cursor_count++;
+            E.render.full_redraw = true;
+          }
+        }
       }
       continue;
     }
@@ -2623,70 +3379,78 @@ int main(int argc, char **argv) {
 
       /* ── Enter ────────────────────────────────────────── */
     } else if (key == '\r' || key == '\n') {
-      size_t pos = buffer_get_offset(E.buf, E.cx, E.cy);
+      if (E.extra_cursor_count > 0) {
+        multi_cursor_enter();
+      } else {
+        size_t pos = buffer_get_offset(E.buf, E.cx, E.cy);
 
-      /* Auto-indent: copy leading whitespace from current line,
-         preserving the original whitespace characters (spaces vs tabs) */
-      char *curr_line = buffer_get_line(E.buf, E.cy);
-      int indent = 0;
-      char indent_chars[256];
-      if (curr_line) {
-        while ((curr_line[indent] == ' ' || curr_line[indent] == '\t')
-               && indent < (int)sizeof(indent_chars) - 1) {
-          indent_chars[indent] = curr_line[indent];
-          indent++;
+        /* Auto-indent: copy leading whitespace from current line,
+           preserving the original whitespace characters (spaces vs tabs) */
+        char *curr_line = buffer_get_line(E.buf, E.cy);
+        int indent = 0;
+        char indent_chars[256];
+        if (curr_line) {
+          while ((curr_line[indent] == ' ' || curr_line[indent] == '\t')
+                 && indent < (int)sizeof(indent_chars) - 1) {
+            indent_chars[indent] = curr_line[indent];
+            indent++;
+          }
+          free(curr_line);
         }
-        free(curr_line);
+
+        /* Insert newline + indent */
+        char insert_buf[256];
+        insert_buf[0] = '\n';
+        int ilen = 1;
+        for (int i = 0; i < indent && ilen < 255; i++)
+          insert_buf[ilen++] = indent_chars[i];
+        insert_buf[ilen] = '\0';
+
+        buffer_insert(E.buf, pos, insert_buf, ilen);
+        undo_record(&E.undo, UNDO_INSERT, pos, insert_buf, ilen, E.cx, E.cy);
+        E.cy++;
+        E.cx = indent;
+        mark_modified();
+        send_collab_op((int)pos, true, insert_buf, ilen);
       }
-
-      /* Insert newline + indent */
-      char insert_buf[256];
-      insert_buf[0] = '\n';
-      int ilen = 1;
-      for (int i = 0; i < indent && ilen < 255; i++)
-        insert_buf[ilen++] = indent_chars[i];
-      insert_buf[ilen] = '\0';
-
-      buffer_insert(E.buf, pos, insert_buf, ilen);
-      undo_record(&E.undo, UNDO_INSERT, pos, insert_buf, ilen, E.cx, E.cy);
-      E.cy++;
-      E.cx = indent;
-      mark_modified();
-      send_collab_op((int)pos, true, insert_buf, ilen);
 
       /* ── Backspace ────────────────────────────────────── */
     } else if (key == KEY_BACKSPACE) {
-      size_t pos = buffer_get_offset(E.buf, E.cx, E.cy);
-      if (pos > 0) {
-        /* Get deleted char cheaply — single line alloc, not full text */
-        char deleted_char;
-        if (E.cx > 0) {
-          char *ln = buffer_get_line(E.buf, E.cy);
-          deleted_char = (ln && E.cx <= (int)strlen(ln)) ? ln[E.cx - 1] : '\0';
-          free(ln);
-        } else {
-          deleted_char = '\n'; /* joining lines */
+      if (E.extra_cursor_count > 0) {
+        multi_cursor_backspace();
+      } else {
+        size_t pos = buffer_get_offset(E.buf, E.cx, E.cy);
+        if (pos > 0) {
+          /* Get deleted char cheaply — single line alloc, not full text */
+          char deleted_char;
+          if (E.cx > 0) {
+            char *ln = buffer_get_line(E.buf, E.cy);
+            deleted_char = (ln && E.cx <= (int)strlen(ln)) ? ln[E.cx - 1] : '\0';
+            free(ln);
+          } else {
+            deleted_char = '\n'; /* joining lines */
+          }
+
+          int old_cx = E.cx, old_cy = E.cy;
+          buffer_delete(E.buf, pos - 1, 1);
+
+          if (E.cx > 0) {
+            E.cx--;
+          } else if (E.cy > 0) {
+            E.cy--;
+            E.cx = line_len(E.buf, E.cy);
+          }
+
+          /* Record for undo (try merging consecutive backspaces) */
+          if (!undo_try_merge(&E.undo, UNDO_DELETE, pos - 1, &deleted_char, 1,
+                              old_cx, old_cy)) {
+            undo_record(&E.undo, UNDO_DELETE, pos - 1, &deleted_char, 1, old_cx,
+                        old_cy);
+          }
+
+          mark_modified();
+          send_collab_op((int)(pos - 1), false, &deleted_char, 1);
         }
-
-        int old_cx = E.cx, old_cy = E.cy;
-        buffer_delete(E.buf, pos - 1, 1);
-
-        if (E.cx > 0) {
-          E.cx--;
-        } else if (E.cy > 0) {
-          E.cy--;
-          E.cx = line_len(E.buf, E.cy);
-        }
-
-        /* Record for undo (try merging consecutive backspaces) */
-        if (!undo_try_merge(&E.undo, UNDO_DELETE, pos - 1, &deleted_char, 1,
-                            old_cx, old_cy)) {
-          undo_record(&E.undo, UNDO_DELETE, pos - 1, &deleted_char, 1, old_cx,
-                      old_cy);
-        }
-
-        mark_modified();
-        send_collab_op((int)(pos - 1), false, &deleted_char, 1);
       }
 
       /* Update completion filter if visible */
@@ -2694,26 +3458,30 @@ int main(int argc, char **argv) {
 
       /* ── Delete (forward) ─────────────────────────────── */
     } else if (key == KEY_DELETE) {
-      size_t pos = buffer_get_offset(E.buf, E.cx, E.cy);
-      size_t tlen = buffer_total_len(E.buf); /* No alloc! */
-      if (pos < tlen) {
-        /* Get deleted char cheaply — single line alloc */
-        char deleted_char;
-        char *ln = buffer_get_line(E.buf, E.cy);
-        int ll = ln ? (int)strlen(ln) : 0;
-        deleted_char = (ln && E.cx < ll) ? ln[E.cx] : '\n';
-        free(ln);
+      if (E.extra_cursor_count > 0) {
+        multi_cursor_delete();
+      } else {
+        size_t pos = buffer_get_offset(E.buf, E.cx, E.cy);
+        size_t tlen = buffer_total_len(E.buf); /* No alloc! */
+        if (pos < tlen) {
+          /* Get deleted char cheaply — single line alloc */
+          char deleted_char;
+          char *ln = buffer_get_line(E.buf, E.cy);
+          int ll = ln ? (int)strlen(ln) : 0;
+          deleted_char = (ln && E.cx < ll) ? ln[E.cx] : '\n';
+          free(ln);
 
-        buffer_delete(E.buf, pos, 1);
+          buffer_delete(E.buf, pos, 1);
 
-        /* Record for undo */
-        if (!undo_try_merge(&E.undo, UNDO_DELETE, pos, &deleted_char, 1, E.cx,
-                            E.cy)) {
-          undo_record(&E.undo, UNDO_DELETE, pos, &deleted_char, 1, E.cx, E.cy);
+          /* Record for undo */
+          if (!undo_try_merge(&E.undo, UNDO_DELETE, pos, &deleted_char, 1, E.cx,
+                              E.cy)) {
+            undo_record(&E.undo, UNDO_DELETE, pos, &deleted_char, 1, E.cx, E.cy);
+          }
+
+          mark_modified();
+          send_collab_op((int)pos, false, &deleted_char, 1);
         }
-
-        mark_modified();
-        send_collab_op((int)pos, false, &deleted_char, 1);
       }
 
       /* Update completion filter on forward delete too */
@@ -2743,53 +3511,62 @@ int main(int argc, char **argv) {
         completion_hide(&E.completion);
         E.render.full_redraw = true;
       } else {
-        int spaces = E.cfg.tab_width - (E.cx % E.cfg.tab_width);
-        size_t pos = buffer_get_offset(E.buf, E.cx, E.cy);
-        if (E.cfg.use_spaces) {
-          char tab_buf[16];
-          for (int i = 0; i < spaces && i < 15; i++)
-            tab_buf[i] = ' ';
-          tab_buf[spaces] = '\0';
-          buffer_insert(E.buf, pos, tab_buf, spaces);
-          undo_record(&E.undo, UNDO_INSERT, pos, tab_buf, spaces, E.cx, E.cy);
-          E.cx += spaces;
+        if (E.extra_cursor_count > 0) {
+          multi_cursor_tab();
         } else {
-          buffer_insert(E.buf, pos, "\t", 1);
-          undo_record(&E.undo, UNDO_INSERT, pos, "\t", 1, E.cx, E.cy);
-          E.cx++;
+          int spaces = E.cfg.tab_width - (E.cx % E.cfg.tab_width);
+          size_t pos = buffer_get_offset(E.buf, E.cx, E.cy);
+          if (E.cfg.use_spaces) {
+            char tab_buf[16];
+            for (int i = 0; i < spaces && i < 15; i++)
+              tab_buf[i] = ' ';
+            tab_buf[spaces] = '\0';
+            buffer_insert(E.buf, pos, tab_buf, spaces);
+            undo_record(&E.undo, UNDO_INSERT, pos, tab_buf, spaces, E.cx, E.cy);
+            E.cx += spaces;
+          } else {
+            buffer_insert(E.buf, pos, "\t", 1);
+            undo_record(&E.undo, UNDO_INSERT, pos, "\t", 1, E.cx, E.cy);
+            E.cx++;
+          }
+          mark_modified();
+          send_collab_op((int)pos, true, E.cfg.use_spaces ? "    " : "\t",
+                         E.cfg.use_spaces ? spaces : 1);
         }
-        mark_modified();
-        send_collab_op((int)pos, true, E.cfg.use_spaces ? "    " : "\t",
-                       E.cfg.use_spaces ? spaces : 1);
       }
 
       /* ── Printable characters ─────────────────────────── */
     } else if (key >= 32 && key <= 126) {
-      char c = (char)key;
-      size_t pos = buffer_get_offset(E.buf, E.cx, E.cy);
-      buffer_insert(E.buf, pos, &c, 1);
+      if (E.extra_cursor_count > 0) {
+        char c = (char)key;
+        multi_cursor_insert(&c, 1);
+      } else {
+        char c = (char)key;
+        size_t pos = buffer_get_offset(E.buf, E.cx, E.cy);
+        buffer_insert(E.buf, pos, &c, 1);
 
-      /* Try merging with previous undo entry for word-level undo */
-      if (!undo_try_merge(&E.undo, UNDO_INSERT, pos, &c, 1, E.cx, E.cy)) {
-        undo_record(&E.undo, UNDO_INSERT, pos, &c, 1, E.cx, E.cy);
-      }
+        /* Try merging with previous undo entry for word-level undo */
+        if (!undo_try_merge(&E.undo, UNDO_INSERT, pos, &c, 1, E.cx, E.cy)) {
+          undo_record(&E.undo, UNDO_INSERT, pos, &c, 1, E.cx, E.cy);
+        }
 
-      E.cx++;
-      mark_modified();
-      send_collab_op((int)pos, true, &c, 1);
+        E.cx++;
+        mark_modified();
+        send_collab_op((int)pos, true, &c, 1);
 
-      /* Auto-trigger completion on identifier chars and trigger chars */
-      maybe_request_completion(key);
+        /* Auto-trigger completion on identifier chars and trigger chars */
+        maybe_request_completion(key);
 
-      /* Fire keypress to plugins (e.g., autopairs auto-closes brackets) */
-      plugin_on_keypress(&E.plugins, key, E.buf);
+        /* Fire keypress to plugins (e.g., autopairs auto-closes brackets) */
+        plugin_on_keypress(&E.plugins, key, E.buf);
 
-      /* Update completion filter if visible */
-      if (E.completion.visible) {
-        char word[128];
-        get_word_at_cursor(word, sizeof(word));
-        completion_update_filter(&E.completion, word);
-        E.render.full_redraw = true;
+        /* Update completion filter if visible */
+        if (E.completion.visible) {
+          char word[128];
+          get_word_at_cursor(word, sizeof(word));
+          completion_update_filter(&E.completion, word);
+          E.render.full_redraw = true;
+        }
       }
     }
   }
@@ -2826,6 +3603,12 @@ int main(int argc, char **argv) {
   plugin_host_free(&E.plugins);
   fs_vm_free(&E.scripts);
   ipc_free(&E.ipc);
+  if (E.config_inotify_fd != -1) {
+    if (E.config_watch_fd != -1) {
+      inotify_rm_watch(E.config_inotify_fd, E.config_watch_fd);
+    }
+    close(E.config_inotify_fd);
+  }
   arena_free(session_arena);
 
   if (E.modified && E.filepath)

@@ -13,24 +13,26 @@ typedef enum {
 
 /* ── Single undo entry ──────────────────────────────────────── */
 
+typedef struct UndoEntry UndoEntry;
+
+struct UndoEntry {
+    UndoType          type;
+    size_t            pos;       /* byte position in document */
+    char             *text;      /* the text that was inserted or deleted */
+    size_t            len;       /* length of text */
+    int               cx, cy;    /* cursor position before the operation */
+    struct UndoEntry *children[8];
+    int               child_count;
+    struct UndoEntry *parent;
+    struct UndoEntry *most_recent_child; /* internal helper to track redo path */
+};
+
+/* ── Undo stack (represented as undo tree) ──────────────────── */
+
 typedef struct {
-    UndoType  type;
-    size_t    pos;       /* byte position in document */
-    char     *text;      /* the text that was inserted or deleted */
-    size_t    len;       /* length of text */
-    int       cx, cy;    /* cursor position before the operation */
-} UndoEntry;
-
-/* ── Undo stack (linear history with redo) ──────────────────── */
-
-#define UNDO_MAX_ENTRIES 8192
-
-typedef struct {
-    UndoEntry entries[UNDO_MAX_ENTRIES];
-    int       count;     /* total entries (including redo-able ones) */
-    int       current;   /* index of next entry to undo (0 = nothing to undo) */
-                         /* entries[0..current-1] = undo-able */
-                         /* entries[current..count-1] = redo-able */
+    UndoEntry *root;
+    UndoEntry *current;
+    UndoEntry *last_branch;
 } UndoStack;
 
 /* ── Public API ─────────────────────────────────────────────── */
@@ -63,5 +65,8 @@ UndoEntry *undo_redo(UndoStack *u);
 /* Check if undo/redo is available */
 bool undo_can_undo(UndoStack *u);
 bool undo_can_redo(UndoStack *u);
+
+/* Get the root of the last discarded branch */
+UndoEntry* undo_get_last_branch(UndoStack *u);
 
 #endif

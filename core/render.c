@@ -88,6 +88,15 @@ void render_init(RenderState *r, int width, int height) {
     r->theme         = NULL;
     r->git           = NULL;
     r->diag_count    = 0;
+    r->ui            = NULL;
+    r->widget_count  = 0;
+    memset(r->widgets, 0, sizeof(r->widgets));
+    r->collab_active = false;
+    r->collab_peer_cursor_line = 0;
+    r->collab_peer_cursor_col  = 0;
+    r->extra_cursor_count = 0;
+    memset(r->extra_cx, 0, sizeof(r->extra_cx));
+    memset(r->extra_cy, 0, sizeof(r->extra_cy));
     alloc_cell_bufs(r);
 }
 
@@ -732,6 +741,26 @@ static void blame_render(RenderState *r, int cy) {
     }
 }
 
+void render_register_widget(RenderState *r, struct ForgeWidget *w) {
+    if (!r || !w) return;
+    for (int i = 0; i < r->widget_count; i++) {
+        if (r->widgets[i] == w) return;
+    }
+    if (r->widget_count < 32) {
+        r->widgets[r->widget_count++] = w;
+    }
+}
+
+void render_mark_dirty(RenderState *r, int start_row, int num_rows) {
+    if (!r) return;
+    for (int i = 0; i < num_rows; i++) {
+        int y = start_row + i;
+        if (y >= 0 && y < r->height) {
+            memset(r->front_buffer[y], 0, r->width + 1);
+        }
+    }
+}
+
 void ui_register_builtins(UIRegistry *ui) {
     memset(&gutter_widget, 0, sizeof(gutter_widget));
     strncpy(gutter_widget.name, "gutter", sizeof(gutter_widget.name) - 1);
@@ -772,10 +801,39 @@ void ui_register_builtins(UIRegistry *ui) {
 
 void render_frame(RenderState *r, Buffer *b, UIRegistry *ui,
                   int cx, int cy) {
+    r->ui = ui;
+
+    /* If blame is visible and terminal is narrow, show blame info as status message */
+    if (r->git && r->git->blame_visible && r->git->blame_count > 0 && r->theme &&
+        r->width - BLAME_COL_WIDTH < GUTTER_WIDTH + 20) {
+        if (cy >= 0 && cy < r->git->blame_count) {
+            GitBlameLine *bl = &r->git->blame[cy];
+            char timestr[16];
+            time_t now = time(NULL);
+            long diff_secs = (long)(now - bl->date);
+            if (diff_secs < 60)
+                snprintf(timestr, sizeof(timestr), "%lds", diff_secs);
+            else if (diff_secs < 3600)
+                snprintf(timestr, sizeof(timestr), "%ldm", diff_secs / 60);
+            else if (diff_secs < 86400)
+                snprintf(timestr, sizeof(timestr), "%ldh", diff_secs / 3600);
+            else if (diff_secs < 2592000)
+                snprintf(timestr, sizeof(timestr), "%ldd", diff_secs / 86400);
+            else
+                snprintf(timestr, sizeof(timestr), "%ldmo", diff_secs / 2592000);
+
+            render_set_status(r, "Blame: %.10s • %s ago • %.7s • %.50s",
+                              bl->author, timestr, bl->sha, bl->summary);
+        }
+    }
+
     int text_rows = r->height - 1;
     /* Reduce text area when timeline is visible */
     if (r->git && r->git->timeline_visible && r->git->commit_count > 0)
         text_rows -= TIMELINE_HEIGHT;
+    /* Reduce text area when references panel is visible */
+    if (r->refs_panel_visible)
+        text_rows -= REFS_PANEL_HEIGHT;
     adjust_scroll(r, ui, cx, cy, text_rows);
 
     r->out_len = 0;
@@ -879,6 +937,7 @@ void render_frame(RenderState *r, Buffer *b, UIRegistry *ui,
             stream_str(r, ESC_RESET);
         }
     }
+    stream_str(r, ESC_RESET);
 
     /* Offset row indices when tab bar is present */
     int row_offset = show_tabs ? 1 : 0;
@@ -924,6 +983,7 @@ void render_frame(RenderState *r, Buffer *b, UIRegistry *ui,
             && !r->theme)
             continue;
         stream_printf(r, "\x1b[%d;1H", y + 1 + row_offset);
+        stream_str(r, ESC_RESET);
 
         int logical = r->scroll_row + y;
         int is_cursor_row = (logical == cy);
@@ -944,7 +1004,9 @@ void render_frame(RenderState *r, Buffer *b, UIRegistry *ui,
                 stream_fg(r, t->gutter_fg);
 
             if ((size_t)logical < total_lines) {
-                stream_append(r, row, gutter_w);
+                stream_append(r, row, gutter_w - 1);
+                stream_fg(r, t->gutter_fg);
+                stream_append(r, row + gutter_w - 1, 1);
             } else {
                 /* Past EOF: dim tilde */
                 stream_fg(r, t->gutter_fg);
@@ -1063,13 +1125,106 @@ void render_frame(RenderState *r, Buffer *b, UIRegistry *ui,
     /* ── Render blame overlay ─────────────────────────────────*/
     blame_render(r, cy);
 
+    /* Flush main stream before drawing direct-to-stdout elements */
+    if (r->out_len > 0) {
+        (void)write(STDOUT_FILENO, r->output_stream, r->out_len);
+        r->out_len = 0;
+    }
+
+    /* ── Render widgets ───────────────────────────────────────*/
+    for (int i = 0; i < r->widget_count; i++) {
+        struct ForgeWidget *w = r->widgets[i];
+        if (w && w->dirty) {
+            if (w->render_cb) {
+                w->render_cb(w, (struct ForgeBuffer *)b);
+            }
+            w->dirty = false;
+        }
+    }
+
+    /* ── Render peer cursor ───────────────────────────────────*/
+    if (r->collab_active) {
+        int peer_y = r->collab_peer_cursor_line - r->scroll_row;
+        if (peer_y >= 0 && peer_y < text_rows) {
+            int gutter_w = ui->slots[SLOT_GUTTER].visible ? ui->slots[SLOT_GUTTER].width : GUTTER_WIDTH;
+            int text_cols = r->width - gutter_w - 1;
+            int peer_x = r->collab_peer_cursor_col - r->scroll_col;
+            if (peer_x >= 0 && peer_x <= text_cols) {
+                int p_screen_row = peer_y + 1 + row_offset;
+                int p_screen_col = peer_x + gutter_w + 1 + 1;
+                
+                char ch = ' ';
+                char *line = buffer_get_line(b, r->collab_peer_cursor_line);
+                if (line) {
+                    if (r->collab_peer_cursor_col >= 0 && r->collab_peer_cursor_col < (int)strlen(line)) {
+                        ch = line[r->collab_peer_cursor_col];
+                    }
+                    free(line);
+                }
+                
+                char cbuf[256];
+                int clen;
+                if (r->theme) {
+                    clen = snprintf(cbuf, sizeof(cbuf), "\x1b[%d;%dH\x1b[48;2;%u;%u;%um\x1b[38;2;%u;%u;%um%c\x1b[0m",
+                                    p_screen_row, p_screen_col,
+                                    r->theme->accent.r, r->theme->accent.g, r->theme->accent.b,
+                                    r->theme->bg.r, r->theme->bg.g, r->theme->bg.b, ch);
+                } else {
+                    clen = snprintf(cbuf, sizeof(cbuf), "\x1b[%d;%dH\x1b[43m%c\x1b[0m",
+                                    p_screen_row, p_screen_col, ch);
+                }
+                if (clen > 0) {
+                    (void)write(STDOUT_FILENO, cbuf, clen);
+                }
+            }
+        }
+    }
+
+    /* ── Render extra cursors ─────────────────────────────────*/
+    for (int i = 0; i < r->extra_cursor_count; i++) {
+        int e_y = r->extra_cy[i] - r->scroll_row;
+        if (e_y >= 0 && e_y < text_rows) {
+            int gutter_w = ui->slots[SLOT_GUTTER].visible ? ui->slots[SLOT_GUTTER].width : GUTTER_WIDTH;
+            int text_cols = r->width - gutter_w - 1;
+            int e_x = r->extra_cx[i] - r->scroll_col;
+            if (e_x >= 0 && e_x <= text_cols) {
+                int screen_row = e_y + 1 + row_offset;
+                int screen_col = e_x + gutter_w + 1 + 1;
+                
+                char ch = ' ';
+                char *line = buffer_get_line(b, r->extra_cy[i]);
+                if (line) {
+                    if (r->extra_cx[i] >= 0 && r->extra_cx[i] < (int)strlen(line)) {
+                        ch = line[r->extra_cx[i]];
+                    }
+                    free(line);
+                }
+                
+                char cbuf[256];
+                int clen;
+                if (r->theme) {
+                    clen = snprintf(cbuf, sizeof(cbuf), "\x1b[%d;%dH\x1b[38;2;%u;%u;%um\x1b[4m%c\x1b[0m",
+                                    screen_row, screen_col,
+                                    r->theme->accent.r, r->theme->accent.g, r->theme->accent.b, ch);
+                } else {
+                    clen = snprintf(cbuf, sizeof(cbuf), "\x1b[%d;%dH\x1b[33m\x1b[4m%c\x1b[0m",
+                                    screen_row, screen_col, ch);
+                }
+                if (clen > 0) {
+                    (void)write(STDOUT_FILENO, cbuf, clen);
+                }
+            }
+        }
+    }
+
     /* ── Place cursor ────────────────────────────────────────*/
     int screen_row = cy - r->scroll_row + 1 + row_offset;
     int final_gutter_w = ui->slots[SLOT_GUTTER].visible ? ui->slots[SLOT_GUTTER].width : GUTTER_WIDTH;
     int screen_col = cx - r->scroll_col + final_gutter_w + 1 + 1; /* +1 for diag col */
-    stream_printf(r, "\x1b[%d;%dH", screen_row, screen_col);
-    stream_str(r, ESC_SHOW_CURSOR);
-
-    if (r->out_len > 0)
-        (void)write(STDOUT_FILENO, r->output_stream, r->out_len);
+    
+    char cbuf[128];
+    int clen = snprintf(cbuf, sizeof(cbuf), "\x1b[%d;%dH" ESC_SHOW_CURSOR, screen_row, screen_col);
+    if (clen > 0) {
+        (void)write(STDOUT_FILENO, cbuf, clen);
+    }
 }

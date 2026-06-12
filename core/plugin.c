@@ -411,15 +411,6 @@ size_t forge_buffer_word_count(ForgeBuffer *buf) {
  * and iteration in render_frame(). That is a separate feature.
  */
 
-struct ForgeWidget {
-    char  name[128];
-    int   slot;
-    int   priority;
-    bool  dirty;
-    void *render_cb;
-    void *key_cb;
-};
-
 ForgeWidget *forge_widget_new(const char *name, int slot, int priority) {
     ForgeWidget *w = calloc(1, sizeof(ForgeWidget));
     if (w) {
@@ -428,33 +419,64 @@ ForgeWidget *forge_widget_new(const char *name, int slot, int priority) {
         w->priority = priority;
         w->dirty = true;
     }
-    fprintf(stderr, "forge: widget_new('%s') — widget rendering not yet supported, "
-                    "widget will not be visible\n", name ? name : "?");
     return w;
 }
 
 void forge_widget_set_render_cb(ForgeWidget *w, forge_widget_render_cb cb) {
-    if (w) w->render_cb = (void *)cb;
+    if (w) w->render_cb = cb;
 }
 
 void forge_widget_set_key_cb(ForgeWidget *w, forge_widget_key_cb cb) {
-    if (w) w->key_cb = (void *)cb;
+    if (w) w->key_cb = cb;
 }
 
 void forge_widget_mark_dirty(ForgeWidget *w) {
-    if (w) w->dirty = true;
+    if (!w) return;
+    w->dirty = true;
+    if (g_editor_ctx && g_editor_ctx->render && g_editor_ctx->render->ui) {
+        RenderState *r = g_editor_ctx->render;
+        int slot_id = w->slot;
+        if (slot_id >= 0 && slot_id < SLOT_COUNT) {
+            int start_row = r->ui->slots[slot_id].row - 1;
+            int num_rows = r->ui->slots[slot_id].height;
+            render_mark_dirty(r, start_row, num_rows);
+        }
+    }
 }
 
 void forge_widget_register(ForgeWidget *w) {
-    if (w)
-        fprintf(stderr, "forge: widget_register('%s') — stub, widget not rendered\n",
-                w->name);
+    if (w && g_editor_ctx && g_editor_ctx->render) {
+        render_register_widget(g_editor_ctx->render, w);
+    }
 }
 
 void forge_widget_write(ForgeWidget *w, int row, int col,
                         const char *text, unsigned int fg_color,
                         unsigned int bg_color) {
-    /* No-op: the render system doesn't support widget draw areas yet */
-    (void)w; (void)row; (void)col; (void)text;
-    (void)fg_color; (void)bg_color;
+    if (!w || !text) return;
+    if (!g_editor_ctx || !g_editor_ctx->render || !g_editor_ctx->render->ui) return;
+    
+    RenderState *r = g_editor_ctx->render;
+    int slot_id = w->slot;
+    if (slot_id < 0 || slot_id >= SLOT_COUNT) return;
+    
+    int slot_row = r->ui->slots[slot_id].row;
+    int slot_col = r->ui->slots[slot_id].col;
+    int screen_row = slot_row + row;
+    int screen_col = slot_col + col;
+    
+    unsigned int r_fg = (fg_color >> 16) & 0xFF;
+    unsigned int g_fg = (fg_color >> 8) & 0xFF;
+    unsigned int b_fg = fg_color & 0xFF;
+    
+    unsigned int r_bg = (bg_color >> 16) & 0xFF;
+    unsigned int g_bg = (bg_color >> 8) & 0xFF;
+    unsigned int b_bg = bg_color & 0xFF;
+    
+    char buf[4096];
+    int blen = snprintf(buf, sizeof(buf), "\x1b[%d;%dH\x1b[38;2;%u;%u;%um\x1b[48;2;%u;%u;%um%s\x1b[0m",
+                        screen_row, screen_col, r_fg, g_fg, b_fg, r_bg, g_bg, b_bg, text);
+    if (blen > 0) {
+        (void)write(STDOUT_FILENO, buf, blen);
+    }
 }

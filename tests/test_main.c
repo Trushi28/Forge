@@ -12,6 +12,9 @@
 #include "../core/buffer.h"
 #include "../core/undo.h"
 #include "../core/arena.h"
+#include "../core/forgescript.h"
+#include "../core/plugin.h"
+#include "../core/render.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -397,6 +400,121 @@ static void test_arena_overflow(void) {
     arena_free(a);
 }
 
+static void write_temp_file(const char *path, const char *content) {
+    FILE *f = fopen(path, "w");
+    assert(f);
+    fputs(content, f);
+    fclose(f);
+}
+
+static void test_forgescript_on_save(void) {
+    ForgeScriptVM vm;
+    fs_vm_init(&vm);
+
+    RenderState r;
+    render_init(&r, 80, 24);
+    EditorContext ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.render = &r;
+    plugin_set_editor_context(&ctx);
+
+    const char *path = "/tmp/test_save.fs";
+    write_temp_file(path, "on save {\n    notify \"save_ok\"\n}\n");
+
+    bool ok = fs_vm_load_script(&vm, path);
+    CHECK(ok, "failed to load script");
+
+    r.status_msg[0] = '\0';
+    fs_vm_fire_event(&vm, FS_EVENT_SAVE, path);
+
+    ASSERT_EQ_STR(r.status_msg, "save_ok");
+
+    remove(path);
+    fs_vm_free(&vm);
+}
+
+static void test_forgescript_on_keypress(void) {
+    ForgeScriptVM vm;
+    fs_vm_init(&vm);
+
+    RenderState r;
+    render_init(&r, 80, 24);
+    EditorContext ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.render = &r;
+    plugin_set_editor_context(&ctx);
+
+    const char *path = "/tmp/test_keypress.fs";
+    write_temp_file(path, "on keypress Ctrl+B {\n    notify \"key_ok\"\n}\n");
+
+    bool ok = fs_vm_load_script(&vm, path);
+    CHECK(ok, "failed to load script");
+
+    r.status_msg[0] = '\0';
+    fs_vm_fire_keypress(&vm, "Ctrl+A");
+    CHECK(r.status_msg[0] == '\0', "should not fire for Ctrl+A");
+
+    fs_vm_fire_keypress(&vm, "Ctrl+B");
+    ASSERT_EQ_STR(r.status_msg, "key_ok");
+
+    remove(path);
+    fs_vm_free(&vm);
+}
+
+static void test_forgescript_syntax_error(void) {
+    ForgeScriptVM vm;
+    fs_vm_init(&vm);
+
+    const char *path = "/tmp/test_syntax_error.fs";
+    write_temp_file(path, "on save notify \"hello\"\n"); /* missing LBRACE */
+
+    bool ok = fs_vm_load_script(&vm, path);
+    CHECK(!ok, "expected compilation failure");
+
+    remove(path);
+    fs_vm_free(&vm);
+}
+
+static void test_forgescript_nonexistent_file(void) {
+    ForgeScriptVM vm;
+    fs_vm_init(&vm);
+
+    bool ok = fs_vm_load_script(&vm, "/tmp/nonexistent_file_path.fs");
+    CHECK(!ok, "expected failure for nonexistent file");
+
+    fs_vm_free(&vm);
+}
+
+static void test_forgescript_two_scripts(void) {
+    ForgeScriptVM vm;
+    fs_vm_init(&vm);
+
+    RenderState r;
+    render_init(&r, 80, 24);
+    EditorContext ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.render = &r;
+    plugin_set_editor_context(&ctx);
+
+    const char *path1 = "/tmp/test_one.fs";
+    const char *path2 = "/tmp/test_two.fs";
+    write_temp_file(path1, "on save {\n    notify \"one\"\n}\n");
+    write_temp_file(path2, "on save {\n    notify \"two\"\n}\n");
+
+    bool ok1 = fs_vm_load_script(&vm, path1);
+    bool ok2 = fs_vm_load_script(&vm, path2);
+    CHECK(ok1 && ok2, "failed to load scripts");
+
+    unsigned prev_executed = vm.executed_handlers;
+    fs_vm_fire_event(&vm, FS_EVENT_SAVE, "dummy_path");
+
+    ASSERT_EQ_INT(vm.executed_handlers - prev_executed, 2);
+
+    remove(path1);
+    remove(path2);
+    fs_vm_free(&vm);
+}
+
 /* ═══════════════════════════════════════════════════════════════
    Main — run all tests
    ═══════════════════════════════════════════════════════════════ */
@@ -440,6 +558,12 @@ int main(void) {
     RUN_TEST(test_arena_alignment);
     RUN_TEST(test_arena_reset);
     RUN_TEST(test_arena_overflow);
+    printf("\n" ANSI_BOLD "── ForgeScript VM Tests ──" ANSI_RESET "\n");
+    RUN_TEST(test_forgescript_on_save);
+    RUN_TEST(test_forgescript_on_keypress);
+    RUN_TEST(test_forgescript_syntax_error);
+    RUN_TEST(test_forgescript_nonexistent_file);
+    RUN_TEST(test_forgescript_two_scripts);
 
     /* Summary */
     printf("\n" ANSI_BOLD "════════════════════════════════════" ANSI_RESET "\n");

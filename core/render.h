@@ -12,6 +12,7 @@
 #define GUTTER_WIDTH 5   /* 4 digits + 1 separator space */
 #define TIMELINE_HEIGHT 3 /* rows for the git timeline scrubber */
 #define BLAME_COL_WIDTH 28 /* width of inline blame annotations */
+#define REFS_PANEL_HEIGHT 8 /* height of the Find References bottom panel */
 
 /* ── Diagnostic markers for gutter ──────────────────────────── */
 #define DIAG_NONE    0
@@ -27,6 +28,16 @@ typedef struct {
     int severity;      /* DIAG_ERROR, DIAG_WARNING, etc. */
     char message[256];
 } Diagnostic;
+
+struct ForgeBuffer;
+struct ForgeWidget {
+    char  name[128];
+    int   slot;
+    int   priority;
+    bool  dirty;
+    void (*render_cb)(struct ForgeWidget *w, struct ForgeBuffer *buf);
+    void (*key_cb)(struct ForgeWidget *w, int key);
+};
 
 typedef struct RenderState {
     int   width, height;
@@ -60,6 +71,26 @@ typedef struct RenderState {
     int  tab_count;
     int  active_tab;
     char tab_names[32][64];  /* basename of each open file */
+
+    /* UI Registry pointer */
+    UIRegistry *ui;
+
+    /* Widget registry */
+    struct ForgeWidget *widgets[32];
+    int widget_count;
+
+    /* Collab peer state */
+    bool collab_active;
+    int  collab_peer_cursor_line;
+    int  collab_peer_cursor_col;
+
+    /* Multi-cursor */
+    int  extra_cx[16];
+    int  extra_cy[16];
+    int  extra_cursor_count;
+
+    /* References panel */
+    bool refs_panel_visible;
 } RenderState;
 
 void ui_register_builtins(UIRegistry *ui);
@@ -77,5 +108,9 @@ void render_clear_diagnostics(RenderState *r);
 void render_add_diagnostic(RenderState *r, int line, int severity,
                            const char *msg);
 int  render_get_diag_severity(RenderState *r, int line);
+
+/* Widget functions */
+void render_register_widget(RenderState *r, struct ForgeWidget *w);
+void render_mark_dirty(RenderState *r, int start_row, int num_rows);
 
 #endif

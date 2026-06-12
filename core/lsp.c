@@ -737,6 +737,33 @@ void lsp_request_definition(LSPClient *c, const char *uri,
     jw_free(&w);
 }
 
+void lsp_request_references(LSPClient *c, const char *uri,
+                            int line, int col) {
+    if (!c || !c->running || !c->initialized) return;
+
+    JsonWriter w;
+    jw_init(&w);
+    jw_obj_start(&w);
+    jw_key(&w, "textDocument");
+    jw_obj_start(&w);
+      jw_key(&w, "uri"); jw_string(&w, uri);
+    jw_obj_end(&w); jw_str_raw(&w, ",");
+    jw_key(&w, "position");
+    jw_obj_start(&w);
+      jw_key(&w, "line");      jw_int(&w, line);
+      jw_key(&w, "character"); jw_int(&w, col);
+    jw_obj_end(&w); jw_str_raw(&w, ",");
+    jw_key(&w, "context");
+    jw_obj_start(&w);
+      jw_key(&w, "includeDeclaration"); jw_str_raw(&w, "true");
+    jw_obj_end(&w);
+    jw_obj_end(&w);
+
+    lsp_send_request(c, "textDocument/references", w.buf, w.len,
+                     LSP_RESP_REFERENCES);
+    jw_free(&w);
+}
+
 /* ══════════════════════════════════════════════════════════════
    Response handling
    ══════════════════════════════════════════════════════════════ */
@@ -861,6 +888,34 @@ static void handle_definition_response(LSPClient *c, JValue *result) {
     c->definition.valid = true;
 }
 
+static void handle_references_response(LSPClient *c, JValue *result) {
+    c->references.count = 0;
+    c->references.valid = false;
+    c->references_ready = true;
+
+    if (!result || result->type != JV_ARRAY) return;
+
+    for (int i = 0; i < result->arr.count && c->references.count < LSP_MAX_REFERENCES; i++) {
+        JValue *loc = result->arr.items[i];
+        if (!loc || loc->type != JV_OBJECT) continue;
+
+        JValue *uri_v = jv_get(loc, "uri");
+        if (!uri_v || uri_v->type != JV_STRING) continue;
+
+        JValue *range = jv_get(loc, "range");
+        if (!range || range->type != JV_OBJECT) continue;
+
+        JValue *start = jv_get(range, "start");
+        if (!start || start->type != JV_OBJECT) continue;
+
+        LSPReferenceLocation *ref = &c->references.locations[c->references.count++];
+        strncpy(ref->uri, uri_v->s, LSP_MAX_URI - 1);
+        ref->line = jv_int(jv_get(start, "line"));
+        ref->col  = jv_int(jv_get(start, "character"));
+    }
+    c->references.valid = (c->references.count > 0);
+}
+
 static void handle_diagnostics_notification(LSPClient *c, JValue *params) {
     if (!params || params->type != JV_OBJECT) return;
 
@@ -934,6 +989,9 @@ static void handle_message(LSPClient *c, const char *json, int json_len) {
                 break;
             case LSP_RESP_DEFINITION:
                 handle_definition_response(c, result);
+                break;
+            case LSP_RESP_REFERENCES:
+                handle_references_response(c, result);
                 break;
             default:
                 break;

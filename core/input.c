@@ -136,6 +136,8 @@ static int handle_csi(const char *seq, int slen) {
         return KEY_MOUSE_SCROLL_DOWN;
       if (btn == 0)
         return KEY_MOUSE_LEFT;
+      if (btn == 8 || btn == 16 || btn == 24)
+        return KEY_ALT_MOUSE_LEFT;
       if (btn == 2)
         return KEY_MOUSE_RIGHT;
     }
@@ -197,6 +199,11 @@ static int handle_csi(const char *seq, int slen) {
     if (letter == '~' && (mod == 5 || mod == 6)) {
       if (n1 == 5) return KEY_CTRL_PAGE_UP;
       if (n1 == 6) return KEY_CTRL_PAGE_DOWN;
+    }
+
+    if (mod == 7) {
+      if (letter == 'A') return KEY_CTRL_ALT_UP;
+      if (letter == 'B') return KEY_CTRL_ALT_DOWN;
     }
 
     if (mod == 5 || mod == 6) {

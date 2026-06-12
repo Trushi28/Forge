@@ -44,11 +44,15 @@ enum KeyCode {
   KEY_CTRL_PAGE_UP = 1150,
   KEY_CTRL_PAGE_DOWN,
 
+  KEY_CTRL_ALT_UP = 1160,
+  KEY_CTRL_ALT_DOWN,
+
   /* ── Mouse events (coordinates in g_mouse_x / g_mouse_y) ── */
   KEY_MOUSE_LEFT = 1200,
   KEY_MOUSE_RIGHT,
   KEY_MOUSE_SCROLL_UP,
   KEY_MOUSE_SCROLL_DOWN,
+  KEY_ALT_MOUSE_LEFT = 1205,
 };
 
 /* Set by input_read_key() when a mouse key is returned.
