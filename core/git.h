@@ -67,6 +67,9 @@ typedef struct {
     int          blame_count;
     bool         blame_visible;
 
+    /* Diff overlay active (for timeline diff view) */
+    bool  diff_overlay_active;
+
     /* Internal: libgit2 repo handle (opaque here to avoid header dep) */
     void *repo_handle;
 } GitState;

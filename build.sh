@@ -33,7 +33,7 @@ detect_libgit2() {
         ok "libgit2 found — git features enabled"
     else
         warn "libgit2 not found — building without git features"
-        warn "  Install for git support: sudo apt-get install libgit2-dev"
+        warn "  Install for git support: sudo pacman -S libgit2"
     fi
 }
 
@@ -58,8 +58,8 @@ check_deps() {
     }
 
     bold "── Checking build dependencies ─────────────────────"
-    _check "gcc"   gcc   "sudo apt-get install build-essential"
-    _check "make"  make  "sudo apt-get install make"
+    _check "gcc"   gcc   "sudo pacman -S base-devel"
+    _check "make"  make  "sudo pacman -S make"
 
     if [ $missing -ne 0 ]; then
         echo ""
@@ -75,7 +75,7 @@ check_deps() {
 # ── Build functions ────────────────────────────────────────────
 build_core() {
     log "Building C core…"
-    make -j"$(nproc 2>/dev/null || echo 4)" $(GIT_MAKE_FLAG)
+    make -j"$(nproc 2>/dev/null || echo 4)" $(GIT_MAKE_FLAG) ${EXTRA_MAKE_FLAGS:-}
     ok "Core built → ./forge"
 }
 
@@ -264,6 +264,12 @@ case "${1:-core}" in
         echo "   Keybinds: Ctrl+S save  Ctrl+F find  Ctrl+P palette"
         echo "             Ctrl+T git   Ctrl+Z undo  Ctrl+Y redo"
         echo "             Ctrl+Q quit"
+        ;;
+    debug)
+        check_deps
+        EXTRA_MAKE_FLAGS="CFLAGS='-Wall -Wextra -std=c11 -g -DFORGE_DEBUG -DDEBUG -Wno-unused-result -Wno-format-truncation -Wno-missing-field-initializers -D_GNU_SOURCE'" build_core
+        echo ""
+        ok "Debug build complete.  Run: ./forge <file> (with gdb/valgrind)"
         ;;
     all)
         check_deps

@@ -118,6 +118,10 @@ typedef struct {
   /* Multi-cursor */
   int extra_cx[16], extra_cy[16];
   int extra_cursor_count;
+
+  /* Visual selection */
+  bool selection_active;
+  int  anchor_cx, anchor_cy;
 } EditorState;
 
 static EditorState E;
@@ -191,6 +195,44 @@ static int add_buffer(Buffer *buf, const char *path) {
   return idx;
 }
 
+static void git_reopen(void) {
+  git_state_free(&E.git);
+
+  char target_dir[1024] = {0};
+  if (E.filepath) {
+    char path_copy[1024];
+    strncpy(path_copy, E.filepath, sizeof(path_copy) - 1);
+    path_copy[sizeof(path_copy) - 1] = '\0';
+    char *dir = dirname(path_copy);
+    if (dir) {
+      strncpy(target_dir, dir, sizeof(target_dir) - 1);
+    }
+  }
+
+  if (target_dir[0] == '\0') {
+    if (!getcwd(target_dir, sizeof(target_dir))) {
+      target_dir[0] = '\0';
+    }
+  }
+
+  if (target_dir[0] != '\0') {
+    if (!git_state_init(&E.git, target_dir)) {
+      /* Retry with cwd as fallback if dirname-based path failed */
+      char cwd_fallback[1024];
+      if (getcwd(cwd_fallback, sizeof(cwd_fallback))) {
+        git_state_init(&E.git, cwd_fallback);
+      }
+    }
+    if (E.git.repo_open) {
+      if (E.filepath) {
+        git_refresh_diff(&E.git, E.filepath);
+        git_refresh_log(&E.git, E.filepath);
+      }
+      git_refresh_branch(&E.git);
+    }
+  }
+}
+
 static void open_file_at_path(const char *path) {
   if (!path || !path[0]) return;
 
@@ -253,10 +295,7 @@ static void open_file_at_path(const char *path) {
   }
 
   /* Refresh git for new file */
-  if (E.git.repo_open) {
-    git_refresh_diff(&E.git, E.filepath);
-    git_refresh_branch(&E.git);
-  }
+  git_reopen();
 
   /* Fire on_open hook */
   if (E.cfg.hook_on_open[0])
@@ -841,7 +880,11 @@ static void cmd_lsp_restart(void *ctx) {
 static void cmd_toggle_blame(void *ctx) {
   (void)ctx;
   if (!E.git.repo_open) {
+#ifdef HAS_LIBGIT2
+    render_set_status(&E.render, "Git not available (no repository found)");
+#else
     render_set_status(&E.render, "Git not available (build without libgit2)");
+#endif
     return;
   }
   E.git.blame_visible = !E.git.blame_visible;
@@ -855,7 +898,11 @@ static void cmd_toggle_blame(void *ctx) {
 static void cmd_toggle_timeline(void *ctx) {
   (void)ctx;
   if (!E.git.repo_open) {
-    render_set_status(&E.render, "Git not available");
+#ifdef HAS_LIBGIT2
+    render_set_status(&E.render, "Git not available (no repository found)");
+#else
+    render_set_status(&E.render, "Git not available (build without libgit2)");
+#endif
     return;
   }
   E.git.timeline_visible = !E.git.timeline_visible;
@@ -876,6 +923,57 @@ static void cmd_find_references(void *ctx) {
   } else {
     render_set_status(&E.render, "No LSP server running");
   }
+}
+
+static void cmd_show_hover(void *ctx) {
+  (void)ctx;
+  if (E.lsp && E.lsp->running && E.lsp->initialized) {
+    lsp_request_hover(E.lsp, E.file_uri, E.cy, E.cx);
+    E.show_hover = true;
+    render_set_status(&E.render, "Fetching hover docs...");
+  } else {
+    render_set_status(&E.render, "No LSP server running");
+  }
+}
+
+static void cmd_copy_selection(void *ctx) {
+  (void)ctx;
+  if (!E.selection_active) {
+    render_set_status(&E.render, "No selection active");
+    return;
+  }
+
+  /* Determine selection range (anchor vs cursor) */
+  size_t off_a = buffer_get_offset(E.buf, E.anchor_cx, E.anchor_cy);
+  size_t off_c = buffer_get_offset(E.buf, E.cx, E.cy);
+  size_t start = off_a < off_c ? off_a : off_c;
+  size_t end   = off_a < off_c ? off_c : off_a;
+  size_t sel_len = end - start;
+
+  if (sel_len == 0) {
+    render_set_status(&E.render, "Empty selection");
+    return;
+  }
+
+  char *text = buffer_get_text(E.buf);
+  if (!text) return;
+
+  size_t tlen = strlen(text);
+  if (end > tlen) end = tlen;
+  sel_len = end - start;
+
+  /* Try xclip first, then xsel */
+  FILE *clip = popen("xclip -selection clipboard 2>/dev/null", "w");
+  if (!clip)
+    clip = popen("xsel --clipboard --input 2>/dev/null", "w");
+  if (clip) {
+    fwrite(text + start, 1, sel_len, clip);
+    pclose(clip);
+    render_set_status(&E.render, "Copied %zu chars to clipboard", sel_len);
+  } else {
+    render_set_status(&E.render, "No clipboard tool found (install xclip or xsel)");
+  }
+  free(text);
 }
 
 /* ── Guild commands ──────────────────────────────────────────── */
@@ -1284,6 +1382,20 @@ static void handle_net_message(const char *msg) {
         }
         E.render.full_redraw = true;
         render_set_status(&E.render, "✦ COLLAB — remote edit from %s", E.collab_peer);
+      }
+
+      /* Populate extra cursor arrays from remote peer cursor */
+      int cursor_row = -1, cursor_col = -1;
+      if (json_get_int(msg, "cursor_row", &cursor_row) &&
+          json_get_int(msg, "cursor_col", &cursor_col)) {
+        /* Find or allocate a slot for this peer (use peer index 0 for now) */
+        int peer_idx = 0; /* single-peer collab: always slot 0 */
+        if (peer_idx < 16) {
+          E.render.extra_cx[peer_idx] = cursor_col;
+          E.render.extra_cy[peer_idx] = cursor_row;
+          if (peer_idx >= E.render.extra_cursor_count)
+            E.render.extra_cursor_count = peer_idx + 1;
+        }
       }
     }
   } else if (strcmp(type, "FILE_RECEIVED") == 0) {
@@ -2283,6 +2395,15 @@ static void multi_cursor_enter(void) {
 int main(int argc, char **argv) {
   E.filepath = (argc >= 2) ? argv[1] : NULL;
 
+  /* Resolve filepath to absolute path so git_reopen() and other
+     subsystems always work with a canonical path. */
+  static char resolved_path[1024];
+  if (E.filepath) {
+    if (realpath(E.filepath, resolved_path)) {
+      E.filepath = resolved_path;
+    }
+  }
+
   session_arena = arena_new(1024 * 1024 * 16);
 
   signal(SIGWINCH, sigwinch_handler);
@@ -2327,16 +2448,7 @@ int main(int argc, char **argv) {
   /* ── Initialize undo ──────────────────────────────────── */
   undo_init(&E.undo);
 
-  /* ── Initialize git ───────────────────────────────────── */
-  char cwd[1024];
-  bool has_cwd = (getcwd(cwd, sizeof(cwd)) != NULL);
-  if (has_cwd) {
-    git_state_init(&E.git, cwd);
-    if (E.git.repo_open && E.filepath) {
-      git_refresh_diff(&E.git, E.filepath);
-      git_refresh_branch(&E.git);
-    }
-  }
+  git_reopen();
   E.render.git = &E.git;
 
   /* ── Initialize plugins ───────────────────────────────── */
@@ -2367,7 +2479,8 @@ int main(int argc, char **argv) {
       fs_vm_load_dir(&E.scripts, script_dir);
     }
     /* Also load from project-local scripts */
-    if (has_cwd) {
+    char cwd[1024];
+    if (getcwd(cwd, sizeof(cwd))) {
       snprintf(script_dir, sizeof(script_dir), "%s/scripts/user", cwd);
       fs_vm_load_dir(&E.scripts, script_dir);
     }
@@ -2393,7 +2506,7 @@ int main(int argc, char **argv) {
   palette_add_command(&E.palette, "Next Theme", "Cycle through themes", "",
                       cmd_next_theme, NULL);
   palette_add_command(&E.palette, "Go to Line", "Jump to a line number",
-                      "Ctrl+G", cmd_goto_line, NULL);
+                      ":", cmd_goto_line, NULL);
   palette_add_command(&E.palette, "Open File", "Open a file", "", cmd_open_file,
                       NULL);
   palette_add_command(&E.palette, "Format File", "Format with formatter", "",
@@ -2414,6 +2527,10 @@ int main(int argc, char **argv) {
                       cmd_guild_collab, NULL);
   palette_add_command(&E.palette, "Find References", "Find references of symbol under cursor", "",
                       cmd_find_references, NULL);
+  palette_add_command(&E.palette, "Show Hover Docs", "Show hover documentation for symbol under cursor", "Ctrl+K",
+                      cmd_show_hover, NULL);
+  palette_add_command(&E.palette, "Copy Selection", "Copy selected text to clipboard", "",
+                      cmd_copy_selection, NULL);
 
   /* ── Start LSP ────────────────────────────────────────── */
   E.lsp = NULL;
@@ -2447,6 +2564,9 @@ int main(int argc, char **argv) {
   E.lsp_dirty = false;
   E.collab_active = false;
   E.collab_session_id = 0;
+  E.selection_active = false;
+  E.anchor_cx = 0;
+  E.anchor_cy = 0;
   E.collab_peer[0] = '\0';
   E.extra_cursor_count = 0;
   get_time(&E.lsp_last_edit);
@@ -2596,6 +2716,11 @@ int main(int argc, char **argv) {
       E.render.extra_cx[i] = E.extra_cx[i];
       E.render.extra_cy[i] = E.extra_cy[i];
     }
+    E.render.selection_active = E.selection_active;
+    E.render.sel_anchor_cx = E.anchor_cx;
+    E.render.sel_anchor_cy = E.anchor_cy;
+    E.render.sel_cursor_cx = E.cx;
+    E.render.sel_cursor_cy = E.cy;
     render_frame(&E.render, E.buf, &E.ui, E.cx, E.cy);
 
     /* Render overlays */
@@ -2915,6 +3040,20 @@ int main(int argc, char **argv) {
 
     /* ── Block editing when viewing historical file ────── */
     if (E.git.timeline_viewing) {
+      /* Ctrl+D: toggle diff overlay in timeline view */
+      if (key == KEY_CTRL_D) {
+        E.git.diff_overlay_active = !E.git.diff_overlay_active;
+        if (E.git.diff_overlay_active && E.filepath) {
+          GitCommit *c = &E.git.commits[E.git.timeline_selected];
+          git_refresh_diff(&E.git, E.filepath);
+          render_set_status(&E.render, "Diff: %s vs HEAD", c->short_sha);
+        } else {
+          E.git.diff_count = 0;
+          render_set_status(&E.render, "Diff overlay off");
+        }
+        E.render.full_redraw = true;
+        continue;
+      }
       /* Only allow navigation and escape, not editing */
       if (key == KEY_ARROW_UP || key == KEY_ARROW_DOWN ||
           key == KEY_ARROW_LEFT || key == KEY_ARROW_RIGHT ||
@@ -3226,6 +3365,45 @@ int main(int argc, char **argv) {
       move_word_right();
       E.render.full_redraw = true;
       continue;
+    }
+
+    /* ── Shift+Arrow: visual selection ───────────────── */
+    if (key == KEY_SHIFT_UP || key == KEY_SHIFT_DOWN ||
+        key == KEY_SHIFT_LEFT || key == KEY_SHIFT_RIGHT) {
+      if (!E.selection_active) {
+        E.selection_active = true;
+        E.anchor_cx = E.cx;
+        E.anchor_cy = E.cy;
+      }
+      if (key == KEY_SHIFT_UP) {
+        if (E.cy > 0) { E.cy--; clamp_cx(&E.cx, E.cy); }
+      } else if (key == KEY_SHIFT_DOWN) {
+        size_t lc = buffer_line_count(E.buf);
+        if (lc > 0 && (size_t)E.cy < lc - 1) { E.cy++; clamp_cx(&E.cx, E.cy); }
+      } else if (key == KEY_SHIFT_LEFT) {
+        if (E.cx > 0) { E.cx--; }
+        else if (E.cy > 0) { E.cy--; E.cx = line_len(E.buf, E.cy); }
+      } else if (key == KEY_SHIFT_RIGHT) {
+        int ll = line_len(E.buf, E.cy);
+        if (E.cx < ll) { E.cx++; }
+        else { size_t lc = buffer_line_count(E.buf); if ((size_t)E.cy < lc - 1) { E.cy++; E.cx = 0; } }
+      }
+      E.render.full_redraw = true;
+      continue;
+    }
+
+    /* ── Deactivate selection on non-selection keys ──── */
+    if (E.selection_active) {
+      /* Ctrl+C copies selection instead of deactivating */
+      if (key == KEY_CTRL_C) {
+        cmd_copy_selection(NULL);
+        E.selection_active = false;
+        E.render.full_redraw = true;
+        continue;
+      }
+      /* Any other key deactivates selection */
+      E.selection_active = false;
+      E.render.full_redraw = true;
     }
 
     /* ── Ctrl+A: jump to line start ──────────────────── */

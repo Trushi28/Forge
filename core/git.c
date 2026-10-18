@@ -10,6 +10,10 @@
 
 #include <git2.h>
 
+#ifndef GIT_REPOSITORY_OPEN_SEARCH
+#define GIT_REPOSITORY_OPEN_SEARCH 0
+#endif
+
 /* ── Init / Free ───────────────────────────────────────────── */
 
 bool git_state_init(GitState *gs, const char *workdir) {
@@ -17,7 +21,7 @@ bool git_state_init(GitState *gs, const char *workdir) {
     git_libgit2_init();
 
     git_repository *repo = NULL;
-    int err = git_repository_open_ext(&repo, workdir, 0, NULL);
+    int err = git_repository_open_ext(&repo, workdir, GIT_REPOSITORY_OPEN_SEARCH, NULL);
     if (err != 0) {
         gs->repo_open = false;
         return false;

@@ -1072,8 +1072,49 @@ void render_frame(RenderState *r, Buffer *b, UIRegistry *ui,
 
                 stream_bg(r, row_bg);
 
+                /* Selection highlight: compute selection range for this line */
+                int sel_start_col = -1, sel_end_col = -1;
+                if (r->selection_active) {
+                    int sa_cx = r->sel_anchor_cx, sa_cy = r->sel_anchor_cy;
+                    int sc_cx = r->sel_cursor_cx, sc_cy = r->sel_cursor_cy;
+                    /* Normalize: ensure start <= end */
+                    int s_sy, s_sx, s_ey, s_ex;
+                    if (sa_cy < sc_cy || (sa_cy == sc_cy && sa_cx <= sc_cx)) {
+                        s_sy = sa_cy; s_sx = sa_cx; s_ey = sc_cy; s_ex = sc_cx;
+                    } else {
+                        s_sy = sc_cy; s_sx = sc_cx; s_ey = sa_cy; s_ex = sa_cx;
+                    }
+                    if (logical >= s_sy && logical <= s_ey) {
+                        if (logical == s_sy && logical == s_ey) {
+                            sel_start_col = s_sx; sel_end_col = s_ex;
+                        } else if (logical == s_sy) {
+                            sel_start_col = s_sx; sel_end_col = llen;
+                        } else if (logical == s_ey) {
+                            sel_start_col = 0; sel_end_col = s_ex;
+                        } else {
+                            sel_start_col = 0; sel_end_col = llen;
+                        }
+                    }
+                }
+
+                /* Selection background color: blend accent into bg */
+                ThemeColor sel_bg_color;
+                if (r->theme) {
+                    sel_bg_color.r = (uint8_t)((r->theme->accent.r * 2 + r->theme->bg.r * 3) / 5);
+                    sel_bg_color.g = (uint8_t)((r->theme->accent.g * 2 + r->theme->bg.g * 3) / 5);
+                    sel_bg_color.b = (uint8_t)((r->theme->accent.b * 2 + r->theme->bg.b * 3) / 5);
+                } else {
+                    sel_bg_color = (ThemeColor){80, 80, 120};
+                }
+
                 for (int x = 0; x < text_cols; x++) {
                     int src_col = start_col + x;
+                    bool in_selection = (sel_start_col >= 0 && src_col >= sel_start_col && src_col < sel_end_col);
+                    if (in_selection) {
+                        stream_bg(r, sel_bg_color);
+                    } else {
+                        stream_bg(r, row_bg);
+                    }
                     if (src_col < llen && line) {
                         HighlightKind kind = hl[src_col];
                         ThemeColor fc = hl_to_color(t, kind);

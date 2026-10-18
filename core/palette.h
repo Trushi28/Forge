@@ -66,6 +66,9 @@ typedef struct {
     int           result_index;    /* index into filtered[] */
     int           goto_line;       /* for GOTO_LINE mode */
     char          result_path[512]; /* for FILES mode */
+
+    /* Scroll state (reset on each open) */
+    int           scroll_offset;
 } PaletteState;
 
 /* ── API ────────────────────────────────────────────────────── */

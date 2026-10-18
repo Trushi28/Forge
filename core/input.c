@@ -218,7 +218,20 @@ static int handle_csi(const char *seq, int slen) {
         return KEY_ARROW_DOWN;
       }
     }
-    /* Shift+Arrow: treat as regular arrow */
+    /* Shift+Arrow: mod=2 — visual selection keys */
+    if (mod == 2) {
+      switch (letter) {
+      case 'A':
+        return KEY_SHIFT_UP;
+      case 'B':
+        return KEY_SHIFT_DOWN;
+      case 'C':
+        return KEY_SHIFT_RIGHT;
+      case 'D':
+        return KEY_SHIFT_LEFT;
+      }
+    }
+    /* Other modifiers: treat as regular arrow */
     switch (letter) {
     case 'A':
       return KEY_ARROW_UP;

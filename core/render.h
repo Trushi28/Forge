@@ -89,6 +89,11 @@ typedef struct RenderState {
     int  extra_cy[16];
     int  extra_cursor_count;
 
+    /* Visual selection */
+    bool selection_active;
+    int  sel_anchor_cx, sel_anchor_cy;
+    int  sel_cursor_cx, sel_cursor_cy;
+
     /* References panel */
     bool refs_panel_visible;
 } RenderState;

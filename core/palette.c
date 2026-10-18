@@ -40,6 +40,7 @@ void palette_show(PaletteState *ps) {
     ps->cursor     = 0;
     ps->selected   = 0;
     ps->accepted   = false;
+    ps->scroll_offset = 0;
 
     /* Show all commands initially */
     ps->filtered_count = ps->command_count;
@@ -333,9 +334,54 @@ void palette_scan_files(PaletteState *ps, const char *root_dir) {
     scan_dir_recursive(ps, dir, "");
 }
 
-/* ══════════════════════════════════════════════════════════════
-   Render — centered overlay
-   ══════════════════════════════════════════════════════════════ */
+static void print_highlighted_match(char *buf, int *blen, int max_len, const char *text, const char *query,
+                                    ThemeColor hl_fg, ThemeColor normal_fg, ThemeColor bg_color,
+                                    bool bold_item, bool underline_match) {
+    const char *q = query;
+    #define HPRINTF(...) *blen += snprintf(buf + *blen, max_len - *blen, __VA_ARGS__)
+
+    // Set background color once
+    HPRINTF("\x1b[48;2;%u;%u;%um", bg_color.r, bg_color.g, bg_color.b);
+
+    while (*text && *blen < max_len - 64) {
+        bool is_match = false;
+        if (*q && tolower((unsigned char)*text) == tolower((unsigned char)*q)) {
+            is_match = true;
+            q++;
+        }
+
+        if (is_match) {
+            // Highlight color
+            if (underline_match) {
+                // Keep same fg but add underline
+                HPRINTF("\x1b[38;2;%u;%u;%um\x1b[4m", normal_fg.r, normal_fg.g, normal_fg.b);
+            } else {
+                HPRINTF("\x1b[38;2;%u;%u;%um\x1b[1m", hl_fg.r, hl_fg.g, hl_fg.b);
+            }
+        } else {
+            // Normal color
+            HPRINTF("\x1b[38;2;%u;%u;%um", normal_fg.r, normal_fg.g, normal_fg.b);
+            if (underline_match) {
+                HPRINTF("\x1b[24m"); // remove underline
+            }
+            if (bold_item) {
+                HPRINTF("\x1b[1m");
+            } else {
+                HPRINTF("\x1b[22m"); // normal weight
+            }
+        }
+
+        buf[(*blen)++] = *text;
+        text++;
+    }
+
+    // Clean up underline if we added it
+    if (underline_match) {
+        HPRINTF("\x1b[24m");
+    }
+
+    #undef HPRINTF
+}
 
 void palette_render(PaletteState *ps, ForgeTheme *theme,
                     int term_width, int term_height) {
@@ -350,11 +396,18 @@ void palette_render(PaletteState *ps, ForgeTheme *theme,
 
     int max_results = ps->filtered_count < PALETTE_MAX_VISIBLE
                         ? ps->filtered_count : PALETTE_MAX_VISIBLE;
-    int popup_height = max_results + 4;
 
-    /* Center horizontally and vertically */
+    /* Calculate dynamic popup height for proper centering */
+    int popup_height = 4;
+    if (ps->mode == PALETTE_COMMANDS) {
+        popup_height += max_results * 2;
+    } else {
+        popup_height += max_results;
+    }
+
+    /* Position at upper quarter, not center */
     int col = (term_width - popup_width) / 2 + 1;
-    int row = (term_height - popup_height) / 2 + 1;
+    int row = term_height / 4;
     if (row < 1) row = 1;
     if (col < 1) col = 1;
 
@@ -371,14 +424,14 @@ void palette_render(PaletteState *ps, ForgeTheme *theme,
         popup_bg  = theme->gutter_bg;
         popup_fg  = theme->fg;
         border_c  = theme->gutter_fg;
-        input_bg  = theme->gutter_bg;
+        input_bg  = theme->gutter_bg; /* Match popup background to avoid "transparency" cutout */
         sel_bg    = theme->statusbar_accent;
         sel_fg    = theme->bg;
     } else {
         popup_bg  = (ThemeColor){40, 40, 40};
         popup_fg  = (ThemeColor){200, 200, 200};
         border_c  = (ThemeColor){150, 150, 150};
-        input_bg  = (ThemeColor){40, 40, 40};
+        input_bg  = (ThemeColor){40, 40, 40}; /* Match popup background */
         sel_bg    = (ThemeColor){100, 150, 255};
         sel_fg    = (ThemeColor){20, 20, 20};
     }
@@ -416,7 +469,7 @@ void palette_render(PaletteState *ps, ForgeTheme *theme,
             popup_bg.r, popup_bg.g, popup_bg.b);
     BPRINTF("│");
 
-    // Draw content padding and colors
+    // Draw content padding and colors (bg color with fg text)
     BPRINTF("\x1b[48;2;%u;%u;%um\x1b[38;2;%u;%u;%um",
             input_bg.r, input_bg.g, input_bg.b,
             popup_fg.r, popup_fg.g, popup_fg.b);
@@ -435,13 +488,15 @@ void palette_render(PaletteState *ps, ForgeTheme *theme,
         BPRINTF("⌘ ");
 
     /* Input text */
-    int input_space = popup_width - 7;
+    int input_space = popup_width - 8;
     int show_len = ps->input_len < input_space ? ps->input_len : input_space;
     for (int i = 0; i < show_len; i++)
         BPRINTF("%c", ps->input[i]);
 
-    /* Cursor indicator */
-    BPRINTF("▎");
+    /* Cursor indicator (cursor as a block) */
+    BPRINTF("\x1b[38;2;%u;%u;%um█", theme ? theme->accent.r : border_c.r, theme ? theme->accent.g : border_c.g, theme ? theme->accent.b : border_c.b);
+    // Restore default input text color
+    BPRINTF("\x1b[38;2;%u;%u;%um", popup_fg.r, popup_fg.g, popup_fg.b);
 
     /* Fill rest */
     int used = show_len + 1;
@@ -464,12 +519,14 @@ void palette_render(PaletteState *ps, ForgeTheme *theme,
     BPRINTF("┤");
 
     /* ── Result rows ────────────────────────────────────────── */
-    /* Scrolling window */
-    int scroll_start = 0;
+    /* Scrolling window — use ps->scroll_offset instead of static local */
+    int scroll_start = ps->scroll_offset;
     if (ps->selected >= scroll_start + max_results)
         scroll_start = ps->selected - max_results + 1;
     if (ps->selected < scroll_start)
         scroll_start = ps->selected;
+    ps->scroll_offset = scroll_start;
+    int current_row = row + 3;
 
     for (int i = 0; i < max_results; i++) {
         int fi = scroll_start + i;
@@ -477,26 +534,8 @@ void palette_render(PaletteState *ps, ForgeTheme *theme,
 
         bool selected = (fi == ps->selected);
 
-        BPRINTF("\x1b[%d;%dH", row + 3 + i, col);
-
-        // Draw left border
-        BPRINTF("\x1b[38;2;%u;%u;%um\x1b[48;2;%u;%u;%um",
-                border_c.r, border_c.g, border_c.b,
-                popup_bg.r, popup_bg.g, popup_bg.b);
-        BPRINTF("│");
-
-        // Set row colors
-        if (selected) {
-            BPRINTF("\x1b[48;2;%u;%u;%um\x1b[38;2;%u;%u;%um\x1b[1m",
-                    sel_bg.r, sel_bg.g, sel_bg.b,
-                    sel_fg.r, sel_fg.g, sel_fg.b);
-        } else {
-            BPRINTF("\x1b[48;2;%u;%u;%um\x1b[38;2;%u;%u;%um",
-                    popup_bg.r, popup_bg.g, popup_bg.b,
-                    popup_fg.r, popup_fg.g, popup_fg.b);
-        }
-
-        BPRINTF(" ");
+        ThemeColor item_bg = selected ? sel_bg : popup_bg;
+        ThemeColor item_fg = selected ? sel_fg : popup_fg;
 
         int content_width = popup_width - 4;
 
@@ -504,67 +543,166 @@ void palette_render(PaletteState *ps, ForgeTheme *theme,
             int idx = ps->filtered[fi];
             PaletteCommand *cmd = &ps->commands[idx];
 
-            /* Command name */
+            // ── Row 1: Name & Shortcut
+            BPRINTF("\x1b[%d;%dH", current_row, col);
+
+            // Draw left border
+            BPRINTF("\x1b[38;2;%u;%u;%um\x1b[48;2;%u;%u;%um│",
+                    border_c.r, border_c.g, border_c.b,
+                    popup_bg.r, popup_bg.g, popup_bg.b);
+
+            // Left padding space in item background
+            BPRINTF("\x1b[48;2;%u;%u;%um ", item_bg.r, item_bg.g, item_bg.b);
+
+            /* Command name with matched characters highlight */
             int nl = (int)strlen(cmd->name);
             int shortcut_len = (int)strlen(cmd->shortcut);
             int name_space = content_width - shortcut_len - 2;
             int show_name = nl < name_space ? nl : name_space;
+            if (show_name < 0) show_name = 0;
 
-            for (int j = 0; j < show_name; j++)
-                BPRINTF("%c", cmd->name[j]);
-            for (int j = show_name; j < name_space; j++)
-                BPRINTF(" ");
+            char trunc_name[128];
+            memcpy(trunc_name, cmd->name, show_name);
+            trunc_name[show_name] = '\0';
 
-            /* Shortcut (right-aligned, dimmer) */
-            if (!selected && shortcut_len > 0) {
-                if (theme) {
-                    BPRINTF("\x1b[38;2;%u;%u;%um",
-                            theme->comment.r, theme->comment.g, theme->comment.b);
-                }
-            }
-            BPRINTF("  %s", cmd->shortcut);
-            // Restore selection or popup colors
+            print_highlighted_match(buf, &blen, sizeof(buf), trunc_name, ps->input,
+                                    sel_bg, item_fg, item_bg, selected, selected);
+
+            // Pad remaining space between name and shortcut
+            BPRINTF("\x1b[48;2;%u;%u;%um\x1b[38;2;%u;%u;%um\x1b[22m",
+                    item_bg.r, item_bg.g, item_bg.b,
+                    item_fg.r, item_fg.g, item_fg.b);
+            if (selected) BPRINTF("\x1b[1m");
+            for (int j = show_name; j < name_space; j++) BPRINTF(" ");
+            BPRINTF("  ");
+
+            /* Shortcut (dimmed gutter_fg, right-aligned) */
             if (selected) {
-                BPRINTF("\x1b[48;2;%u;%u;%um\x1b[38;2;%u;%u;%um\x1b[1m",
-                        sel_bg.r, sel_bg.g, sel_bg.b,
-                        sel_fg.r, sel_fg.g, sel_fg.b);
+                BPRINTF("\x1b[38;2;%u;%u;%um\x1b[1m", item_fg.r, item_fg.g, item_fg.b);
             } else {
-                BPRINTF("\x1b[48;2;%u;%u;%um\x1b[38;2;%u;%u;%um",
-                        popup_bg.r, popup_bg.g, popup_bg.b,
-                        popup_fg.r, popup_fg.g, popup_fg.b);
+                BPRINTF("\x1b[38;2;%u;%u;%um\x1b[2m", border_c.r, border_c.g, border_c.b);
             }
+            BPRINTF("%s", cmd->shortcut);
+            BPRINTF("\x1b[22m\x1b[0m");
+
+            // Right padding and right border
+            BPRINTF("\x1b[48;2;%u;%u;%um ", item_bg.r, item_bg.g, item_bg.b);
+            BPRINTF("\x1b[38;2;%u;%u;%um\x1b[48;2;%u;%u;%um│",
+                    border_c.r, border_c.g, border_c.b,
+                    popup_bg.r, popup_bg.g, popup_bg.b);
+
+            current_row++;
+
+            // ── Row 2: Description
+            BPRINTF("\x1b[%d;%dH", current_row, col);
+
+            // Left border
+            BPRINTF("\x1b[38;2;%u;%u;%um\x1b[48;2;%u;%u;%um│",
+                    border_c.r, border_c.g, border_c.b,
+                    popup_bg.r, popup_bg.g, popup_bg.b);
+
+            // Left padding space
+            BPRINTF("\x1b[48;2;%u;%u;%um ", item_bg.r, item_bg.g, item_bg.b);
+
+            /* Description text (dimmed gutter_fg, smaller indent) */
+            int dl = (int)strlen(cmd->description);
+            int desc_space = content_width - 2;
+            int show_desc = dl < desc_space ? dl : desc_space;
+            if (show_desc < 0) show_desc = 0;
+
+            char trunc_desc[256];
+            memcpy(trunc_desc, cmd->description, show_desc);
+            trunc_desc[show_desc] = '\0';
+
+            BPRINTF("\x1b[48;2;%u;%u;%um\x1b[38;2;%u;%u;%um  %s",
+                    item_bg.r, item_bg.g, item_bg.b,
+                    border_c.r, border_c.g, border_c.b,
+                    trunc_desc);
+
+            // Pad remaining spaces
+            for (int j = show_desc; j < desc_space; j++) BPRINTF(" ");
+            BPRINTF(" ");
+
+            // Right border
+            BPRINTF("\x1b[38;2;%u;%u;%um\x1b[48;2;%u;%u;%um│",
+                    border_c.r, border_c.g, border_c.b,
+                    popup_bg.r, popup_bg.g, popup_bg.b);
+
+            current_row++;
 
         } else if (ps->mode == PALETTE_FILES) {
             int idx = ps->filtered[fi];
             PaletteFile *pf = &ps->files[idx];
+
+            BPRINTF("\x1b[%d;%dH", current_row, col);
+
+            // Left border
+            BPRINTF("\x1b[38;2;%u;%u;%um\x1b[48;2;%u;%u;%um│",
+                    border_c.r, border_c.g, border_c.b,
+                    popup_bg.r, popup_bg.g, popup_bg.b);
+
+            // Left padding space
+            BPRINTF("\x1b[48;2;%u;%u;%um ", item_bg.r, item_bg.g, item_bg.b);
+
+            /* File path with matched characters highlight */
             int pl = (int)strlen(pf->path);
             int show_path = pl < content_width ? pl : content_width;
-            for (int j = 0; j < show_path; j++)
-                BPRINTF("%c", pf->path[j]);
-            for (int j = show_path; j < content_width; j++)
-                BPRINTF(" ");
+            if (show_path < 0) show_path = 0;
+
+            char trunc_path[512];
+            memcpy(trunc_path, pf->path, show_path);
+            trunc_path[show_path] = '\0';
+
+            print_highlighted_match(buf, &blen, sizeof(buf), trunc_path, ps->input,
+                                    sel_bg, item_fg, item_bg, selected, selected);
+
+            // Pad remaining space
+            BPRINTF("\x1b[48;2;%u;%u;%um\x1b[38;2;%u;%u;%um\x1b[22m",
+                    item_bg.r, item_bg.g, item_bg.b,
+                    item_fg.r, item_fg.g, item_fg.b);
+            if (selected) BPRINTF("\x1b[1m");
+            for (int j = show_path; j < content_width; j++) BPRINTF(" ");
+
+            // Right padding and border
+            BPRINTF(" ");
+            BPRINTF("\x1b[38;2;%u;%u;%um\x1b[48;2;%u;%u;%um│",
+                    border_c.r, border_c.g, border_c.b,
+                    popup_bg.r, popup_bg.g, popup_bg.b);
+
+            current_row++;
 
         } else if (ps->mode == PALETTE_GOTO_LINE) {
-            for (int j = 0; j < content_width; j++)
-                BPRINTF(" ");
-        }
+            BPRINTF("\x1b[%d;%dH", current_row, col);
 
-        // Draw right padding and right border
-        BPRINTF(" ");
-        BPRINTF("\x1b[38;2;%u;%u;%um\x1b[48;2;%u;%u;%um",
-                border_c.r, border_c.g, border_c.b,
-                popup_bg.r, popup_bg.g, popup_bg.b);
-        BPRINTF("│");
+            // Left border
+            BPRINTF("\x1b[38;2;%u;%u;%um\x1b[48;2;%u;%u;%um│",
+                    border_c.r, border_c.g, border_c.b,
+                    popup_bg.r, popup_bg.g, popup_bg.b);
+
+            // Left padding space
+            BPRINTF("\x1b[48;2;%u;%u;%um ", item_bg.r, item_bg.g, item_bg.b);
+
+            // Goto line just shows empty/background
+            for (int j = 0; j < content_width; j++) BPRINTF(" ");
+
+            // Right padding and border
+            BPRINTF(" ");
+            BPRINTF("\x1b[38;2;%u;%u;%um\x1b[48;2;%u;%u;%um│",
+                    border_c.r, border_c.g, border_c.b,
+                    popup_bg.r, popup_bg.g, popup_bg.b);
+
+            current_row++;
+        }
     }
 
     /* ── Bottom border with hint bar inside ─────────────────── */
-    BPRINTF("\x1b[%d;%dH", row + 3 + max_results, col);
+    BPRINTF("\x1b[%d;%dH", current_row, col);
     BPRINTF("\x1b[38;2;%u;%u;%um\x1b[48;2;%u;%u;%um",
             border_c.r, border_c.g, border_c.b,
             popup_bg.r, popup_bg.g, popup_bg.b);
     BPRINTF("└");
 
-    const char *hint = " ↑↓ navigate  ⏎ accept  esc close  > files  : goto line ";
+    const char *hint = " ↑↓ navigate  ⏎ accept  esc close ";
     int hint_len = (int)strlen(hint);
     if (popup_width - 2 < hint_len) {
         hint = " ↑↓  ⏎  esc ";
@@ -576,15 +714,11 @@ void palette_render(PaletteState *ps, ForgeTheme *theme,
 
     for (int i = 0; i < dash_before; i++) BPRINTF("─");
 
-    // Print hint in comment/dim color
-    if (theme) {
-        BPRINTF("\x1b[38;2;%u;%u;%um", theme->comment.r, theme->comment.g, theme->comment.b);
-    } else {
-        BPRINTF("\x1b[2m");
-    }
+    // Print hint in gutter_fg color (unselected / normal, not comments)
+    BPRINTF("\x1b[38;2;%u;%u;%um\x1b[22m", border_c.r, border_c.g, border_c.b);
     BPRINTF("%s", hint);
 
-    // Restore border color
+    // Restore border color/line
     BPRINTF("\x1b[38;2;%u;%u;%um\x1b[48;2;%u;%u;%um",
             border_c.r, border_c.g, border_c.b,
             popup_bg.r, popup_bg.g, popup_bg.b);

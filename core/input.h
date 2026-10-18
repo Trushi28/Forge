@@ -47,6 +47,12 @@ enum KeyCode {
   KEY_CTRL_ALT_UP = 1160,
   KEY_CTRL_ALT_DOWN,
 
+  /* ── Shift+Arrow (visual selection) ───────────────────── */
+  KEY_SHIFT_UP = 1170,
+  KEY_SHIFT_DOWN,
+  KEY_SHIFT_LEFT,
+  KEY_SHIFT_RIGHT,
+
   /* ── Mouse events (coordinates in g_mouse_x / g_mouse_y) ── */
   KEY_MOUSE_LEFT = 1200,
   KEY_MOUSE_RIGHT,
