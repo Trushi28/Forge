@@ -16,15 +16,20 @@ use crypto::{ContactBook, Identity};
 use peer::PeerRuntime;
 use transfer::FilePool;
 
-const SOCKET_PATH: &str = "/tmp/forge-net.sock";
-const TRANSFER_PORT: u16 = 9877;
 
 #[tokio::main]
 async fn main() {
     eprintln!("forge-net v0.1 starting...");
 
-    // Clean up old socket
-    let _ = std::fs::remove_file(SOCKET_PATH);
+    // The control socket lives in the per-user config dir (not world-writable /tmp).
+    let net_dir = net_config_dir();
+    let _ = std::fs::create_dir_all(&net_dir);
+    let sock = socket_path();
+    if tokio::net::UnixStream::connect(&sock).await.is_ok() {
+        eprintln!("forge-net: already running on {}", sock.display());
+        return;
+    }
+    let _ = std::fs::remove_file(&sock);
 
     // Initialize guild state and load config
     let guild_state = Arc::new(Mutex::new(guild::GuildState::new()));
@@ -36,7 +41,6 @@ async fn main() {
     // Initialize shared state
     let file_pool = Arc::new(Mutex::new(FilePool::new()));
     let collab_mgr = Arc::new(Mutex::new(CollabManager::new()));
-    let net_dir = net_config_dir();
     let identity = match Identity::load_or_create(&net_dir) {
         Ok(identity) => Arc::new(identity),
         Err(e) => {
@@ -88,13 +92,8 @@ async fn main() {
         }
     });
 
-    // Start file transfer listener in background
-    let fp = file_pool.clone();
-    tokio::spawn(async move {
-        if let Err(e) = transfer::listen_for_transfers(TRANSFER_PORT, fp).await {
-            eprintln!("forge-net: transfer listener error: {}", e);
-        }
-    });
+    // NOTE: the old plaintext file-transfer listener was removed: it accepted
+    // unauthenticated files. Files travel as encrypted FILE_OFFER peer messages.
 
     // Start encrypted peer listener in background
     let peer_runtime = PeerRuntime {
@@ -114,10 +113,10 @@ async fn main() {
     });
 
     // Listen for connections from the C editor
-    let listener = match UnixListener::bind(SOCKET_PATH) {
+    let listener = match UnixListener::bind(&sock) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("forge-net: failed to bind socket {}: {}", SOCKET_PATH, e);
+            eprintln!("forge-net: failed to bind socket {}: {}", sock.display(), e);
             return;
         }
     };
@@ -126,10 +125,10 @@ async fn main() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(SOCKET_PATH, std::fs::Permissions::from_mode(0o666));
+        let _ = std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600));
     }
 
-    eprintln!("forge-net: listening on {}", SOCKET_PATH);
+    eprintln!("forge-net: listening on {}", sock.display());
 
     // Handle graceful shutdown
     let shutdown = tokio::signal::ctrl_c();
@@ -158,11 +157,15 @@ async fn main() {
             }
             _ = &mut shutdown => {
                 eprintln!("forge-net: shutting down...");
-                let _ = std::fs::remove_file(SOCKET_PATH);
+                let _ = std::fs::remove_file(&sock);
                 break;
             }
         }
     }
+}
+
+fn socket_path() -> PathBuf {
+    net_config_dir().join("forge-net.sock")
 }
 
 fn net_config_dir() -> PathBuf {

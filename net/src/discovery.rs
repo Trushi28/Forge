@@ -53,7 +53,7 @@ pub async fn run_discovery(
     eprintln!("forge-net: scanning for peers on LAN...");
 
     loop {
-        match receiver.recv() {
+        match receiver.recv_async().await {
             Ok(event) => {
                 match event {
                     ServiceEvent::ServiceResolved(info) => {

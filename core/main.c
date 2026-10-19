@@ -14,6 +14,7 @@
 #include "ui.h"
 #include "undo.h"
 #include <signal.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -109,6 +110,9 @@ typedef struct {
   bool search_found;
 
   /* Collaboration state */
+  char *collab_snapshot;      /* our buffer text at :collab time (initiator) */
+  char *collab_incoming;      /* initiator's document (responder)            */
+  size_t collab_incoming_len;
   bool collab_active;
   int  collab_session_id;
   char collab_peer[64];
@@ -331,6 +335,19 @@ static long ms_since(struct timespec *since) {
 
 /* ── Small JSON helpers for forge-net IPC messages ─────────── */
 
+static int hex4(const char *s) {
+  int v = 0;
+  for (int k = 0; k < 4; k++) {
+    char c = s[k];
+    v <<= 4;
+    if (c >= '0' && c <= '9') v |= c - '0';
+    else if (c >= 'a' && c <= 'f') v |= c - 'a' + 10;
+    else if (c >= 'A' && c <= 'F') v |= c - 'A' + 10;
+    else return -1;
+  }
+  return v;
+}
+
 static bool json_get_string(const char *json, const char *key, char *out,
                             size_t out_sz) {
   if (!json || !key || !out || out_sz == 0)
@@ -352,13 +369,110 @@ static bool json_get_string(const char *json, const char *key, char *out,
   p++;
 
   size_t n = 0;
-  while (*p && *p != '"' && n + 1 < out_sz) {
-    if (*p == '\\' && p[1])
+  while (*p && *p != '"' && n + 4 < out_sz) {
+    if (*p == '\\' && p[1]) {
       p++;
-    out[n++] = *p++;
+      switch (*p) {
+      case 'n': out[n++] = '\n'; p++; break;
+      case 't': out[n++] = '\t'; p++; break;
+      case 'r': out[n++] = '\r'; p++; break;
+      case 'b': out[n++] = '\b'; p++; break;
+      case 'f': out[n++] = '\f'; p++; break;
+      case 'u': {
+        int cp = hex4(p + 1);
+        if (cp < 0) { out[n++] = 'u'; p++; break; }
+        p += 5;
+        if (cp < 0x80) out[n++] = (char)cp;
+        else if (cp < 0x800) {
+          out[n++] = (char)(0xC0 | (cp >> 6));
+          out[n++] = (char)(0x80 | (cp & 0x3F));
+        } else if (cp >= 0xD800 && cp < 0xE000) {
+          out[n++] = '?'; /* lone surrogate */
+        } else {
+          out[n++] = (char)(0xE0 | (cp >> 12));
+          out[n++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+          out[n++] = (char)(0x80 | (cp & 0x3F));
+        }
+        break;
+      }
+      default: out[n++] = *p++; break;
+      }
+    } else {
+      out[n++] = *p++;
+    }
   }
   out[n] = '\0';
   return true;
+}
+
+static bool json_get_bool(const char *json, const char *key, bool *out) {
+  char pattern[96];
+  snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+  const char *p = strstr(json, pattern);
+  if (!p || !(p = strchr(p + strlen(pattern), ':')))
+    return false;
+  p++;
+  while (*p == ' ')
+    p++;
+  if (strncmp(p, "true", 4) == 0) { *out = true; return true; }
+  if (strncmp(p, "false", 5) == 0) { *out = false; return true; }
+  return false;
+}
+
+/* ── Escaped JSON builder for IPC messages ──────────────────────
+   ipc_send_kv("CHAT_SEND", "guild", "", "text", s, NULL)          */
+typedef struct { char *p; size_t len, cap; } Str;
+
+static bool str_put(Str *s, const char *d, size_t n) {
+  if (s->len + n + 1 > s->cap) {
+    size_t nc = s->cap ? s->cap : 256;
+    while (s->len + n + 1 > nc) nc *= 2;
+    char *np = realloc(s->p, nc);
+    if (!np) return false;
+    s->p = np;
+    s->cap = nc;
+  }
+  memcpy(s->p + s->len, d, n);
+  s->len += n;
+  s->p[s->len] = '\0';
+  return true;
+}
+
+static bool str_put_esc(Str *s, const char *d) {
+  for (; *d; d++) {
+    unsigned char c = (unsigned char)*d;
+    char t[8];
+    if (c == '"' || c == '\\') {
+      t[0] = '\\'; t[1] = (char)c;
+      if (!str_put(s, t, 2)) return false;
+    } else if (c == '\n') { if (!str_put(s, "\\n", 2)) return false; }
+    else if (c == '\t') { if (!str_put(s, "\\t", 2)) return false; }
+    else if (c == '\r') { if (!str_put(s, "\\r", 2)) return false; }
+    else if (c < 0x20) {
+      int n = snprintf(t, sizeof t, "\\u%04x", c);
+      if (!str_put(s, t, (size_t)n)) return false;
+    } else if (!str_put(s, d, 1)) return false;
+  }
+  return true;
+}
+
+static bool ipc_send_kv(const char *type, ...) {
+  Str s = {0};
+  bool ok = str_put(&s, "{\"type\":\"", 9) && str_put_esc(&s, type) &&
+            str_put(&s, "\"", 1);
+  va_list ap;
+  va_start(ap, type);
+  for (const char *k; ok && (k = va_arg(ap, const char *));) {
+    const char *v = va_arg(ap, const char *);
+    ok = str_put(&s, ",\"", 2) && str_put_esc(&s, k) &&
+         str_put(&s, "\":\"", 3) && str_put_esc(&s, v ? v : "") &&
+         str_put(&s, "\"", 1);
+  }
+  va_end(ap);
+  ok = ok && str_put(&s, "}", 1);
+  ok = ok && s.len <= IPC_MAX_MSG_SZ && ipc_send(&E.ipc, s.p, (int)s.len);
+  free(s.p);
+  return ok;
 }
 
 static bool json_get_int(const char *json, const char *key, int *out) {
@@ -1035,9 +1149,9 @@ static void cmd_guild_share(void *ctx) {
     return;
   }
   long file_len = ftell(f);
-  if (file_len < 0 || file_len > 10 * 1024 * 1024) {
+  if (file_len < 0 || file_len > 700 * 1024) { /* IPC frames are capped at 1MB (+33% base64) */
     fclose(f);
-    render_set_status(&E.render, "Share limit is 10MB");
+    render_set_status(&E.render, "Share limit is 700KB");
     return;
   }
   rewind(f);
@@ -1137,7 +1251,19 @@ static void handle_guild_command(const char *cmd) {
       int len = snprintf(json, sizeof(json),
           "{\"type\":\"COLLAB_ACCEPT\",\"session_id\":%d}", E.collab_session_id);
       ipc_send(&E.ipc, json, len);
+      if (E.collab_incoming) {
+        Buffer *nb = buffer_new(E.collab_incoming, E.collab_incoming_len);
+        save_active_buffer();
+        int gi = add_buffer(nb, NULL);
+        if (gi >= 0) {
+          load_buffer(gi);
+          if (g_plugin_ctx) g_plugin_ctx->buf = E.buf;
+        } else {
+          buffer_free(nb);
+        }
+      }
       E.collab_active = true;
+      E.render.full_redraw = true;
       render_set_status(&E.render, "✦ COLLAB — accepted session with %s", E.collab_peer);
     } else {
       render_set_status(&E.render, "No pending collab request");
@@ -1148,15 +1274,21 @@ static void handle_guild_command(const char *cmd) {
   if (strncmp(cmd, ":collab ", 8) == 0) {
     const char *peer = cmd + 8;
     while (*peer == ' ') peer++;
-    if (*peer && E.ipc.connected) {
-      char json[512];
-      int len = snprintf(json, sizeof(json),
-          "{\"type\":\"COLLAB_START\",\"peer\":\"%s\",\"file\":\"%s\"}",
-          peer, E.filepath ? E.filepath : "");
-      ipc_send(&E.ipc, json, len);
-      render_set_status(&E.render, "Collab request sent to %s", peer);
-    } else if (!E.ipc.connected) {
+    if (!E.ipc.connected) {
       render_set_status(&E.render, "Not connected to forge-net");
+    } else if (*peer) {
+      char *text = buffer_get_text(E.buf);
+      if (text && strlen(text) < 700 * 1024 &&
+          ipc_send_kv("COLLAB_START", "peer", peer, "file",
+                      E.filepath ? E.filepath : "", "text", text, NULL)) {
+        free(E.collab_snapshot);
+        E.collab_snapshot = text;
+        render_set_status(&E.render, "Collab request sent to %s", peer);
+      } else {
+        free(text);
+        render_set_status(&E.render,
+                          "Collab: buffer too large (700KB) or send failed");
+      }
     }
     return;
   }
@@ -1178,10 +1310,7 @@ static void handle_guild_command(const char *cmd) {
     /* :grab <peer> <file> */
     char peer[64] = "", file[128] = "";
     if (sscanf(cmd + 6, "%63s %127s", peer, file) >= 2 && E.ipc.connected) {
-      char json[512];
-      int len = snprintf(json, sizeof(json),
-          "{\"type\":\"FILE_GRAB\",\"from\":\"%s\",\"name\":\"%s\"}", peer, file);
-      ipc_send(&E.ipc, json, len);
+      ipc_send_kv("FILE_GRAB", "from", peer, "name", file, NULL);
       render_set_status(&E.render, "Grabbing %s from %s...", file, peer);
     } else {
       render_set_status(&E.render, "Usage: :grab <peer> <file>");
@@ -1193,10 +1322,7 @@ static void handle_guild_command(const char *cmd) {
     const char *file = cmd + 6;
     while (*file == ' ') file++;
     if (*file && E.ipc.connected) {
-      char json[512];
-      int len = snprintf(json, sizeof(json),
-          "{\"type\":\"FILE_DROP\",\"name\":\"%s\"}", file);
-      ipc_send(&E.ipc, json, len);
+      ipc_send_kv("FILE_DROP", "name", file, NULL);
       render_set_status(&E.render, "Dropped: %s", file);
     }
     return;
@@ -1222,10 +1348,7 @@ static void handle_guild_command(const char *cmd) {
     const char *text = cmd + 6;
     while (*text == ' ') text++;
     if (*text && E.ipc.connected) {
-      char json[1024];
-      int len = snprintf(json, sizeof(json),
-          "{\"type\":\"CHAT_SEND\",\"guild\":\"\",\"text\":\"%s\"}", text);
-      ipc_send(&E.ipc, json, len);
+      ipc_send_kv("CHAT_SEND", "guild", "", "text", text, NULL);
       render_set_status(&E.render, "Chat: %s", text);
     }
     return;
@@ -1311,6 +1434,12 @@ static void handle_net_message(const char *msg) {
     json_get_int(msg, "session_id", &session_id);
     E.collab_session_id = session_id;
     snprintf(E.collab_peer, sizeof(E.collab_peer), "%s", from);
+    free(E.collab_incoming);
+    E.collab_incoming = malloc(strlen(msg) + 1);
+    E.collab_incoming_len = 0;
+    if (E.collab_incoming &&
+        json_get_string(msg, "initial_text", E.collab_incoming, strlen(msg) + 1))
+      E.collab_incoming_len = strlen(E.collab_incoming);
     snprintf(E.guild_last_event, sizeof(E.guild_last_event),
              "Collab request from %s on %s — :collab_accept to join", from, file);
     render_set_status(&E.render, "%s", E.guild_last_event);
@@ -1321,6 +1450,15 @@ static void handle_net_message(const char *msg) {
     char peer[64];
     json_get_int(msg, "session_id", &session_id);
     json_get_string(msg, "peer", peer, sizeof(peer));
+    char *cur_text = buffer_get_text(E.buf);
+    bool same = E.collab_snapshot && cur_text && strcmp(cur_text, E.collab_snapshot) == 0;
+    free(cur_text);
+    if (!same) {
+      render_set_status(&E.render,
+                        "Collab: buffer changed since request — run :collab again");
+      E.render.full_redraw = true;
+      return;
+    }
     E.collab_active = true;
     E.collab_session_id = session_id;
     snprintf(E.collab_peer, sizeof(E.collab_peer), "%s", peer);
@@ -1353,8 +1491,8 @@ static void handle_net_message(const char *msg) {
         E.collab_peer_cursor_line = peer_row;
         E.collab_peer_cursor_col = peer_col;
         /* Check for "is_insert" (simple string check for "true") */
-        const char *p = strstr(op_json, "\"is_insert\"");
-        bool is_insert = (p && strstr(p, "true"));
+        bool is_insert = false;
+        json_get_bool(op_json, "is_insert", &is_insert);
         if (is_insert && text[0]) {
           buffer_insert(E.buf, (size_t)pos, text, (int)strlen(text));
           /* Adjust cursor if insertion is before our position */
@@ -1380,6 +1518,7 @@ static void handle_net_message(const char *msg) {
             E.cx = new_col;
           }
         }
+        mark_modified();
         E.render.full_redraw = true;
         render_set_status(&E.render, "✦ COLLAB — remote edit from %s", E.collab_peer);
       }
@@ -1399,49 +1538,39 @@ static void handle_net_message(const char *msg) {
       }
     }
   } else if (strcmp(type, "FILE_RECEIVED") == 0) {
-    char from[64], name[128], data_b64[1024 * 1024];
+    char from[64] = "", name[128] = "";
     int size = 0;
     json_get_string(msg, "from", from, sizeof(from));
     json_get_string(msg, "name", name, sizeof(name));
     json_get_int(msg, "size", &size);
-    /* If data_b64 is present, decode and open the file */
-    if (json_get_string(msg, "data_b64", data_b64, sizeof(data_b64)) && data_b64[0]) {
-      size_t decoded_len = 0;
-      unsigned char *decoded = base64_decode_bytes(data_b64, &decoded_len);
-      if (decoded && decoded_len > 0) {
-        /* Write to a temp file and open it */
-        char tmppath[512];
-        snprintf(tmppath, sizeof(tmppath), "/tmp/forge_grab_%s", name);
-        FILE *f = fopen(tmppath, "wb");
-        if (f) {
-          fwrite(decoded, 1, decoded_len, f);
-          fclose(f);
-          /* Open grabbed file as a new buffer in the multi-buffer list */
-          Buffer *grabbed = load_file(tmppath);
-          save_active_buffer();
-          int grab_idx = add_buffer(grabbed, NULL);
-          if (grab_idx >= 0) {
-            load_buffer(grab_idx);
-            if (g_plugin_ctx) g_plugin_ctx->buf = E.buf;
-          } else {
-            /* Fallback: replace current buffer */
-            buffer_free(E.buf);
-            E.buf = grabbed;
-            E.buffers[E.active_buf].buf = E.buf;
-            E.filepath = NULL;
-            E.cx = 0;
-            E.cy = 0;
-          }
+    size_t mlen = strlen(msg);
+    char *b64 = malloc(mlen + 1);
+    if (b64 && json_get_string(msg, "data_b64", b64, mlen + 1) && b64[0]) {
+      size_t dlen = 0;
+      unsigned char *dec = base64_decode_bytes(b64, &dlen);
+      if (dec) {
+        /* Straight into a scratch buffer: no temp file, no stack array. */
+        Buffer *grabbed = buffer_new((const char *)dec, dlen);
+        save_active_buffer();
+        int gi = add_buffer(grabbed, NULL);
+        if (gi >= 0) {
+          load_buffer(gi);
+          if (g_plugin_ctx) g_plugin_ctx->buf = E.buf;
           E.modified = false;
-          render_set_status(&E.render, "Grabbed: %s from %s (%zu bytes)", name, from, decoded_len);
+          render_set_status(&E.render, "Grabbed: %s from %s (%zu bytes)", name,
+                            from, dlen);
+        } else {
+          buffer_free(grabbed);
+          render_set_status(&E.render, "Too many open buffers to open %s", name);
         }
-        free(decoded);
+        free(dec);
       }
     } else {
       snprintf(E.guild_last_event, sizeof(E.guild_last_event),
                "File from %s: %s (%d bytes)", from, name, size);
       render_set_status(&E.render, "%s", E.guild_last_event);
     }
+    free(b64);
     E.render.full_redraw = true;
   } else if (strcmp(type, "INVITE_CREATED") == 0) {
     char fp[128];
@@ -2407,6 +2536,7 @@ int main(int argc, char **argv) {
   session_arena = arena_new(1024 * 1024 * 16);
 
   signal(SIGWINCH, sigwinch_handler);
+  signal(SIGPIPE, SIG_IGN); /* dead LSP server / forge-net must not kill the editor */
   input_enable_raw_mode();
   input_enable_mouse();
 
@@ -3831,6 +3961,8 @@ int main(int argc, char **argv) {
   plugin_host_free(&E.plugins);
   fs_vm_free(&E.scripts);
   ipc_free(&E.ipc);
+  free(E.collab_snapshot);
+  free(E.collab_incoming);
   if (E.config_inotify_fd != -1) {
     if (E.config_watch_fd != -1) {
       inotify_rm_watch(E.config_inotify_fd, E.config_watch_fd);

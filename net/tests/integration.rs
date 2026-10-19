@@ -224,7 +224,7 @@ fn test_ipc_incoming_msg_deserialization() {
     let json = r#"{"type":"COLLAB_START","peer":"alice","file":"main.c"}"#;
     let msg: IncomingMsg = serde_json::from_str(json).unwrap();
     match msg {
-        IncomingMsg::CollabStart { peer, file } => {
+        IncomingMsg::CollabStart { peer, file, .. } => {
             assert_eq!(peer, "alice");
             assert_eq!(file, "main.c");
         }
@@ -357,4 +357,116 @@ fn test_guild_pings() {
     assert_eq!(ping.line, 42);
 
     assert_eq!(gs.pending_pings.len(), 1);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Regression tests for the collab handshake and the crypto nonce
+// ═══════════════════════════════════════════════════════════════
+
+#[test]
+fn test_collab_responder_session_syncs_initial_text() {
+    // Initiator and responder start from the same document text, so ops converge.
+    let peer = make_peer("peer");
+    let mut a = CollabManager::new();
+    let mut b = CollabManager::new();
+    let id = a.create_session("f.c", &peer, "hello");
+    // Responder-side session is created from the request (Pending until accepted).
+    b.accept_session(id, "f.c", &peer, "hello");
+    assert_eq!(b.get_session(id).unwrap().state, SessionState::Pending);
+    b.get_session(id).unwrap().accept();
+    assert!(b.active_sessions().contains(&id));
+
+    let op = a.get_session(id).unwrap().local_insert(5, '!');
+    let (pos, is_insert, len) = b.get_session(id).unwrap().apply_remote_get_edit(&op);
+    assert_eq!((pos, is_insert, len), (5, true, 1));
+    assert_eq!(b.get_session(id).unwrap().text(), "hello!");
+}
+
+#[test]
+fn test_crypto_nonce_not_reused_across_sessions() {
+    use forge_net::crypto::Identity;
+    let dir_a = std::env::temp_dir().join(format!("forge-test-a-{}", std::process::id()));
+    let dir_b = std::env::temp_dir().join(format!("forge-test-b-{}", std::process::id()));
+    let a = Identity::load_or_create(&dir_a).unwrap();
+    let b = Identity::load_or_create(&dir_b).unwrap();
+
+    // Two separate connections (= two fresh sessions) sending their first message.
+    let f1 = a.session(&b.public_key_b64()).unwrap().encrypt(b"one").unwrap();
+    let f2 = a.session(&b.public_key_b64()).unwrap().encrypt(b"two").unwrap();
+    assert_ne!(f1.nonce_b64, f2.nonce_b64, "(key, nonce) must never repeat");
+
+    // And the other side can still decrypt.
+    let rx = b.session(&a.public_key_b64()).unwrap();
+    assert_eq!(rx.decrypt(&f1).unwrap(), b"one");
+    assert_eq!(rx.decrypt(&f2).unwrap(), b"two");
+    let _ = std::fs::remove_dir_all(dir_a);
+    let _ = std::fs::remove_dir_all(dir_b);
+}
+
+#[test]
+fn test_ipc_collab_start_text_is_optional() {
+    let msg: IncomingMsg =
+        serde_json::from_str(r#"{"type":"COLLAB_START","peer":"a","file":"f","text":"x\ny"}"#).unwrap();
+    match msg {
+        IncomingMsg::CollabStart { text, .. } => assert_eq!(text, "x\ny"),
+        _ => panic!(),
+    }
+    let old: IncomingMsg = serde_json::from_str(r#"{"type":"COLLAB_START","peer":"a","file":"f"}"#).unwrap();
+    assert!(matches!(old, IncomingMsg::CollabStart { .. }));
+}
+
+// ═══════════════════════════════════════════════════════════════
+// End-to-end: the IPC connection handler must keep answering after chat
+// ═══════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn test_ipc_chat_does_not_deadlock_daemon() {
+    use forge_net::crypto::{ContactBook, Identity};
+    use forge_net::peer::PeerRuntime;
+    use forge_net::transfer::FilePool;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::{broadcast, Mutex};
+
+    let dir = std::env::temp_dir().join(format!("forge-test-ipc-{}", std::process::id()));
+    let guild_state = Arc::new(Mutex::new(GuildState::new()));
+    let file_pool = Arc::new(Mutex::new(FilePool::new()));
+    let collab_mgr = Arc::new(Mutex::new(CollabManager::new()));
+    let (events, _) = broadcast::channel(16);
+    let rt = PeerRuntime {
+        identity: Arc::new(Identity::load_or_create(&dir).unwrap()),
+        contacts: Arc::new(Mutex::new(ContactBook::load(&dir).unwrap())),
+        guild_state: guild_state.clone(),
+        file_pool: file_pool.clone(),
+        collab_mgr: collab_mgr.clone(),
+        events: events.clone(),
+        listen_port: 0,
+    };
+
+    let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
+    tokio::spawn(forge_net::ipc::handle_connection(
+        server, guild_state, file_pool, collab_mgr, rt, events,
+    ));
+
+    async fn send(c: &mut tokio::net::UnixStream, json: &str) {
+        c.write_all(&(json.len() as u32).to_be_bytes()).await.unwrap();
+        c.write_all(json.as_bytes()).await.unwrap();
+    }
+    async fn recv(c: &mut tokio::net::UnixStream) -> String {
+        let mut h = [0u8; 4];
+        c.read_exact(&mut h).await.unwrap();
+        let mut b = vec![0u8; u32::from_be_bytes(h) as usize];
+        c.read_exact(&mut b).await.unwrap();
+        String::from_utf8(b).unwrap()
+    }
+
+    // A chat (with quotes/backslashes) followed by STATUS: before the fix the
+    // broadcast() call deadlocked on guild_state and STATUS was never answered.
+    send(&mut client, r#"{"type":"CHAT_SEND","guild":"","text":"say \"hi\" \\ ok"}"#).await;
+    send(&mut client, r#"{"type":"STATUS"}"#).await;
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(3), recv(&mut client))
+        .await
+        .expect("daemon deadlocked after CHAT_SEND");
+    assert!(resp.contains("STATUS_RESP"), "{resp}");
+    let _ = std::fs::remove_dir_all(dir);
 }

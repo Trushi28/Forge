@@ -35,6 +35,9 @@ pub struct PlainHello {
     pub guild: String,
     pub public_key_b64: String,
     pub fingerprint: String,
+    /// Port the sender listens on (the connection's source port is ephemeral).
+    #[serde(default)]
+    pub port: u16,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -210,6 +213,7 @@ impl PeerRuntime {
             guild: gs.guild_name.clone(),
             public_key_b64: self.identity.public_key_b64(),
             fingerprint: self.identity.fingerprint(),
+            port: self.listen_port,
         }
     }
 
@@ -266,14 +270,25 @@ async fn handle_inbound(
     let remote: PlainHello = read_json(&mut stream, MAX_PLAIN_FRAME).await?;
     let hello = runtime.local_hello().await;
     write_json(&mut stream, &hello, MAX_PLAIN_FRAME).await?;
-    runtime.verify_remote(&remote, Some(addr.clone())).await?;
+    // `addr` is the connection's source address (ephemeral port). Reply to the
+    // peer's advertised listen port instead, or later sends to it would fail.
+    let peer_addr = match (addr.parse::<std::net::SocketAddr>(), remote.port) {
+        (Ok(a), p) if p != 0 => std::net::SocketAddr::new(a.ip(), p).to_string(),
+        _ => String::new(),
+    };
+    runtime
+        .verify_remote(
+            &remote,
+            if peer_addr.is_empty() { None } else { Some(peer_addr.clone()) },
+        )
+        .await?;
 
     {
         let mut gs = runtime.guild_state.lock().await;
         gs.add_or_update_peer(
             remote.handle.clone(),
             remote.guild.clone(),
-            addr,
+            peer_addr,
             String::new(),
         );
     }
@@ -367,21 +382,38 @@ async fn handle_peer_msg(msg: PeerMsg, runtime: &PeerRuntime) {
             session_id,
             from,
             file,
-            initial_text: _,
+            initial_text,
         } => {
+            // Create the responder-side session now; without it, accepting later
+            // found no session and nothing was ever sent back.
+            let peer = runtime.guild_state.lock().await.find_peer(&from).cloned();
+            if let Some(peer) = peer {
+                runtime
+                    .collab_mgr
+                    .lock()
+                    .await
+                    .accept_session(session_id, &file, &peer, &initial_text);
+            }
             let _ = runtime.events.send(OutgoingMsg::CollabRequest {
                 session_id,
                 from,
                 file,
+                initial_text,
             });
         }
         PeerMsg::CollabAccept { session_id, from } => {
+            if let Some(s) = runtime.collab_mgr.lock().await.get_session(session_id) {
+                s.accept();
+            }
             let _ = runtime.events.send(OutgoingMsg::CollabAccepted {
                 session_id,
                 peer: from,
             });
         }
         PeerMsg::CollabDecline { session_id, from } => {
+            if let Some(s) = runtime.collab_mgr.lock().await.get_session(session_id) {
+                s.close();
+            }
             let _ = runtime.events.send(OutgoingMsg::CollabDeclined {
                 session_id,
                 peer: from,
@@ -396,17 +428,23 @@ async fn handle_peer_msg(msg: PeerMsg, runtime: &PeerRuntime) {
             let mut cm = runtime.collab_mgr.lock().await;
             let mut edit_info = None;
             if let Some(session) = cm.get_session(session_id) {
-                if let Ok(op) = serde_json::from_str(&op_json) {
+                if let Ok(op) = serde_json::from_str::<crate::crdt::CrdtOp>(&op_json) {
                     let (pos, is_insert, text_len) = session.apply_remote_get_edit(&op);
-                    // Build a simple position-annotated op_json for the C editor
-                    let annotated = format!(
-                        "{{\"pos\":{},\"is_insert\":{},\"text_len\":{},\"raw\":{}}}",
-                        pos,
-                        if is_insert { "true" } else { "false" },
-                        text_len,
-                        op_json
+                    // Position-annotated op for the C editor, including the inserted
+                    // text (the editor reads "text"; it used to be missing).
+                    let text = match &op {
+                        crate::crdt::CrdtOp::Insert { value, .. } => value.to_string(),
+                        _ => String::new(),
+                    };
+                    edit_info = Some(
+                        serde_json::json!({
+                            "pos": pos,
+                            "is_insert": is_insert,
+                            "text_len": text_len,
+                            "text": text,
+                        })
+                        .to_string(),
                     );
-                    edit_info = Some(annotated);
                 }
             }
             drop(cm);

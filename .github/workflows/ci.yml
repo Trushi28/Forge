@@ -39,6 +39,9 @@ jobs:
     - name: Run C core tests
       run: make test WITH_GIT=1
 
+    - name: Run sanitizer tests (buffer fuzz, IPC, LSP JSON)
+      run: make fuzz
+
     # ── Build plugins ──────────────────────────────────────────
     - name: Build plugins
       run: make plugins

@@ -5,7 +5,7 @@ use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use hkdf::Hkdf;
-use rand_core::OsRng;
+use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -69,7 +69,6 @@ pub struct Invite {
 pub struct CryptoSession {
     tx: XChaCha20Poly1305,
     rx: XChaCha20Poly1305,
-    send_counter: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -148,7 +147,6 @@ impl Identity {
         Ok(CryptoSession {
             tx: XChaCha20Poly1305::new(Key::from_slice(tx_key)),
             rx: XChaCha20Poly1305::new(Key::from_slice(rx_key)),
-            send_counter: 0,
         })
     }
 }
@@ -260,9 +258,11 @@ impl Invite {
 
 impl CryptoSession {
     pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<EncryptedFrame, String> {
+        // A fresh CryptoSession is built per connection with the same static-static
+        // key, so a counter nonce restarted at 0 every time => (key, nonce) reuse.
+        // XChaCha20's 192-bit nonce is meant to be random.
         let mut nonce = [0u8; 24];
-        nonce[..8].copy_from_slice(&self.send_counter.to_be_bytes());
-        self.send_counter = self.send_counter.saturating_add(1);
+        OsRng.fill_bytes(&mut nonce);
         let body = self
             .tx
             .encrypt(XNonce::from_slice(&nonce), plaintext)

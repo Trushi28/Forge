@@ -5,53 +5,47 @@
 #include <stddef.h>
 #include <sys/types.h>
 
-/* ── IPC Bridge — C ↔ forge-net (Rust) via Unix socket ────── */
+/* ── IPC Bridge — C ↔ forge-net (Rust) via Unix socket ──────
+   Socket lives at $HOME/.config/forge/net/forge-net.sock (mode 0600),
+   NOT in world-writable /tmp.  forge-net must use the same path.   */
 
-#define IPC_SOCKET_PATH "/tmp/forge-net.sock"
-#define IPC_READ_BUF_SZ 65536
-#define IPC_MAX_MSG_SZ  (1024 * 1024)
+#define IPC_READ_BUF_INIT 65536
+#define IPC_MAX_MSG_SZ    (1024 * 1024)
 
 typedef struct {
     int    fd;              /* socket file descriptor (-1 = disconnected) */
     bool   connected;
-    char   read_buf[IPC_READ_BUF_SZ];
+    char  *read_buf;        /* grows up to IPC_MAX_MSG_SZ + 4 */
     int    read_len;
+    int    read_cap;
 
     /* forge-net process management */
     pid_t  net_pid;         /* PID of forge-net child process (-1 = not started) */
     int    reconnect_timer; /* countdown frames until next reconnect attempt */
+    int    spawn_failures;  /* consecutive early exits of the spawned child */
 } IPCBridge;
 
-/* Initialize the bridge (does not connect) */
+/* Fill `out` with the socket path. */
+void ipc_socket_path(char *out, size_t out_sz);
+
 void ipc_init(IPCBridge *ipc);
-
-/* Try to connect to the forge-net socket. Returns true on success. */
 bool ipc_connect(IPCBridge *ipc);
-
-/* Disconnect */
 void ipc_disconnect(IPCBridge *ipc);
 
-/* Send a length-prefixed JSON message */
+/* Send a length-prefixed JSON message (handles partial writes, no SIGPIPE). */
 bool ipc_send(IPCBridge *ipc, const char *json, int len);
 
-/* Non-blocking poll: read any available data.
-   Returns number of complete messages available. */
+/* Non-blocking poll: drain the socket. Returns complete messages buffered. */
 int ipc_poll(IPCBridge *ipc);
 
-/* Extract and return a complete JSON message from the read buffer.
-   Caller must free() the returned string.
-   Returns NULL if no complete message is available. */
+/* Pop one complete message (malloc'd, caller frees) or NULL. */
 char *ipc_read_message(IPCBridge *ipc);
 
-/* Attempt periodic reconnection (call every N frames).
-   Also auto-spawns forge-net if not running. */
+/* Periodic reconnect; connects to an already-running forge-net first and
+   only spawns one if none answers. Call once per frame. */
 bool ipc_try_connect(IPCBridge *ipc);
 
-/* Spawn the forge-net binary as a child process.
-   Returns true if spawned successfully. */
 bool ipc_spawn_net(IPCBridge *ipc);
-
-/* Free resources and kill forge-net if we spawned it */
 void ipc_free(IPCBridge *ipc);
 
 #endif

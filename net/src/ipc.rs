@@ -32,7 +32,12 @@ pub enum IncomingMsg {
     TrustAccept { handle: String, fingerprint: String },
 
     #[serde(rename = "COLLAB_START")]
-    CollabStart { peer: String, file: String },
+    CollabStart {
+        peer: String,
+        file: String,
+        #[serde(default)]
+        text: String,
+    },
 
     #[serde(rename = "COLLAB_ACCEPT")]
     CollabAccept { session_id: u64 },
@@ -110,6 +115,7 @@ pub enum OutgoingMsg {
         session_id: u64,
         from: String,
         file: String,
+        initial_text: String,
     },
 
     #[serde(rename = "COLLAB_ACCEPTED")]
@@ -199,8 +205,21 @@ pub async fn handle_connection(
     peer_runtime: PeerRuntime,
     events: broadcast::Sender<OutgoingMsg>,
 ) -> Result<(), IpcError> {
-    let (mut reader, mut writer) = stream.into_split();
+    let (reader, mut writer) = stream.into_split();
     let mut event_rx = events.subscribe();
+
+    // read_message() is not cancel-safe: if a broadcast event won the select!
+    // race, a half-read frame would be dropped and the stream desynchronised.
+    // Read in its own task and select on the (cancel-safe) channel instead.
+    let (in_tx, mut in_rx) = tokio::sync::mpsc::channel::<String>(64);
+    tokio::spawn(async move {
+        let mut reader = reader;
+        while let Ok(json) = read_message(&mut reader).await {
+            if in_tx.send(json).await.is_err() {
+                break;
+            }
+        }
+    });
 
     loop {
         let json = tokio::select! {
@@ -214,9 +233,9 @@ pub async fn handle_connection(
                     Err(broadcast::error::RecvError::Closed) => return Ok(()),
                 }
             }
-            read = read_message(&mut reader) => match read {
-                Ok(j) => j,
-                Err(_) => return Ok(()),
+            read = in_rx.recv() => match read {
+                Some(j) => j,
+                None => return Ok(()),
             },
         };
 
@@ -267,12 +286,15 @@ pub async fn handle_connection(
             IncomingMsg::ChatSend { guild: _, text } => {
                 let mut gs = guild_state.lock().await;
                 let handle = gs.my_handle.clone();
-                gs.add_chat_message(handle, text.clone());
+                gs.add_chat_message(handle.clone(), text.clone());
                 drop(gs);
 
+                // NB: never lock guild_state inside the argument list of a call that
+                // itself locks it: the temporary guard lives until the end of the
+                // statement, so broadcast() below used to deadlock the whole daemon.
                 peer_runtime
                     .broadcast(PeerMsg::Chat {
-                        from: peer_runtime.guild_state.lock().await.my_handle.clone(),
+                        from: handle,
                         text: text.clone(),
                     })
                     .await;
@@ -296,44 +318,46 @@ pub async fn handle_connection(
                 }
             }
 
-            IncomingMsg::CollabStart { peer, file } => {
+            IncomingMsg::CollabStart { peer, file, text } => {
                 let gs = guild_state.lock().await;
                 if let Some(peer_info) = gs.find_peer(&peer) {
                     let my_handle = gs.my_handle.clone();
-                    let mut cm = collab_mgr.lock().await;
-                    let session_id = cm.create_session(&file, peer_info, "");
+                    let session_id = collab_mgr
+                        .lock()
+                        .await
+                        .create_session(&file, peer_info, &text);
+                    drop(gs);
                     eprintln!(
                         "forge-net: started collab session {} with {} on {}",
                         session_id, peer, file
                     );
-                    drop(cm);
-                    drop(gs);
-
                     let _ = peer_runtime
                         .send_to_handle(
                             &peer,
                             PeerMsg::CollabRequest {
                                 session_id,
                                 from: my_handle,
-                                file: file.clone(),
-                                initial_text: String::new(),
+                                file,
+                                initial_text: text,
                             },
                         )
                         .await;
-
-                    // Notify the editor
-                    let resp = OutgoingMsg::CollabRequest {
-                        session_id,
-                        from: peer.clone(),
-                        file: file.clone(),
-                    };
-                    let _ = write_message(&mut writer, &resp).await;
                 } else {
-                    eprintln!("forge-net: peer '{}' not found", peer);
+                    drop(gs);
+                    write_message(
+                        &mut writer,
+                        &OutgoingMsg::Error {
+                            message: format!("peer '{peer}' not found"),
+                        },
+                    )
+                    .await?;
                 }
             }
 
             IncomingMsg::CollabAccept { session_id } => {
+                // Take guild_state before collab_mgr everywhere (consistent lock order,
+                // and never hold a guild_state guard across send_to_handle()).
+                let my_handle = guild_state.lock().await.my_handle.clone();
                 let mut cm = collab_mgr.lock().await;
                 if let Some(session) = cm.get_session(session_id) {
                     session.accept();
@@ -346,7 +370,7 @@ pub async fn handle_connection(
                             &session.peer_handle,
                             PeerMsg::CollabAccept {
                                 session_id,
-                                from: guild_state.lock().await.my_handle.clone(),
+                                from: my_handle,
                             },
                         )
                         .await;
@@ -370,6 +394,7 @@ pub async fn handle_connection(
                 session_id,
                 op_json,
             } => {
+                let my_handle = guild_state.lock().await.my_handle.clone();
                 let mut cm = collab_mgr.lock().await;
                 if let Some(session) = cm.get_session(session_id) {
                     let peer = session.peer_handle.clone();
@@ -408,7 +433,7 @@ pub async fn handle_connection(
                                         &peer,
                                         PeerMsg::CollabOp {
                                             session_id,
-                                            from: guild_state.lock().await.my_handle.clone(),
+                                            from: my_handle.clone(),
                                             op_json: serialized,
                                         },
                                     )
@@ -427,7 +452,7 @@ pub async fn handle_connection(
                                 &peer,
                                 PeerMsg::CollabOp {
                                     session_id,
-                                    from: guild_state.lock().await.my_handle.clone(),
+                                    from: my_handle.clone(),
                                     op_json,
                                 },
                             )
@@ -454,14 +479,14 @@ pub async fn handle_connection(
                     data,
                 };
 
-                let mut pool = file_pool.lock().await;
-                pool.add_file(file);
+                // Lock order is guild_state -> file_pool everywhere (GuildStatus takes
+                // them that way); never hold the pool while locking guild_state.
+                file_pool.lock().await.add_file(file);
 
                 // Track in guild state
                 let mut gs = guild_state.lock().await;
                 gs.add_shared_file(name.clone(), my_handle.clone(), size);
                 drop(gs);
-                drop(pool);
 
                 peer_runtime
                     .broadcast(PeerMsg::FileOffer {
@@ -477,7 +502,13 @@ pub async fn handle_connection(
             IncomingMsg::FileGrab { from, name } => {
                 let pool = file_pool.lock().await;
                 let key = format!("{}:{}", from, name);
-                if let Some(file) = pool.files.get(&key) {
+                if let Some(file) = pool.files.get(&key).filter(|f| f.size > 700 * 1024) {
+                    // IPC frames are capped at 1MB (base64 adds 33%); refuse instead of
+                    // sending a frame the editor would treat as stream corruption.
+                    let message = format!("{} too large to grab over IPC (700KB limit)", file.name);
+                    drop(pool);
+                    write_message(&mut writer, &OutgoingMsg::Error { message }).await?;
+                } else if let Some(file) = pool.files.get(&key) {
                     let data_b64 = crate::transfer::base64_encode_pub(&file.data);
                     let resp = OutgoingMsg::FileReceived {
                         name: file.name.clone(),
@@ -497,8 +528,7 @@ pub async fn handle_connection(
                 let my_handle = gs.my_handle.clone();
                 drop(gs);
 
-                let mut pool = file_pool.lock().await;
-                pool.remove_file(&my_handle, &name);
+                file_pool.lock().await.remove_file(&my_handle, &name);
 
                 let mut gs = guild_state.lock().await;
                 gs.remove_shared_file(&name, &my_handle);

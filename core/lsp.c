@@ -83,7 +83,15 @@ static void jw_string(JsonWriter *w, const char *val) {
             case '\n': jw_str_raw(w, "\\n");  break;
             case '\r': jw_str_raw(w, "\\r");  break;
             case '\t': jw_str_raw(w, "\\t");  break;
-            default:   jw_raw(w, p, 1);       break;
+            default:
+                if ((unsigned char)*p < 0x20) {
+                    char esc[8];
+                    int n = snprintf(esc, sizeof esc, "\\u%04x", (unsigned char)*p);
+                    jw_raw(w, esc, n);
+                } else {
+                    jw_raw(w, p, 1);
+                }
+                break;
         }
     }
     jw_str_raw(w, "\",");
@@ -132,33 +140,43 @@ struct JValue {
     };
 };
 
-/* Simple bump arena for JSON values */
-typedef struct {
-    char *buf;
-    int   len, cap;
-} JsonArena;
+/* Chunked bump arena for JSON values.  Chunks never move, so pointers
+   handed out earlier stay valid (the old single realloc'd buffer left every
+   already-parsed JValue* dangling on large responses). */
+typedef struct JChunk {
+    struct JChunk *next;
+    int  len, cap;
+    char data[];
+} JChunk;
+
+typedef struct { JChunk *head; } JsonArena;
 
 static JsonArena *ja_new(int cap) {
-    JsonArena *a = malloc(sizeof(JsonArena));
-    a->buf = malloc(cap);
-    a->len = 0;
-    a->cap = cap;
-    return a;
+    (void)cap;
+    return calloc(1, sizeof(JsonArena));
 }
 
 static void *ja_alloc(JsonArena *a, int size) {
-    int aligned = (size + 7) & ~7;
-    if (a->len + aligned > a->cap) {
-        a->cap = (a->len + aligned) * 2;
-        a->buf = realloc(a->buf, a->cap);
+    int aligned = (size + 15) & ~15;
+    if (!a->head || a->head->len + aligned > a->head->cap) {
+        int cap = aligned > 65536 ? aligned : 65536;
+        JChunk *c = malloc(sizeof(JChunk) + (size_t)cap);
+        c->next = a->head;
+        c->len  = 0;
+        c->cap  = cap;
+        a->head = c;
     }
-    void *p = a->buf + a->len;
-    a->len += aligned;
+    void *p = a->head->data + a->head->len;
+    a->head->len += aligned;
     return p;
 }
 
 static void ja_free(JsonArena *a) {
-    free(a->buf);
+    for (JChunk *c = a->head; c;) {
+        JChunk *n = c->next;
+        free(c);
+        c = n;
+    }
     free(a);
 }
 
@@ -183,6 +201,19 @@ static void jp_skip_ws(JParser *p) {
 }
 
 static JValue *jp_parse(JParser *p);
+
+static int jp_hex4(const char *s) {
+    int v = 0;
+    for (int k = 0; k < 4; k++) {
+        char c = s[k];
+        v <<= 4;
+        if (c >= '0' && c <= '9') v |= c - '0';
+        else if (c >= 'a' && c <= 'f') v |= c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') v |= c - 'A' + 10;
+        else return -1;
+    }
+    return v;
+}
 
 static char *jp_parse_string_raw(JParser *p, int *out_len) {
     if (p->pos >= p->len || p->src[p->pos] != '"') return NULL;
@@ -210,6 +241,39 @@ static char *jp_parse_string_raw(JParser *p, int *out_len) {
                 case 'r':  result[ri++] = '\r'; break;
                 case 't':  result[ri++] = '\t'; break;
                 case '/':  result[ri++] = '/';  break;
+                case 'b':  result[ri++] = '\b'; break;
+                case 'f':  result[ri++] = '\f'; break;
+                case 'u': {
+                    int end = start + slen, cp;
+                    if (i + 4 < end && (cp = jp_hex4(p->src + i + 1)) >= 0) {
+                        i += 4;
+                        if (cp >= 0xD800 && cp < 0xDC00 && i + 6 < end &&
+                            p->src[i + 1] == '\\' && p->src[i + 2] == 'u') {
+                            int lo = jp_hex4(p->src + i + 3);
+                            if (lo >= 0xDC00 && lo < 0xE000) {
+                                cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                                i += 6;
+                            }
+                        }
+                        if (cp < 0x80) result[ri++] = (char)cp;
+                        else if (cp < 0x800) {
+                            result[ri++] = (char)(0xC0 | (cp >> 6));
+                            result[ri++] = (char)(0x80 | (cp & 0x3F));
+                        } else if (cp < 0x10000) {
+                            result[ri++] = (char)(0xE0 | (cp >> 12));
+                            result[ri++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                            result[ri++] = (char)(0x80 | (cp & 0x3F));
+                        } else {
+                            result[ri++] = (char)(0xF0 | (cp >> 18));
+                            result[ri++] = (char)(0x80 | ((cp >> 12) & 0x3F));
+                            result[ri++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                            result[ri++] = (char)(0x80 | (cp & 0x3F));
+                        }
+                    } else {
+                        result[ri++] = 'u';
+                    }
+                    break;
+                }
                 default:   result[ri++] = p->src[i]; break;
             }
         } else {
@@ -1059,6 +1123,7 @@ void lsp_poll(LSPClient *c) {
             continue;
         }
         content_length = atoi(cl + 15);
+        if (content_length < 0) content_length = 0;
 
         int total_msg = header_len + content_length;
         if (c->read_len < total_msg) break;  /* Wait for more data */

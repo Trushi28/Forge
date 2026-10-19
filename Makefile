@@ -40,7 +40,7 @@ OBJS = $(patsubst $(SRCDIR)/%.c,$(BUILDDIR)/%.o,$(SRCS))
 # Objects needed for tests (everything except main.o)
 TEST_OBJS = $(filter-out $(BUILDDIR)/main.o,$(OBJS))
 
-.PHONY: all clean debug net plugins test
+.PHONY: all clean debug net plugins test fuzz
 
 all: $(BUILDDIR) $(TARGET)
 
@@ -70,6 +70,17 @@ test: $(BUILDDIR) $(TEST_OBJS)
 	@echo "  Running Forge C core tests"
 	@echo "════════════════════════════════════════════════"
 	@$(BUILDDIR)/test_forge
+
+# ── Sanitizer tests: piece-tree differential fuzz, IPC framing, LSP JSON parser
+SAN = -std=c11 -D_GNU_SOURCE -g -fsanitize=address,undefined
+fuzz: $(BUILDDIR)
+	$(CC) $(SAN) -o $(BUILDDIR)/fuzz $(TESTDIR)/test_buffer_fuzz.c \
+	    $(SRCDIR)/buffer.c $(SRCDIR)/arena.c $(SRCDIR)/globals.c
+	$(BUILDDIR)/fuzz
+	$(CC) $(SAN) -o $(BUILDDIR)/ipc_test $(TESTDIR)/test_ipc.c $(SRCDIR)/ipc.c -lpthread
+	$(BUILDDIR)/ipc_test
+	$(CC) $(SAN) -o $(BUILDDIR)/lsp_json_test $(TESTDIR)/test_lsp_json.c
+	$(BUILDDIR)/lsp_json_test
 
 # ── Debug build ───────────────────────────────────────────────
 debug: CFLAGS = -Wall -Wextra -std=c11 -g -DDEBUG -Wno-unused-result -Wno-format-truncation -D_GNU_SOURCE

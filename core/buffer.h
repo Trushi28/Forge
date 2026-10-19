@@ -10,6 +10,7 @@ typedef struct PieceNode {
   bool        is_original;
   size_t      buf_start;
   size_t      buf_len;
+  size_t      own_lines;      /* '\n' count in this node's own piece   */
   size_t      subtree_len;    /* total bytes in this subtree          */
   size_t      subtree_lines;  /* total '\n' chars in this subtree     */
   RBColor     color;
@@ -24,7 +25,9 @@ typedef struct Buffer {
   size_t      add_cap;
   PieceNode  *root;
   PieceNode  *nil;            /* sentinel – always BLACK, all fields 0 */
-  size_t      piece_count;
+  size_t      piece_count;    /* live nodes in tree (incl. dead ones)  */
+  size_t      dead_count;     /* zero-length nodes awaiting compaction */
+  PieceNode  *free_list;      /* recycled nodes (linked via ->right)   */
 
   /* ── lazy line cache ─────────────────────────────────────── */
   char       *cached_text;    /* full flattened text (NULL = dirty)   */

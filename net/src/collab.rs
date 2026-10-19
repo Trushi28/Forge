@@ -49,7 +49,7 @@ impl CollabSession {
             file: file.to_string(),
             peer_handle: peer.handle.clone(),
             peer_addr: peer.addr.clone(),
-            state: SessionState::Active,
+            state: SessionState::Pending, // becomes Active when the user accepts
             agent_id: 2, // responder is always agent 2
             doc: CollabDoc::from_text(2, initial_text),
             outgoing_ops: Vec::new(),
@@ -142,9 +142,15 @@ pub struct CollabManager {
 
 impl CollabManager {
     pub fn new() -> Self {
+        // Both peers used to count from 1, so ids collided. Randomise the start
+        // (kept < 1e9 so it still fits the C editor's `int`).
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() as u64)
+            .unwrap_or(1);
         CollabManager {
             sessions: HashMap::new(),
-            next_id: 1,
+            next_id: nanos % 1_000_000_000 + 1,
         }
     }
 
