@@ -609,7 +609,7 @@ The layout engine (`ui.c`) is roughly 500 lines of C — a slot table, an ordere
 
 ## 8. Network Layer (Rust)
 
-### 7.1 IPC Protocol
+### 8.1 IPC Protocol
 
 Messages between C and Rust are length-prefixed JSON over a Unix socket:
 
@@ -631,7 +631,7 @@ Messages between C and Rust are length-prefixed JSON over a Unix socket:
 { "type": "PING_RECV", "from": "rex", "file": "main.c", "line": 47 }
 ```
 
-### 7.2 CRDT Engine
+### 8.2 CRDT Engine
 
 Uses `diamond-types` — the same CRDT powering production collaborative editors:
 
@@ -659,7 +659,7 @@ impl CollabDoc {
 }
 ```
 
-### 7.3 Guild Discovery (mDNS)
+### 8.3 Guild Discovery (mDNS)
 
 Zero-config peer discovery on LAN:
 
@@ -687,7 +687,7 @@ pub async fn discover(guild: &str) -> impl Stream<Item = Peer> {
 }
 ```
 
-### 7.4 P2P File Transfer
+### 8.4 P2P File Transfer
 
 Direct TCP — no relay, no cloud:
 
