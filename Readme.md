@@ -728,7 +728,7 @@ Any LSP-compliant server works automatically.
 textDocument/completion      → dropdown popup at cursor
 textDocument/publishDiagnostics → red/yellow lines in gutter
 textDocument/hover           → doc popup on Ctrl+K
-textDocument/definition      → jump with gd
+textDocument/definition      → jump with Ctrl+]
 textDocument/references      → list panel with gr
 textDocument/formatting      → format file with :fmt
 workspace/symbol             → fuzzy symbol search Ctrl+P @

@@ -1039,6 +1039,16 @@ static void cmd_find_references(void *ctx) {
   }
 }
 
+static void cmd_goto_definition(void *ctx) {
+  (void)ctx;
+  if (E.lsp && E.lsp->running && E.lsp->initialized) {
+    lsp_request_definition(E.lsp, E.file_uri, E.cy, E.cx);
+    render_set_status(&E.render, "Finding definition...");
+  } else {
+    render_set_status(&E.render, "No LSP server running");
+  }
+}
+
 static void cmd_show_hover(void *ctx) {
   (void)ctx;
   if (E.lsp && E.lsp->running && E.lsp->initialized) {
@@ -2657,6 +2667,8 @@ int main(int argc, char **argv) {
                       cmd_guild_collab, NULL);
   palette_add_command(&E.palette, "Find References", "Find references of symbol under cursor", "",
                       cmd_find_references, NULL);
+  palette_add_command(&E.palette, "Go to Definition", "Jump to definition of symbol under cursor", "Ctrl+]",
+                      cmd_goto_definition, NULL);
   palette_add_command(&E.palette, "Show Hover Docs", "Show hover documentation for symbol under cursor", "Ctrl+K",
                       cmd_show_hover, NULL);
   palette_add_command(&E.palette, "Copy Selection", "Copy selected text to clipboard", "",
@@ -3075,18 +3087,18 @@ int main(int argc, char **argv) {
       continue;
     }
 
-    /* ── Ctrl+G: Go-to-definition / Guild panel ─────── */
-    if (key == KEY_CTRL_G) {
-      if (E.guild_panel_visible) {
-        /* Always allow closing the guild panel */
-        cmd_toggle_guild(NULL);
-      } else if (E.lsp && E.lsp->running && E.lsp->initialized) {
-        lsp_request_definition(E.lsp, E.file_uri, E.cy, E.cx);
-        render_set_status(&E.render, "Finding definition...");
-      } else {
-        /* No LSP: toggle guild panel open */
-        cmd_toggle_guild(NULL);
-      }
+    /* ── Ctrl+G: Guild panel (as advertised in the palette/welcome screen).
+       It used to jump to the definition whenever an LSP was running, so the
+       guild panel could never be opened in a file with a language server.
+       Go-to-definition now lives on Ctrl+] and in the palette. ───────── */
+    if (key == KEY_CTRL_G && !E.search_active) {
+      cmd_toggle_guild(NULL);
+      continue;
+    }
+
+    /* ── Ctrl+]: Go to definition ────────────────────── */
+    if (key == KEY_CTRL_RBRACKET) {
+      cmd_goto_definition(NULL);
       continue;
     }
 

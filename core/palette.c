@@ -334,6 +334,15 @@ void palette_scan_files(PaletteState *ps, const char *root_dir) {
     scan_dir_recursive(ps, dir, "");
 }
 
+/* Display columns of a UTF-8 string (one per code point). strlen() counts
+   bytes, which made borders drawn around "↑↓ ⏎" come out 6 columns short. */
+static int disp_width(const char *s) {
+    int n = 0;
+    for (; *s; s++)
+        if (((unsigned char)*s & 0xC0) != 0x80) n++;
+    return n;
+}
+
 static void print_highlighted_match(char *buf, int *blen, int max_len, const char *text, const char *query,
                                     ThemeColor hl_fg, ThemeColor normal_fg, ThemeColor bg_color,
                                     bool bold_item, bool underline_match) {
@@ -397,6 +406,9 @@ void palette_render(PaletteState *ps, ForgeTheme *theme,
     int max_results = ps->filtered_count < PALETTE_MAX_VISIBLE
                         ? ps->filtered_count : PALETTE_MAX_VISIBLE;
 
+    /* Go-to-line has no result list; it used to draw a column of blank rows. */
+    if (ps->mode == PALETTE_GOTO_LINE) max_results = 0;
+
     /* Calculate dynamic popup height for proper centering */
     int popup_height = 4;
     if (ps->mode == PALETTE_COMMANDS) {
@@ -449,7 +461,7 @@ void palette_render(PaletteState *ps, ForgeTheme *theme,
 
     /* Top bar with title */
     BPRINTF("┌");
-    int title_len = (int)strlen(title);
+    int title_len = disp_width(title);
     int dash_before = (popup_width - 2 - title_len) / 2;
     int dash_after  = popup_width - 2 - title_len - dash_before;
     for (int i = 0; i < dash_before; i++) BPRINTF("─");
@@ -488,8 +500,10 @@ void palette_render(PaletteState *ps, ForgeTheme *theme,
         BPRINTF("⌘ ");
 
     /* Input text */
-    int input_space = popup_width - 8;
-    int show_len = ps->input_len < input_space ? ps->input_len : input_space;
+    /* │ + pad + 2-col prompt + [text, cursor, fill] + pad + │ = popup_width.
+       (This used popup_width - 8, leaving the input row 2 columns short.) */
+    int input_space = popup_width - 6;
+    int show_len = ps->input_len < input_space - 1 ? ps->input_len : input_space - 1;
     for (int i = 0; i < show_len; i++)
         BPRINTF("%c", ps->input[i]);
 
@@ -703,10 +717,10 @@ void palette_render(PaletteState *ps, ForgeTheme *theme,
     BPRINTF("└");
 
     const char *hint = " ↑↓ navigate  ⏎ accept  esc close ";
-    int hint_len = (int)strlen(hint);
+    int hint_len = disp_width(hint);
     if (popup_width - 2 < hint_len) {
         hint = " ↑↓  ⏎  esc ";
-        hint_len = (int)strlen(hint);
+        hint_len = disp_width(hint);
     }
 
     dash_before = (popup_width - 2 - hint_len) / 2;

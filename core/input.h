@@ -11,6 +11,7 @@ enum KeyCode {
   KEY_CTRL_F = 6,  /* find / search                */
   KEY_CTRL_G = 7,  /* guild panel                  */
   KEY_CTRL_H = 8,  /* backspace                    */
+  KEY_CTRL_RBRACKET = 29, /* go to definition (Ctrl+])  */
   KEY_CTRL_K = 11, /* hover / kill line            */
   KEY_CTRL_N = 14, /* next (completion)            */
   KEY_CTRL_P = 16, /* command palette / prev       */

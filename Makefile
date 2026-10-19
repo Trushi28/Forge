@@ -81,6 +81,9 @@ fuzz: $(BUILDDIR)
 	$(BUILDDIR)/ipc_test
 	$(CC) $(SAN) -o $(BUILDDIR)/lsp_json_test $(TESTDIR)/test_lsp_json.c
 	$(BUILDDIR)/lsp_json_test
+	$(CC) $(SAN) -o $(BUILDDIR)/palette_test $(TESTDIR)/test_palette_render.c \
+	    $(SRCDIR)/palette.c $(SRCDIR)/theme.c
+	$(BUILDDIR)/palette_test
 
 # ── Debug build ───────────────────────────────────────────────
 debug: CFLAGS = -Wall -Wextra -std=c11 -g -DDEBUG -Wno-unused-result -Wno-format-truncation -D_GNU_SOURCE
