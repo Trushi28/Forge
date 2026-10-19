@@ -24,6 +24,7 @@ bool git_state_init(GitState *gs, const char *workdir) {
     int err = git_repository_open_ext(&repo, workdir, GIT_REPOSITORY_OPEN_SEARCH, NULL);
     if (err != 0) {
         gs->repo_open = false;
+        git_libgit2_shutdown();   /* balance the init above */
         return false;
     }
 
@@ -39,11 +40,14 @@ bool git_state_init(GitState *gs, const char *workdir) {
 }
 
 void git_state_free(GitState *gs) {
-    if (gs->repo_handle)
+    /* Only shut libgit2 down if a successful init is outstanding.  git_reopen()
+       calls this on a zeroed state first, which used to shut down without init. */
+    if (gs->repo_handle) {
         git_repository_free((git_repository *)gs->repo_handle);
+        git_libgit2_shutdown();
+    }
     gs->repo_handle = NULL;
     gs->repo_open = false;
-    git_libgit2_shutdown();
 }
 
 /* ── Branch ────────────────────────────────────────────────── */

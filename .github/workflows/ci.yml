@@ -27,7 +27,7 @@ jobs:
     - name: Verify build without libgit2
       run: |
         make clean
-        make -j$(nproc)
+        make -j$(nproc) WITH_GIT=0
 
     # ── Build with libgit2 for tests ───────────────────────────
     - name: Rebuild with libgit2 for tests
@@ -39,8 +39,11 @@ jobs:
     - name: Run C core tests
       run: make test WITH_GIT=1
 
-    - name: Run sanitizer tests (buffer fuzz, IPC, LSP JSON)
+    - name: Run sanitizer tests (buffer fuzz, IPC, LSP JSON, palette)
       run: make fuzz
+
+    - name: Run libgit2 integration test
+      run: make gittest WITH_GIT=1
 
     # ── Build plugins ──────────────────────────────────────────
     - name: Build plugins

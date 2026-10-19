@@ -997,7 +997,7 @@ static void cmd_toggle_blame(void *ctx) {
 #ifdef HAS_LIBGIT2
     render_set_status(&E.render, "Git not available (no repository found)");
 #else
-    render_set_status(&E.render, "Git not available (build without libgit2)");
+    render_set_status(&E.render, "Git disabled: this build has no libgit2 — install libgit2 (with headers), then run make");
 #endif
     return;
   }
@@ -1015,7 +1015,7 @@ static void cmd_toggle_timeline(void *ctx) {
 #ifdef HAS_LIBGIT2
     render_set_status(&E.render, "Git not available (no repository found)");
 #else
-    render_set_status(&E.render, "Git not available (build without libgit2)");
+    render_set_status(&E.render, "Git disabled: this build has no libgit2 — install libgit2 (with headers), then run make");
 #endif
     return;
   }

@@ -7,12 +7,19 @@ TESTDIR = tests
 TARGET  = forge
 
 # ── Optional libgit2 support ──────────────────────────────────
-# Build with: make WITH_GIT=1
-# Without libgit2, the editor works fine — git features (diff
-# gutter, blame, timeline) are simply disabled.
-ifdef WITH_GIT
-  CFLAGS += -DHAS_LIBGIT2
-  GIT_LDFLAGS = -lgit2
+# Auto-detected with pkg-config (needs the libgit2 *headers*: libgit2-dev /
+# libgit2-devel; on Arch just `libgit2`).  Override with:
+#   make WITH_GIT=1   force on      make WITH_GIT=0   force off
+# Without libgit2 the editor works fine — git features (diff gutter, blame,
+# timeline) are simply disabled.
+ifeq ($(origin WITH_GIT),undefined)
+  ifneq ($(shell pkg-config --exists libgit2 2>/dev/null && echo yes),)
+    WITH_GIT = 1
+  endif
+endif
+ifeq ($(WITH_GIT),1)
+  CFLAGS += -DHAS_LIBGIT2 $(shell pkg-config --cflags libgit2 2>/dev/null)
+  GIT_LDFLAGS = $(or $(shell pkg-config --libs libgit2 2>/dev/null),-lgit2)
 else
   GIT_LDFLAGS =
 endif
@@ -40,7 +47,7 @@ OBJS = $(patsubst $(SRCDIR)/%.c,$(BUILDDIR)/%.o,$(SRCS))
 # Objects needed for tests (everything except main.o)
 TEST_OBJS = $(filter-out $(BUILDDIR)/main.o,$(OBJS))
 
-.PHONY: all clean debug net plugins test fuzz
+.PHONY: all clean debug net plugins test fuzz gittest FORCE
 
 all: $(BUILDDIR) $(TARGET)
 
@@ -50,8 +57,19 @@ $(BUILDDIR):
 $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(GIT_LDFLAGS) -ldl
 
-$(BUILDDIR)/%.o: $(SRCDIR)/%.c | $(BUILDDIR)
-	$(CC) $(CFLAGS) -c $< -o $@
+# Rebuild every object when the compiler flags change (e.g. libgit2 toggled).
+# Without this, `make` after installing libgit2 said "Nothing to be done" and
+# kept the no-op git.o stub.  Header dependencies are tracked with -MMD, so an
+# edited .h (e.g. buffer.h's struct) also rebuilds its users.
+$(BUILDDIR)/.flags: FORCE | $(BUILDDIR)
+	@echo '$(CC) $(CFLAGS) $(GIT_LDFLAGS)' | cmp -s - $@ || echo '$(CC) $(CFLAGS) $(GIT_LDFLAGS)' > $@
+
+FORCE:
+
+$(BUILDDIR)/%.o: $(SRCDIR)/%.c $(BUILDDIR)/.flags | $(BUILDDIR)
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
+
+-include $(OBJS:.o=.d)
 
 # ── Rust net crate ────────────────────────────────────────────
 net:
@@ -84,6 +102,11 @@ fuzz: $(BUILDDIR)
 	$(CC) $(SAN) -o $(BUILDDIR)/palette_test $(TESTDIR)/test_palette_render.c \
 	    $(SRCDIR)/palette.c $(SRCDIR)/theme.c
 	$(BUILDDIR)/palette_test
+
+# ── libgit2 integration test (skips itself when libgit2 is off)
+gittest: $(BUILDDIR)
+	$(CC) $(CFLAGS) -o $(BUILDDIR)/git_test $(TESTDIR)/test_git.c $(SRCDIR)/git.c $(GIT_LDFLAGS)
+	$(BUILDDIR)/git_test
 
 # ── Debug build ───────────────────────────────────────────────
 debug: CFLAGS = -Wall -Wextra -std=c11 -g -DDEBUG -Wno-unused-result -Wno-format-truncation -D_GNU_SOURCE

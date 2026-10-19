@@ -28,12 +28,12 @@ bold() { echo -e "${BOLD}$*${NC}"; }
 HAS_LIBGIT2=0
 detect_libgit2() {
     if pkg-config --exists libgit2 2>/dev/null || \
-       ldconfig -p 2>/dev/null | grep -q libgit2; then
+       [ -f /usr/include/git2.h ] || [ -f /usr/local/include/git2.h ]; then
         HAS_LIBGIT2=1
         ok "libgit2 found — git features enabled"
     else
         warn "libgit2 not found — building without git features"
-        warn "  Install for git support: sudo pacman -S libgit2"
+        warn "  Install for git support: sudo pacman -S libgit2   (Debian/Ubuntu: libgit2-dev, Fedora: libgit2-devel)"
     fi
 }
 
