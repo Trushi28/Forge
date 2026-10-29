@@ -15,10 +15,14 @@
 #include "../core/forgescript.h"
 #include "../core/plugin.h"
 #include "../core/render.h"
+#include "../core/lsp.h"
+#include "../core/utf8.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 /* ═══════════════════════════════════════════════════════════════
    Test harness
@@ -203,6 +207,130 @@ static void test_buffer_get_offset(void) {
     /* line 2, col 2 → offset 10 (after "abc\ndef\n" + "gh") */
     ASSERT_EQ_INT(buffer_get_offset(b, 2, 2), 10);
     buffer_free(b);
+}
+
+static void test_buffer_tree_line_index_and_range(void) {
+    const char *text = "one\ntwo\nthree\n";
+    Buffer *b = buffer_new(text, strlen(text));
+    ASSERT_EQ_INT(buffer_line_count(b), 4);
+    ASSERT_EQ_INT(buffer_line_to_offset(b, 0), 0);
+    ASSERT_EQ_INT(buffer_line_to_offset(b, 1), 4);
+    ASSERT_EQ_INT(buffer_line_to_offset(b, 3), 14);
+    ASSERT_EQ_INT(buffer_offset_to_line(b, 0), 0);
+    ASSERT_EQ_INT(buffer_offset_to_line(b, 4), 1);
+    ASSERT_EQ_INT(buffer_offset_to_line(b, strlen(text)), 3);
+
+    buffer_insert(b, 4, "X\n", 2);
+    ASSERT_EQ_INT(buffer_line_count(b), 5);
+    buffer_delete(b, 4, 2); /* leaves a zero-length piece in the tree */
+    ASSERT_EQ_INT(buffer_line_count(b), 4);
+    ASSERT_EQ_INT(buffer_line_to_offset(b, 2), 8);
+    ASSERT_EQ_INT(buffer_offset_to_line(b, 8), 2);
+
+    char slice[6] = {0};
+    ASSERT_EQ_INT(buffer_read_range(b, 3, slice, 5), 5);
+    ASSERT_EQ_STR(slice, "\ntwo\n");
+    char *line = buffer_get_line(b, 2);
+    ASSERT_NOT_NULL(line);
+    ASSERT_EQ_STR(line, "three");
+    free(line);
+    buffer_free(b);
+}
+
+static void test_lsp_uri_escapes_path_bytes(void) {
+    char uri[256];
+    lsp_path_to_uri("/tmp/Forge files/a#b%.c", uri, sizeof(uri));
+    ASSERT_EQ_STR(uri, "file:///tmp/Forge%20files/a%23b%25.c");
+}
+
+static void test_utf8_decode_and_display_columns(void) {
+    const char text[] = "A界e\xCC\x81🙂Z";
+    size_t len = sizeof(text) - 1;
+    uint32_t cp = 0;
+    ASSERT_EQ_INT(utf8_decode(text + 1, len - 1, &cp), 3);
+    ASSERT_EQ_INT(cp, 0x754c);
+    ASSERT_EQ_INT(utf8_display_width(text, len), 7);
+    ASSERT_EQ_INT(utf8_display_col(text, len, 4), 3);
+    ASSERT_EQ_INT(utf8_byte_col(text, len, 3), 4);
+    ASSERT_EQ_INT(utf8_utf16_col(text, len, 11), 6);
+    ASSERT_EQ_INT(utf8_byte_from_utf16_col(text, len, 6), 11);
+    ASSERT_EQ_INT(utf8_byte_from_utf16_col(text, len, 5), 7);
+    ASSERT_EQ_INT(utf8_prev(text, len, 4), 1);
+    ASSERT_EQ_INT(utf8_next(text, len, 1), 4);
+    char encoded[4];
+    size_t n = utf8_encode(0x1f642, encoded);
+    ASSERT_EQ_INT(n, 4);
+    ASSERT_EQ_INT(utf8_decode(encoded, n, &cp), n);
+    ASSERT_EQ_INT(cp, 0x1f642);
+    const char invalid[] = "\xf0\x80\x80\x80";
+    ASSERT_EQ_INT(utf8_decode(invalid, sizeof(invalid) - 1, &cp), 1);
+    ASSERT_EQ_INT(cp, 0xfffd);
+}
+
+static char worker_insert_result[1025];
+
+static void capture_worker_insert(const char *text, size_t len) {
+    if (len >= sizeof(worker_insert_result)) return;
+    memcpy(worker_insert_result, text, len);
+    worker_insert_result[len] = '\0';
+}
+
+static void test_plugin_worker_event_and_notify(void) {
+    char dir[] = "/tmp/forge-worker-test-XXXXXX";
+    ASSERT_NOT_NULL(mkdtemp(dir));
+    const char *old_xdg_value = getenv("XDG_CONFIG_HOME");
+    char *old_xdg = old_xdg_value ? strdup(old_xdg_value) : NULL;
+    bool had_old_xdg = old_xdg_value != NULL;
+    ASSERT_EQ_INT(setenv("XDG_CONFIG_HOME", dir, 1), 0);
+    char source[256], plugin_dir[512], plugin_path[768];
+    snprintf(source, sizeof(source), "%s/echo.c", dir);
+    FILE *source_file = fopen(source, "w");
+    ASSERT_NOT_NULL(source_file);
+    fputs("#include <stdio.h>\n#include <string.h>\n"
+          "int main(void) { char event[4096];\n"
+          "while (fgets(event, sizeof event, stdin)) {\n"
+          "if (strstr(event, \"\\\"event\\\":\\\"save\\\"\")) {\n"
+          "puts(\"{\\\"protocol\\\":2,\\\"action\\\":\\\"insert\\\",\\\"text\\\":\\\"inserted\\\\u754c\\\"}\");\n"
+          "puts(\"{\\\"protocol\\\":2,\\\"action\\\":\\\"notify\\\",\\\"message\\\":\\\"worker alive\\\"}\");\n"
+          "fflush(stdout); } } return 0; }\n", source_file);
+    fclose(source_file);
+
+    PluginHost host;
+    RenderState render = {0};
+    EditorContext context = {0};
+    context.render = &render;
+    context.worker_insert = capture_worker_insert;
+    worker_insert_result[0] = '\0';
+    plugin_host_init(&host);
+    plugin_set_editor_context(&context);
+    char *build_args[] = {"plugin", "build", source};
+    ASSERT_EQ_INT(plugin_cli(3, build_args), 0);
+    snprintf(plugin_dir, sizeof(plugin_dir), "%s/forge/plugins", dir);
+    snprintf(plugin_path, sizeof(plugin_path), "%s/echo.forge-plugin", plugin_dir);
+    ASSERT_EQ_INT(plugin_workers_load_dir(&host, plugin_dir), 1);
+    plugin_on_save(&host, "/tmp/unicode-界.c");
+    for (int i = 0; i < 100 && strcmp(render.status_msg, "worker alive") != 0; i++) {
+        usleep(1000);
+        plugin_workers_poll(&host);
+    }
+    ASSERT_EQ_STR(render.status_msg, "worker alive");
+    ASSERT_EQ_STR(worker_insert_result, "inserted界");
+
+    plugin_host_free(&host);
+    plugin_set_editor_context(NULL);
+    unlink(plugin_path);
+    rmdir(plugin_dir);
+    char forge_dir[512];
+    snprintf(forge_dir, sizeof(forge_dir), "%s/forge", dir);
+    rmdir(forge_dir);
+    unlink(source);
+    rmdir(dir);
+    if (had_old_xdg) {
+        setenv("XDG_CONFIG_HOME", old_xdg, 1);
+        free(old_xdg);
+    } else {
+        unsetenv("XDG_CONFIG_HOME");
+    }
 }
 
 static void test_buffer_total_len(void) {
@@ -539,6 +667,10 @@ int main(void) {
     RUN_TEST(test_buffer_line_count_multi);
     RUN_TEST(test_buffer_get_line);
     RUN_TEST(test_buffer_get_offset);
+    RUN_TEST(test_buffer_tree_line_index_and_range);
+    RUN_TEST(test_lsp_uri_escapes_path_bytes);
+    RUN_TEST(test_utf8_decode_and_display_columns);
+    RUN_TEST(test_plugin_worker_event_and_notify);
     RUN_TEST(test_buffer_total_len);
     RUN_TEST(test_buffer_large_insert);
     RUN_TEST(test_buffer_empty_operations);

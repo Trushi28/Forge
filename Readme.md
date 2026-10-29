@@ -1,5 +1,26 @@
-# Forge Editor — Architecture & Design Document
-> A hybrid C/Rust terminal editor with built-in Git, LSP, collab, and guild networking
+# Forge Editor — Architecture & Product Roadmap
+> A hybrid C/Rust terminal editor with built-in Git, LSP, collaboration, and guild networking
+
+> **Status:** This document describes the intended product and architecture, not a
+> guarantee that every feature below is complete. The code is the source of truth.
+> Current build and usage instructions are in [`README.md`](README.md); features
+> that are incomplete or experimental are called out there.
+
+> **Implementation reality (October 2026):** This is an evolving proposal with
+> historical sections below. The editor core is C and Guild is a Rust companion.
+> Legacy `.so` plugins still use `dlopen` in the editor process and are disabled by
+> default. An opt-in JSON-lines worker protocol now isolates crashes and
+> supports event delivery, notifications, and text insertion; it is not a security sandbox and
+> the built-in plugins have not migrated. Guild uses encrypted TCP and LAN mDNS by default;
+> when a rendezvous URL is configured, it can negotiate an encrypted WebRTC data channel
+> using ICE/STUN and optional TURN credentials. Its
+> current X25519 handshake mixes pinned identity DH with fresh per-connection DH,
+> but the protocol has not received an independent security audit. Piece-tree
+> offsets remain bytes; editor input, cursor movement, rendering, and LSP columns
+> now decode UTF-8 scalars. Full grapheme-cluster behavior is unfinished. Treat
+> the architecture diagrams and milestones below
+> as proposals until the corresponding feature appears in the status table in
+> [`README.md`](README.md).
 
 ---
 
@@ -34,11 +55,11 @@ Everything a developer needs — editing, version history, code intelligence, an
 
 | Principle | What it means |
 |-----------|---------------|
-| **Lightweight** | < 2MB RAM idle. Starts in < 5ms. Piece tree buffer (O(log n) ops). |
+| **Lightweight** | Keep the core small and responsive; the RAM and startup figures are targets, not measured guarantees. |
 | **Easy interface** | Command palette, always-visible statusbar, mouse support |
 | **Built-in Git** | Time-travel through commits without leaving the editor |
 | **Local-first** | Guild chat and file sharing work on LAN with zero internet |
-| **Safe plugins** | User plugins run in isolated processes. Core stays stable. |
+| **Safe plugins** | Isolated plugins are a design goal. Current native plugins run in-process and are disabled by default. |
 
 ---
 
@@ -69,8 +90,8 @@ FORGE
 │   └── One-key file restore to any commit
 │
 ├── Plugin System
-│   ├── C plugins (.so)  — loaded via dlopen, process-isolated
-│   ├── ForgeScript DSL  — tiny VM, hot-reload, safe sandbox
+│   ├── C plugins (.so)  — legacy dlopen API, in-process, opt-in
+│   ├── ForgeScript DSL  — small VM; shell execution is opt-in
 │   └── Shell hooks      — on_save = "prettier $FILE"
 │
 ├── Guild Layer
@@ -689,7 +710,7 @@ pub async fn discover(guild: &str) -> impl Stream<Item = Peer> {
 
 ### 8.4 P2P File Transfer
 
-Direct TCP — no relay, no cloud:
+Direct TCP (the fallback transport):
 
 ```rust
 // transfer.rs
@@ -699,7 +720,7 @@ pub async fn send_file(peer_addr: SocketAddr, path: &Path) -> Result<()> {
     let msg = FileMsg { name: path.file_name(), data };
     stream.write_all(&serialize(msg)).await?;
     Ok(())
-    // receiver gets it directly in their editor buffer pool
+    // receiver gets it in their editor buffer pool
 }
 ```
 
@@ -836,9 +857,16 @@ widgets = ["git_branch"]
 widgets = ["mode_indicator", "filename", "lsp_status", "cursor_pos"]
 ```
 
-### Tier 1 — C Plugins (.so, process-isolated)
+### Tier 1 — C Plugins (.so, legacy in-process API)
 
-For powerful plugins. Runs in a child process — a crash cannot affect the editor:
+The diagram describes the intended full plugin host. Current `.so` plugins are
+loaded with `dlopen` in Forge and have the editor's full privileges. They are
+disabled by default. A separate opt-in worker protocol can receive editor
+events, display notifications, and request text insertion. Widgets, restart
+policy, and a capability model are not implemented yet. Workers share the user's
+permissions, so the process boundary protects Forge from crashes but is not a
+security sandbox. The `forge plugin build` command now compiles a simple C
+worker to `.forge-plugin`; it does not build legacy in-process `.so` plugins.
 
 ```
 forge (main)
@@ -873,11 +901,15 @@ FORGE_PLUGIN_INIT {
 }
 ```
 
-Build: `forge plugin build myplugin.c` → outputs `myplugin.so`
+Legacy `.so` plugins must be built manually. For worker plugins, `forge plugin
+build myplugin.c` outputs an executable `.forge-plugin` in the user plugin
+directory.
 
-### Tier 2 — ForgeScript DSL (VM sandboxed, hot-reload)
+### Tier 2 — ForgeScript DSL (current limited VM)
 
-For quick automations. No compilation. Edit and save — changes apply instantly:
+For quick automations. The VM exposes a limited editor API. Shell execution is
+disabled by default and must be explicitly enabled in config; do not treat the
+VM as an operating-system security boundary:
 
 ```
 // myplugin.fs — ForgeScript
@@ -898,7 +930,8 @@ theme {
 }
 ```
 
-ForgeScript VM is ~1000 lines of C: lexer → parser → bytecode compiler → tiny stack VM. Fully sandboxed — scripts cannot access memory outside their API surface.
+ForgeScript currently has a lexer, parser, and VM. The broader widget and
+hot-reload APIs below are design sketches; the VM is not a hardened sandbox.
 
 ### Tier 3 — Shell Hooks (escape hatch)
 
@@ -911,7 +944,9 @@ on_open    = "echo opened $FILE >> ~/.forge/log"
 on_git_commit = "cargo test"
 ```
 
-Any shell command. Zero plugin code needed.
+Hooks invoke shell commands and therefore execute with the user's privileges.
+Use only trusted configuration. These hooks are separate from ForgeScript's
+default-disabled `run` command.
 
 ---
 
@@ -1007,19 +1042,31 @@ anya accepts →
 
 CRDT ensures both users always converge to the same text — no conflicts, no overwriting each other.
 
-### Network topology
+### Network topology (current implementation)
 
 ```
 Same LAN:
-  A ←──── direct TCP ────► B
-  Zero internet. < 1ms latency.
+  A ←──── encrypted TCP ────► B
+  LAN discovery advertises peers on the local network.
 
 Different networks:
-  A ←── TCP hole-punch ──► B
-  If NAT blocks hole-punch:
-  A ←─── tiny relay ─────► B   (relay only brokers connection,
-                                 never sees file content)
+  Optional WebRTC data channel with room signaling and ICE.
+  Set FORGE_RENDEZVOUS_URL to enable it; the default path remains TCP.
+  TURN is used when credentials are configured.
 ```
+
+The broker can run with `cargo run --manifest-path net/Cargo.toml --
+--rendezvous-server 127.0.0.1:8765`. Put it behind a TLS WebSocket proxy
+before using it remotely, then set `FORGE_RENDEZVOUS_URL=wss://your-host/`.
+For local development, `ws://127.0.0.1:8765` is accepted. ICE uses
+`FORGE_STUN_SERVERS` (comma-separated URLs; default is a public STUN service).
+Optional TURN uses `FORGE_TURN_URL`, `FORGE_TURN_USERNAME`, and
+`FORGE_TURN_CREDENTIAL`; use short-lived credentials in production. These
+environment variables are read by `forge-net` when it creates an invite or
+starts a session. TURN and signaling infrastructure must be supplied by the
+deployment; Forge does not host those services. The signaling and TURN services
+can observe connection metadata and candidate addresses, but Guild application
+messages remain encrypted end to end.
 
 ---
 
@@ -1185,6 +1232,10 @@ serde_json     = "1"
 
 ## 15. Phased Build Plan
 
+> Historical proposal checklist from the initial design. Checked items are not
+> maintained as current status; some items may be implemented, partial, or no
+> longer match the code. Use the status and improvement roadmap in `README.md`.
+
 ### Phase 1 — Foundation (Weeks 1–2)
 *Goal: a usable editor*
 
@@ -1237,7 +1288,7 @@ serde_json     = "1"
 - [ ] ForgeScript lexer + parser
 - [ ] ForgeScript bytecode VM
 - [ ] Shell hooks in config
-- [ ] `forge plugin build` command
+- [x] `forge plugin build` command for simple C workers
 
 **Milestone:** Write a 10-line ForgeScript plugin that auto-formats on save.
 
@@ -1295,9 +1346,11 @@ Forge's renderer knows nothing about specific UI elements. It only iterates a sl
 
 The cost is real but bounded: `ui.c` is ~500 lines for the slot table, widget lifecycle, and geometry recalculation on terminal resize. The ForgeScript widget bindings add ~200 more. That's the full price of the feature.
 
-### Why process isolation for plugins?
+### Why process isolation for plugins? (proposal)
 
-A `.so` loaded into the editor process with a bad pointer dereference will crash the entire editor and lose unsaved work. A plugin in a child process can segfault, hang, or be killed — the editor never notices.
+A `.so` loaded into the editor process can crash the editor or access its full
+privileges. A worker process is the intended safer direction, but it has not
+been implemented yet.
 
 ### Why two separate processes (C + Rust)?
 

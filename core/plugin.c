@@ -2,9 +2,14 @@
 #include "forge_api.h"
 #include "buffer.h"
 #include "render.h"
+#include "utf8.h"
+#include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <sys/wait.h>
 #include <dirent.h>
@@ -25,6 +30,301 @@ static PluginHost *g_plugin_host = NULL;
 
 static EditorContext *g_editor_ctx = NULL;
 
+static bool plugin_user_dir(char *out, size_t cap) {
+    const char *xdg = getenv("XDG_CONFIG_HOME");
+    if (xdg && xdg[0] == '/') {
+        int n = snprintf(out, cap, "%s/forge/plugins", xdg);
+        return n >= 0 && (size_t)n < cap;
+    }
+    const char *home = getenv("HOME");
+    if (!home || !home[0]) return false;
+    int n = snprintf(out, cap, "%s/.config/forge/plugins", home);
+    return n >= 0 && (size_t)n < cap;
+}
+
+static bool mkdir_parents(const char *path) {
+    char temp[1024];
+    size_t len = strlen(path);
+    if (len == 0 || len >= sizeof(temp)) return false;
+    memcpy(temp, path, len + 1);
+    for (char *p = temp + 1; *p; p++) {
+        if (*p != '/') continue;
+        *p = '\0';
+        if (mkdir(temp, 0700) != 0 && errno != EEXIST) return false;
+        struct stat st;
+        if (stat(temp, &st) != 0 || !S_ISDIR(st.st_mode)) return false;
+        *p = '/';
+    }
+    if (mkdir(temp, 0700) != 0 && errno != EEXIST) return false;
+    struct stat st;
+    return stat(temp, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+static bool build_worker_c(const char *source) {
+    if (!source || !*source) return false;
+    const char *base = strrchr(source, '/');
+    base = base ? base + 1 : source;
+    size_t base_len = strlen(base);
+    if (base_len <= 2 || strcmp(base + base_len - 2, ".c") != 0) {
+        fprintf(stderr, "forge: plugin build expects a .c source file\n");
+        return false;
+    }
+    char dir[1024], target[1024], temp[1024];
+    if (!plugin_user_dir(dir, sizeof(dir)) || !mkdir_parents(dir)) {
+        fprintf(stderr, "forge: cannot create plugin directory\n");
+        return false;
+    }
+    int n = snprintf(target, sizeof(target), "%s/%.*s.forge-plugin",
+                     dir, (int)(base_len - 2), base);
+    if (n < 0 || (size_t)n >= sizeof(target)) return false;
+    n = snprintf(temp, sizeof(temp), "%s/.plugin-build-XXXXXX", dir);
+    if (n < 0 || (size_t)n >= sizeof(temp)) return false;
+    int tmpfd = mkstemp(temp);
+    if (tmpfd < 0) {
+        perror("forge: create plugin build file");
+        return false;
+    }
+    close(tmpfd);
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        execlp("cc", "cc", "-std=c11", "-O2", "-Wall", "-Wextra",
+               source, "-o", temp, (char *)NULL);
+        perror("forge: execute C compiler");
+        _exit(127);
+    }
+    if (pid < 0) {
+        perror("forge: fork compiler");
+        unlink(temp);
+        return false;
+    }
+    int status;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno == EINTR) continue;
+        unlink(temp);
+        return false;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0 || chmod(temp, 0755) != 0 ||
+        rename(temp, target) != 0) {
+        fprintf(stderr, "forge: plugin worker build failed\n");
+        unlink(temp);
+        return false;
+    }
+    printf("forge: built worker -> %s\n", target);
+    return true;
+}
+
+int plugin_cli(int argc, char **argv) {
+    if (argc == 3 && strcmp(argv[1], "build") == 0)
+        return build_worker_c(argv[2]) ? 0 : 1;
+    fprintf(stderr, "Usage: forge plugin build <source.c>\n");
+    return 2;
+}
+
+static void worker_close(PluginWorker *worker, bool terminate) {
+    if (!worker || !worker->running) return;
+    if (worker->input_fd >= 0) close(worker->input_fd);
+    if (worker->output_fd >= 0) close(worker->output_fd);
+    worker->input_fd = worker->output_fd = -1;
+    if (terminate && worker->pid > 0) {
+        if (kill(worker->pid, SIGTERM) == 0) {
+            int status;
+            if (waitpid(worker->pid, &status, WNOHANG) == 0) {
+                kill(worker->pid, SIGKILL);
+                while (waitpid(worker->pid, &status, 0) < 0 && errno == EINTR) {}
+            }
+        }
+    }
+    worker->running = false;
+    worker->pid = 0;
+    worker->read_len = 0;
+}
+
+static bool json_escape(const char *src, char *dst, size_t cap, size_t *used) {
+    static const char hex[] = "0123456789abcdef";
+    size_t n = 0;
+    for (const unsigned char *p = (const unsigned char *)(src ? src : ""); *p; p++) {
+        char escaped[6];
+        size_t len = 1;
+        escaped[0] = (char)*p;
+        if (*p == '"' || *p == '\\') {
+            escaped[0] = '\\'; escaped[1] = (char)*p; len = 2;
+        } else if (*p < 0x20) {
+            escaped[0] = '\\'; escaped[1] = 'u'; escaped[2] = '0'; escaped[3] = '0';
+            escaped[4] = hex[*p >> 4]; escaped[5] = hex[*p & 15]; len = 6;
+        }
+        if (n + len >= cap) return false;
+        memcpy(dst + n, escaped, len);
+        n += len;
+    }
+    *used = n;
+    return true;
+}
+
+static bool worker_send_event(PluginWorker *worker, const char *event,
+                              const char *filepath, int key) {
+    char line[PLUGIN_WORKER_MAX_LINE];
+    int head = snprintf(line, sizeof(line), "{\"protocol\":2,\"event\":\"%s\",\"key\":%d,\"file\":\"",
+                        event, key);
+    if (head < 0 || (size_t)head >= sizeof(line)) return false;
+    size_t escaped = 0;
+    if (!json_escape(filepath, line + head, sizeof(line) - (size_t)head, &escaped))
+        return false;
+    size_t len = (size_t)head + escaped;
+    if (len + 3 >= sizeof(line)) return false;
+    line[len++] = '"'; line[len++] = '}'; line[len++] = '\n';
+    ssize_t written = write(worker->input_fd, line, len);
+    if (written == (ssize_t)len) return true;
+    /* Pipes are nonblocking: a full pipe drops the event instead of stalling
+       the editor. A partial line would desynchronize the stream, so stop worker. */
+    if (written >= 0 || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR))
+        worker_close(worker, true);
+    return false;
+}
+
+static bool json_get_string(const char *json, const char *field,
+                            char *out, size_t out_cap) {
+    char key[64];
+    if (snprintf(key, sizeof(key), "\"%s\"", field) >= (int)sizeof(key)) return false;
+    const char *p = strstr(json, key);
+    if (!p) return false;
+    p += strlen(key);
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p++ != ':') return false;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p++ != '"') return false;
+    size_t n = 0;
+    while (*p && *p != '"') {
+        unsigned char c = (unsigned char)*p++;
+        if (c == '\\') {
+            if (!*p) return false;
+            c = (unsigned char)*p++;
+            if (c == 'n') c = '\n';
+            else if (c == 'r') c = '\r';
+            else if (c == 't') c = '\t';
+            else if (c == 'b') c = '\b';
+            else if (c == 'f') c = '\f';
+            else if (c == 'u') {
+                uint32_t cp = 0;
+                for (int i = 0; i < 4; i++) {
+                    if (!*p) return false;
+                    unsigned char h = (unsigned char)*p++;
+                    int v = h >= '0' && h <= '9' ? h - '0' :
+                            h >= 'a' && h <= 'f' ? h - 'a' + 10 :
+                            h >= 'A' && h <= 'F' ? h - 'A' + 10 : -1;
+                    if (v < 0) return false;
+                    cp = (cp << 4) | (uint32_t)v;
+                }
+                if (cp >= 0xd800 && cp <= 0xdbff) {
+                    if (!p[0] || !p[1] || p[0] != '\\' || p[1] != 'u') return false;
+                    p += 2;
+                    uint32_t low = 0;
+                    for (int i = 0; i < 4; i++) {
+                        if (!*p) return false;
+                        unsigned char h = (unsigned char)*p++;
+                        int v = h >= '0' && h <= '9' ? h - '0' :
+                                h >= 'a' && h <= 'f' ? h - 'a' + 10 :
+                                h >= 'A' && h <= 'F' ? h - 'A' + 10 : -1;
+                        if (v < 0) return false;
+                        low = (low << 4) | (uint32_t)v;
+                    }
+                    if (low < 0xdc00 || low > 0xdfff) return false;
+                    cp = 0x10000 + ((cp - 0xd800) << 10) + (low - 0xdc00);
+                } else if (cp >= 0xdc00 && cp <= 0xdfff) {
+                    return false;
+                }
+                if (cp == 0) return false;
+                char encoded[4];
+                size_t encoded_len = utf8_encode(cp, encoded);
+                if (n + encoded_len >= out_cap) return false;
+                memcpy(out + n, encoded, encoded_len);
+                n += encoded_len;
+                continue;
+            } else if (c != '"' && c != '\\' && c != '/') return false;
+        }
+        if (c == 0) return false;
+        if (n + 1 >= out_cap) return false;
+        out[n++] = (char)c;
+    }
+    if (*p != '"') return false;
+    out[n] = '\0';
+    return true;
+}
+
+static bool worker_handle_line(const char *line) {
+    if (line[0] != '{') return false;
+    const char *protocol = strstr(line, "\"protocol\"");
+    if (!protocol) return false;
+    protocol = strchr(protocol, ':');
+    if (!protocol || strtol(protocol + 1, NULL, 10) != 2) return false;
+    char action[32], message[257];
+    if (!json_get_string(line, "action", action, sizeof(action))) return false;
+    if (strcmp(action, "notify") == 0) {
+        if (!json_get_string(line, "message", message, sizeof(message))) return false;
+        for (char *p = message; *p; p++)
+            if ((unsigned char)*p < 0x20 || (unsigned char)*p == 0x7f) *p = ' ';
+        if (g_editor_ctx && g_editor_ctx->render) {
+            render_set_status(g_editor_ctx->render, "%s", message);
+            g_editor_ctx->render->full_redraw = true;
+        }
+        return true;
+    }
+    if (strcmp(action, "insert") == 0) {
+        char text[1025];
+        if (!json_get_string(line, "text", text, sizeof(text))) return false;
+        size_t len = strlen(text);
+        for (size_t i = 0; i < len;) {
+            uint32_t cp;
+            size_t n = utf8_decode(text + i, len - i, &cp);
+            if (!n || (cp == 0xfffd && n == 1)) return false;
+            i += n;
+        }
+        if (len && g_editor_ctx && g_editor_ctx->worker_insert)
+            g_editor_ctx->worker_insert(text, len);
+        return true;
+    }
+    return false;
+}
+
+static void worker_read_available(PluginWorker *worker) {
+    char incoming[512];
+    size_t budget = 8192;
+    for (;;) {
+        size_t request = budget < sizeof(incoming) ? budget : sizeof(incoming);
+        ssize_t got = read(worker->output_fd, incoming, request);
+        if (got < 0 && errno == EINTR) continue;
+        if (got < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+        if (got <= 0) {
+            worker_close(worker, true);
+            return;
+        }
+        budget -= (size_t)got;
+        for (ssize_t i = 0; i < got; i++) {
+            char c = incoming[i];
+            if (c == '\n') {
+                worker->read_buffer[worker->read_len] = '\0';
+                if (worker->read_len && !worker_handle_line(worker->read_buffer)) {
+                    fprintf(stderr, "forge: invalid worker response from %s\n", worker->name);
+                    worker_close(worker, true);
+                    return;
+                }
+                worker->read_len = 0;
+            } else if (worker->read_len + 1 < sizeof(worker->read_buffer)) {
+                worker->read_buffer[worker->read_len++] = c;
+            } else {
+                fprintf(stderr, "forge: worker response too large: %s\n", worker->name);
+                worker_close(worker, true);
+                return;
+            }
+        }
+        if (budget == 0) break;
+    }
+    int status;
+    pid_t result = waitpid(worker->pid, &status, WNOHANG);
+    if (result == worker->pid || (result < 0 && errno == ECHILD))
+        worker_close(worker, false);
+}
+
 void plugin_set_editor_context(EditorContext *ctx) {
     g_editor_ctx = ctx;
 }
@@ -40,26 +340,37 @@ void plugin_set_editor_context(EditorContext *ctx) {
 void plugin_run_hook(const char *command, const char *filepath) {
     if (!command || command[0] == '\0') return;
 
-    /* Expand $FILE in the command */
-    char expanded[1024];
-    int  elen = 0;
-    int  clen = (int)strlen(command);
-
-    for (int i = 0; i < clen && elen < (int)sizeof(expanded) - 1; i++) {
-        if (command[i] == '$' && i + 4 < clen &&
-            memcmp(command + i + 1, "FILE", 4) == 0) {
-            /* Replace $FILE with filepath */
-            if (filepath) {
-                int flen = (int)strlen(filepath);
-                if (elen + flen < (int)sizeof(expanded) - 1) {
-                    memcpy(expanded + elen, filepath, flen);
-                    elen += flen;
-                }
-            }
-            i += 4;  /* skip FILE */
-        } else {
+    /* Expand $FILE as one safely quoted shell argument. In config, write
+       `formatter $FILE` without adding quotes around the placeholder. */
+    char expanded[4096];
+    size_t elen = 0, clen = strlen(command);
+    for (size_t i = 0; i < clen; i++) {
+        bool file_token = command[i] == '$' && i + 5 <= clen &&
+                          memcmp(command + i + 1, "FILE", 4) == 0 &&
+                          (i + 5 == clen || !(isalnum((unsigned char)command[i + 5]) ||
+                                               command[i + 5] == '_'));
+        if (!file_token) {
+            if (elen + 1 >= sizeof(expanded)) return;
             expanded[elen++] = command[i];
+            continue;
         }
+
+        const char *value = filepath ? filepath : "";
+        if (elen + 2 >= sizeof(expanded)) return;
+        expanded[elen++] = '\'';
+        for (const char *p = value; *p; p++) {
+            if (*p == '\'') {
+                if (elen + 4 >= sizeof(expanded)) return;
+                memcpy(expanded + elen, "'\\''", 4);
+                elen += 4;
+            } else {
+                if (elen + 1 >= sizeof(expanded)) return;
+                expanded[elen++] = *p;
+            }
+        }
+        if (elen + 1 >= sizeof(expanded)) return;
+        expanded[elen++] = '\'';
+        i += 4;
     }
     expanded[elen] = '\0';
 
@@ -81,17 +392,15 @@ void plugin_run_hook(const char *command, const char *filepath) {
     /* Reap zombie later */
     if (pid > 0) {
         /* Non-blocking wait to reap any previous zombies */
-        waitpid(-1, NULL, WNOHANG);
+        while (waitpid(-1, NULL, WNOHANG) > 0) {}
     }
 }
 
 /* ══════════════════════════════════════════════════════════════
-   Plugin host — dlopen-based C plugin loading
+   Legacy in-process C plugin loading
 
-   Plugins are shared objects (.so) that contain a
-   forge_plugin_init() function. When loaded, this function
-   is called automatically (it's a constructor), which lets
-   the plugin register its callbacks.
+   This path is intentionally opt-in: dlopen plugins run with the
+   editor's full privileges and can crash or corrupt the editor.
    ══════════════════════════════════════════════════════════════ */
 
 void plugin_host_init(PluginHost *ph) {
@@ -99,16 +408,111 @@ void plugin_host_init(PluginHost *ph) {
     ph->initialized = true;
     g_plugin_host = ph;
 
-    /* Default search paths */
-    const char *home = getenv("HOME");
-    if (home) {
-        snprintf(ph->search_paths[0], sizeof(ph->search_paths[0]),
-                 "%s/.config/forge/plugins", home);
+    /* Default per-user search path, honoring the XDG config directory. */
+    if (plugin_user_dir(ph->search_paths[0], sizeof(ph->search_paths[0]))) {
         ph->search_path_count = 1;
     }
 }
 
+static bool worker_start(PluginHost *ph, const char *path) {
+    if (!ph || ph->worker_count >= PLUGIN_MAX_WORKERS || !path) return false;
+    for (int i = 0; i < ph->worker_count; i++)
+        if (ph->workers[i].running && strcmp(ph->workers[i].path, path) == 0)
+            return true;
+    struct stat st;
+    if (lstat(path, &st) != 0 || !S_ISREG(st.st_mode) || access(path, X_OK) != 0)
+        return false;
+
+    int to_child[2], from_child[2];
+    if (pipe2(to_child, O_CLOEXEC) != 0) return false;
+    if (pipe2(from_child, O_CLOEXEC) != 0) {
+        close(to_child[0]); close(to_child[1]); return false;
+    }
+    pid_t pid = fork();
+    if (pid == 0) {
+        (void)dup2(to_child[0], STDIN_FILENO);
+        (void)dup2(from_child[1], STDOUT_FILENO);
+        close(to_child[0]); close(to_child[1]);
+        close(from_child[0]); close(from_child[1]);
+        execl(path, path, (char *)NULL);
+        _exit(127);
+    }
+    close(to_child[0]); close(from_child[1]);
+    if (pid < 0) {
+        close(to_child[1]); close(from_child[0]); return false;
+    }
+
+    int in_flags = fcntl(to_child[1], F_GETFL, 0);
+    int out_flags = fcntl(from_child[0], F_GETFL, 0);
+    if (in_flags < 0 || out_flags < 0 ||
+        fcntl(to_child[1], F_SETFL, in_flags | O_NONBLOCK) < 0 ||
+        fcntl(from_child[0], F_SETFL, out_flags | O_NONBLOCK) < 0) {
+        close(to_child[1]); close(from_child[0]);
+        kill(pid, SIGKILL);
+        while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}
+        return false;
+    }
+
+    PluginWorker *worker = &ph->workers[ph->worker_count++];
+    memset(worker, 0, sizeof(*worker));
+    snprintf(worker->path, sizeof(worker->path), "%s", path);
+    const char *base = strrchr(path, '/');
+    snprintf(worker->name, sizeof(worker->name), "%s", base ? base + 1 : path);
+    worker->pid = pid;
+    worker->input_fd = to_child[1];
+    worker->output_fd = from_child[0];
+    worker->running = true;
+    fprintf(stderr, "forge: started plugin worker: %s\n", worker->name);
+    return true;
+}
+
+int plugin_workers_load_dir(PluginHost *ph, const char *dir) {
+    if (!ph || !ph->initialized || !dir) return 0;
+    for (int i = 0; i < ph->worker_count;) {
+        if (ph->workers[i].running) { i++; continue; }
+        ph->workers[i] = ph->workers[--ph->worker_count];
+        memset(&ph->workers[ph->worker_count], 0, sizeof(ph->workers[0]));
+    }
+    DIR *d = opendir(dir);
+    if (!d) return 0;
+    int loaded = 0;
+    struct dirent *entry;
+    while ((entry = readdir(d)) != NULL) {
+        const char *dot = strrchr(entry->d_name, '.');
+        if (!dot || strcmp(dot, ".forge-plugin") != 0) continue;
+        char full_path[1024];
+        int n = snprintf(full_path, sizeof(full_path), "%s/%s", dir, entry->d_name);
+        if (n < 0 || (size_t)n >= sizeof(full_path)) continue;
+        if (worker_start(ph, full_path)) loaded++;
+    }
+    closedir(d);
+    return loaded;
+}
+
+static void workers_send_event(PluginHost *ph, const char *event,
+                               const char *filepath, int key) {
+    for (int i = 0; i < ph->worker_count; i++) {
+        PluginWorker *worker = &ph->workers[i];
+        if (worker->running)
+            (void)worker_send_event(worker, event, filepath, key);
+    }
+}
+
+void plugin_workers_poll(PluginHost *ph) {
+    if (!ph || !ph->initialized) return;
+    for (int i = 0; i < ph->worker_count; i++)
+        if (ph->workers[i].running) worker_read_available(&ph->workers[i]);
+}
+
+void plugin_workers_stop_all(PluginHost *ph) {
+    if (!ph) return;
+    for (int i = 0; i < ph->worker_count; i++)
+        worker_close(&ph->workers[i], true);
+    ph->worker_count = 0;
+}
+
 void plugin_host_free(PluginHost *ph) {
+    plugin_workers_stop_all(ph);
     /* Unload all plugins */
     for (int i = 0; i < ph->plugin_count; i++) {
         if (ph->plugins[i].handle) {
@@ -206,6 +610,7 @@ int plugin_host_load_dir(PluginHost *ph, const char *dir) {
 
 void plugin_on_save(PluginHost *ph, const char *filepath) {
     if (!ph || !ph->initialized) return;
+    workers_send_event(ph, "save", filepath, 0);
     for (int i = 0; i < ph->on_save_count; i++) {
         if (ph->on_save_cbs[i])
             ph->on_save_cbs[i](filepath);
@@ -214,6 +619,7 @@ void plugin_on_save(PluginHost *ph, const char *filepath) {
 
 void plugin_on_open(PluginHost *ph, const char *filepath) {
     if (!ph || !ph->initialized) return;
+    workers_send_event(ph, "open", filepath, 0);
     for (int i = 0; i < ph->on_open_count; i++) {
         if (ph->on_open_cbs[i])
             ph->on_open_cbs[i](filepath);
@@ -222,6 +628,7 @@ void plugin_on_open(PluginHost *ph, const char *filepath) {
 
 void plugin_on_close(PluginHost *ph, const char *filepath) {
     if (!ph || !ph->initialized) return;
+    workers_send_event(ph, "close", filepath, 0);
     for (int i = 0; i < ph->on_close_count; i++) {
         if (ph->on_close_cbs[i])
             ph->on_close_cbs[i](filepath);
@@ -230,6 +637,8 @@ void plugin_on_close(PluginHost *ph, const char *filepath) {
 
 void plugin_on_keypress(PluginHost *ph, int key, void *buf) {
     if (!ph || !ph->initialized) return;
+    workers_send_event(ph, "keypress",
+        g_editor_ctx && g_editor_ctx->filepath ? *g_editor_ctx->filepath : NULL, key);
     for (int i = 0; i < ph->on_keypress_count; i++) {
         if (ph->on_keypress_cbs[i])
             ph->on_keypress_cbs[i](key, buf);
@@ -400,16 +809,7 @@ size_t forge_buffer_word_count(ForgeBuffer *buf) {
     return words;
 }
 
-/* ── Widget API — STUBS ────────────────────────────────────── */
-/*
- * The widget API is declared in forge_api.h but the render system
- * does not yet have infrastructure to iterate and draw registered
- * widgets. These are explicit no-op stubs. Plugins that use the
- * widget API will get stderr warnings at runtime.
- *
- * To fully support widgets, render.c would need a widget registry
- * and iteration in render_frame(). That is a separate feature.
- */
+/* ── Legacy widget API ─────────────────────────────────────── */
 
 ForgeWidget *forge_widget_new(const char *name, int slot, int priority) {
     ForgeWidget *w = calloc(1, sizeof(ForgeWidget));

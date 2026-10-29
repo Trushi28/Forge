@@ -390,10 +390,14 @@ static void vm_exec(ForgeScriptVM *vm, FSScript *sc, int start, int len) {
             case FS_OP_CALL_RUN:
                 if (sc->sp > 0) {
                     sc->sp--;
-                    plugin_run_hook(sc->stack[sc->sp],
-                                    vm->current_filepath[0]
-                                        ? vm->current_filepath
-                                        : NULL);
+                    if (vm->allow_shell) {
+                        plugin_run_hook(sc->stack[sc->sp],
+                                        vm->current_filepath[0]
+                                            ? vm->current_filepath
+                                            : NULL);
+                    } else {
+                        forge_notify("ForgeScript shell permission is disabled");
+                    }
                 }
                 break;
 
@@ -491,6 +495,10 @@ static void vm_exec(ForgeScriptVM *vm, FSScript *sc, int start, int len) {
 void fs_vm_init(ForgeScriptVM *vm) {
     memset(vm, 0, sizeof(*vm));
     vm->initialized = true;
+}
+
+void fs_vm_set_shell_enabled(ForgeScriptVM *vm, bool enabled) {
+    if (vm) vm->allow_shell = enabled;
 }
 
 void fs_vm_free(ForgeScriptVM *vm) {

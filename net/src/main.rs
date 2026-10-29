@@ -4,6 +4,7 @@ use forge_net::discovery;
 use forge_net::guild;
 use forge_net::ipc;
 use forge_net::peer;
+use forge_net::rendezvous;
 use forge_net::transfer;
 
 use std::path::PathBuf;
@@ -19,6 +20,16 @@ use transfer::FilePool;
 
 #[tokio::main]
 async fn main() {
+    if let Some(index) = std::env::args().position(|arg| arg == "--rendezvous-server") {
+        let bind = std::env::args()
+            .nth(index + 1)
+            .unwrap_or_else(|| "127.0.0.1:8765".to_string());
+        if let Err(error) = rendezvous::run_server(&bind).await {
+            eprintln!("forge-net: rendezvous server failed: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     eprintln!("forge-net v0.1 starting...");
 
     // The control socket lives in the per-user config dir (not world-writable /tmp).
@@ -86,8 +97,9 @@ async fn main() {
     // Start mDNS discovery in background
     let gs = guild_state.clone();
     let cb = contacts.clone();
+    let ev = events.clone();
     tokio::spawn(async move {
-        if let Err(e) = discovery::run_discovery(gs, cb).await {
+        if let Err(e) = discovery::run_discovery(gs, cb, ev).await {
             eprintln!("forge-net: discovery error: {}", e);
         }
     });
@@ -104,6 +116,7 @@ async fn main() {
         collab_mgr: collab_mgr.clone(),
         events: events.clone(),
         listen_port: port,
+        rtc_peers: Arc::new(Mutex::new(std::collections::HashMap::new())),
     };
     let peer_listener_runtime = peer_runtime.clone();
     tokio::spawn(async move {
@@ -169,8 +182,19 @@ fn socket_path() -> PathBuf {
 }
 
 fn net_config_dir() -> PathBuf {
+    if let Ok(config_home) = std::env::var("XDG_CONFIG_HOME") {
+        let path = PathBuf::from(config_home);
+        if path.is_absolute() {
+            return path.join("forge/net");
+        }
+    }
+
     if let Ok(home) = std::env::var("HOME") {
-        PathBuf::from(home).join(".config/forge/net")
+        if !home.is_empty() {
+            PathBuf::from(home).join(".config/forge/net")
+        } else {
+            PathBuf::from("/tmp/forge-net")
+        }
     } else {
         PathBuf::from("/tmp/forge-net")
     }

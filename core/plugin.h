@@ -23,6 +23,7 @@ typedef struct {
     int                *cy;        /* pointer to cursor row */
     struct RenderState *render;    /* for forge_notify → status bar */
     const char        **filepath;  /* pointer to current filepath */
+    void (*worker_insert)(const char *text, size_t len); /* main-thread edit */
 } EditorContext;
 
 /* Set the editor context. Must be called before plugins fire events. */
@@ -32,6 +33,8 @@ void plugin_set_editor_context(EditorContext *ctx);
 
 #define PLUGIN_MAX_LOADED  32
 #define PLUGIN_MAX_CALLBACKS 16
+#define PLUGIN_MAX_WORKERS 16
+#define PLUGIN_WORKER_MAX_LINE 4096
 
 typedef void (*plugin_save_cb)(const char *filepath);
 typedef void (*plugin_open_cb)(const char *filepath);
@@ -45,6 +48,17 @@ typedef struct {
     bool   loaded;
 } LoadedPlugin;
 
+typedef struct {
+    char   name[128];
+    char   path[512];
+    pid_t  pid;
+    int    input_fd;
+    int    output_fd;
+    char   read_buffer[PLUGIN_WORKER_MAX_LINE];
+    size_t read_len;
+    bool   running;
+} PluginWorker;
+
 /* ── Plugin host ────────────────────────────────────────────── */
 
 typedef struct {
@@ -53,6 +67,11 @@ typedef struct {
     /* Loaded .so plugins */
     LoadedPlugin  plugins[PLUGIN_MAX_LOADED];
     int           plugin_count;
+
+    /* Versioned JSON-line workers; process isolation protects the editor
+       from plugin crashes, but these processes still run as the user. */
+    PluginWorker  workers[PLUGIN_MAX_WORKERS];
+    int           worker_count;
 
     /* Registered callbacks from all plugins */
     plugin_save_cb      on_save_cbs[PLUGIN_MAX_CALLBACKS];
@@ -79,6 +98,10 @@ void plugin_host_free(PluginHost *ph);
 
 /* Scan a directory for .so plugins and load them */
 int  plugin_host_load_dir(PluginHost *ph, const char *dir);
+int  plugin_workers_load_dir(PluginHost *ph, const char *dir);
+void plugin_workers_stop_all(PluginHost *ph);
+void plugin_workers_poll(PluginHost *ph);
+int  plugin_cli(int argc, char **argv);
 
 /* Load a single plugin by path */
 bool plugin_host_load(PluginHost *ph, const char *path);

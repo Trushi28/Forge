@@ -1,4 +1,5 @@
 #include "input.h"
+#include "utf8.h"
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,6 +14,25 @@ int g_mouse_y = 0;
 
 /* ── Terminal state ─────────────────────────────────────────── */
 static struct termios orig_termios;
+static unsigned char pending_input[4];
+static int pending_input_count;
+
+static int read_input_byte(unsigned char *out) {
+  if (pending_input_count > 0) {
+    *out = pending_input[0];
+    memmove(pending_input, pending_input + 1, (size_t)--pending_input_count);
+    return 1;
+  }
+  return read(STDIN_FILENO, out, 1);
+}
+
+static void push_input_bytes(const unsigned char *bytes, int count) {
+  while (count-- > 0 && pending_input_count < (int)sizeof(pending_input)) {
+    memmove(pending_input + 1, pending_input, (size_t)pending_input_count);
+    pending_input[0] = bytes[count];
+    pending_input_count++;
+  }
+}
 
 void input_disable_raw_mode(void) {
   tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
@@ -249,8 +269,8 @@ static int handle_csi(const char *seq, int slen) {
 
 /* ── Main read function ─────────────────────────────────────── */
 int input_read_key(void) {
-  char c;
-  int nread = read(STDIN_FILENO, &c, 1);
+  unsigned char c = 0;
+  int nread = read_input_byte(&c);
 
   if (nread == 0)
     return 0; /* 100 ms timeout — no key */
@@ -260,8 +280,25 @@ int input_read_key(void) {
     exit(1);
   }
 
-  if (c != '\x1b')
-    return (unsigned char)c;
+  if (c != '\x1b') {
+    unsigned char first = c;
+    if (first < 0x80) return first;
+    int need = first >= 0xc2 && first <= 0xdf ? 2 :
+               first >= 0xe0 && first <= 0xef ? 3 :
+               first >= 0xf0 && first <= 0xf4 ? 4 : 1;
+    unsigned char bytes[4] = {first, 0, 0, 0};
+    int got = 1;
+    while (got < need) {
+      int result = read(STDIN_FILENO, &bytes[got], 1);
+      if (result != 1) break;
+      got++;
+    }
+    uint32_t cp;
+    size_t consumed = utf8_decode((const char *)bytes, (size_t)got, &cp);
+    if (consumed < (size_t)got)
+      push_input_bytes(bytes + consumed, got - (int)consumed);
+    return KEY_UNICODE_BASE + (int)cp;
+  }
 
   /* ── Escape sequence ──────────────────────────────────────── */
   char intro;

@@ -151,6 +151,7 @@ typedef struct {
     FSScript   scripts[FS_MAX_SCRIPTS];
     int        script_count;
     bool       initialized;
+    bool       allow_shell;
     char       current_filepath[512];
     char       current_selection[256];
     unsigned   executed_handlers;
@@ -161,6 +162,7 @@ typedef struct {
 
 /* Initialize the VM */
 void fs_vm_init(ForgeScriptVM *vm);
+void fs_vm_set_shell_enabled(ForgeScriptVM *vm, bool enabled);
 
 /* Free the VM and all scripts */
 void fs_vm_free(ForgeScriptVM *vm);

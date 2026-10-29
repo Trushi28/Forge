@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -100,22 +101,6 @@ static int for_each_piece(Buffer *b, piece_fn fn, void *ctx) {
     return 0;
 }
 
-typedef struct { Buffer *b; char *ptr; } FlattenCtx;
-
-static int flatten_cb(PieceNode *n, void *c) {
-    FlattenCtx *f = c;
-    if (n->buf_len > 0) {
-        memcpy(f->ptr, piece_src(f->b, n) + n->buf_start, n->buf_len);
-        f->ptr += n->buf_len;
-    }
-    return 0;
-}
-
-static void flatten_into(Buffer *b, char *dst) {
-    FlattenCtx f = { b, dst };
-    for_each_piece(b, flatten_cb, &f);
-}
-
 /* ── Compaction / rebalancing ───────────────────────────────── */
 
 typedef struct { PieceNode **arr; size_t n; } CollectCtx;
@@ -182,63 +167,29 @@ static void buffer_compact(Buffer *b) {
 static int ilog2(size_t n) { int r = 0; while (n > 1) { n >>= 1; r++; } return r; }
 
 /* ══════════════════════════════════════════════════════════════
-   Line cache
-   ══════════════════════════════════════════════════════════════ */
-
-static void cache_dirty(Buffer *b) { b->line_cache_dirty = true; }
-
-static void cache_rebuild(Buffer *b) {
-    if (!b->line_cache_dirty) return;
-
-    free(b->cached_text);
-    free(b->line_starts);
-
-    size_t total = doc_len(b);
-
-    /* +2: unconditional guard '\n' + '\0'.  "foo\n" has two logical
-       lines ("foo" and ""), so the guard is ALWAYS appended.        */
-    b->cached_text = malloc(total + 2);
-    flatten_into(b, b->cached_text);
-    b->cached_text[total] = '\n';
-    size_t scan_total = total + 1;
-    b->cached_text[scan_total] = '\0';
-
-    size_t nlines = 0;
-    for (size_t i = 0; i < scan_total; i++)
-        if (b->cached_text[i] == '\n') nlines++;
-
-    /* line_starts[nlines] = sentinel (one past the last '\n') */
-    b->line_starts    = malloc((nlines + 1) * sizeof(size_t));
-    b->line_starts[0] = 0;
-    size_t li = 1;
-    for (size_t i = 0; i < scan_total && li <= nlines; i++)
-        if (b->cached_text[i] == '\n')
-            b->line_starts[li++] = i + 1;
-
-    b->line_count       = nlines;
-    b->line_cache_dirty = false;
-}
-
-/* ══════════════════════════════════════════════════════════════
    Buffer lifecycle
    ══════════════════════════════════════════════════════════════ */
 
 Buffer *buffer_new(const char *initial_content, size_t len) {
+    if (len > 0 && !initial_content) return NULL;
     Buffer *b = calloc(1, sizeof(Buffer));
+    if (!b) return NULL;
 
     b->nil = calloc(1, sizeof(PieceNode));
+    if (!b->nil) { free(b); return NULL; }
     b->nil->color  = RB_BLACK;
     b->nil->left   = b->nil->right = b->nil->parent = b->nil;
 
     b->original_len = len;
     if (len > 0) {
         b->original = malloc(len);
+        if (!b->original) { free(b->nil); free(b); return NULL; }
         memcpy(b->original, initial_content, len);
     }
 
     b->add_cap = 64 * 1024;
     b->add_buf = malloc(b->add_cap);
-    b->line_cache_dirty = true;
+    if (!b->add_buf) { free(b->original); free(b->nil); free(b); return NULL; }
     b->root = b->nil;
 
     if (len > 0) {
@@ -252,7 +203,7 @@ Buffer *buffer_new(const char *initial_content, size_t len) {
             root->color         = RB_BLACK;
             b->root        = root;
             b->piece_count = 1;
-        }
+        } else { buffer_free(b); return NULL; }
     }
     return b;
 }
@@ -261,8 +212,6 @@ void buffer_free(Buffer *b) {
     if (!b) return;
     free(b->original);
     free(b->add_buf);
-    free(b->cached_text);
-    free(b->line_starts);
     free(b->nil);
     free(b);
 }
@@ -309,14 +258,15 @@ static void link_node(Buffer *b, PieceNode *new_node, PieceNode *parent,
 }
 
 void buffer_insert(Buffer *b, size_t char_pos, const char *text, size_t len) {
-    if (len == 0 || !text) return;
+    if (!b || len == 0 || !text || len > SIZE_MAX - b->add_len) return;
 
     size_t total = doc_len(b);
     if (char_pos > total) char_pos = total;
 
     /* Grow add-buffer */
     if (b->add_len + len > b->add_cap) {
-        size_t ncap = (b->add_len + len) * 2;
+        size_t needed = b->add_len + len;
+        size_t ncap = needed > SIZE_MAX / 2 ? needed : needed * 2;
         char *nb = realloc(b->add_buf, ncap);
         if (!nb) return;
         b->add_buf = nb;
@@ -325,8 +275,6 @@ void buffer_insert(Buffer *b, size_t char_pos, const char *text, size_t len) {
     size_t add_start = b->add_len;
     memcpy(b->add_buf + add_start, text, len);
     b->add_len += len;
-    cache_dirty(b);
-
     size_t z_lines = count_newlines(text, len);
 
     /* Fast path: typing continues the add piece that ends right here. */
@@ -436,9 +384,7 @@ done:
    ══════════════════════════════════════════════════════════════ */
 
 void buffer_delete(Buffer *b, size_t char_pos, size_t del_len) {
-    if (del_len == 0 || b->root == b->nil) return;
-    cache_dirty(b);
-
+    if (!b || del_len == 0 || b->root == b->nil) return;
     while (del_len > 0) {
         PieceNode *curr = b->root;
         size_t     pos  = 0;
@@ -526,57 +472,163 @@ void buffer_delete(Buffer *b, size_t char_pos, size_t del_len) {
 }
 
 /* ══════════════════════════════════════════════════════════════
-   Public read API  (all backed by the line cache)
+   Public read API
+
+   Line starts are selected using cached subtree newline counts. Rendering a
+   visible line therefore copies only that line; it no longer flattens and
+   rescans the entire document after each edit.
    ══════════════════════════════════════════════════════════════ */
 
-size_t buffer_total_len(Buffer *b) { return doc_len(b); }
+size_t buffer_total_len(Buffer *b) { return b ? doc_len(b) : 0; }
+
+size_t buffer_line_count(Buffer *b) {
+    return b ? (b->root != b->nil ? b->root->subtree_lines : 0) + 1 : 0;
+}
+
+size_t buffer_line_to_offset(Buffer *b, size_t line) {
+    if (!b || line == 0) return 0;
+    size_t line_count = buffer_line_count(b);
+    if (line >= line_count) return doc_len(b);
+
+    /* Find the (line - 1)th newline in the in-order piece sequence. */
+    size_t target = line - 1;
+    size_t base = 0;
+    PieceNode *n = b->root;
+    while (n != b->nil) {
+        size_t left_lines = n->left->subtree_lines;
+        if (target < left_lines) {
+            n = n->left;
+            continue;
+        }
+        target -= left_lines;
+        base += n->left->subtree_len;
+
+        if (target < n->own_lines) {
+            const char *src = piece_src(b, n) + n->buf_start;
+            const char *p = src;
+            while (target > 0) {
+                p = memchr(p, '\n', (size_t)(src + n->buf_len - p));
+                if (!p) return doc_len(b);
+                p++;
+                target--;
+            }
+            p = memchr(p, '\n', (size_t)(src + n->buf_len - p));
+            return p ? base + (size_t)(p - src) + 1 : doc_len(b);
+        }
+
+        target -= n->own_lines;
+        base += n->buf_len;
+        n = n->right;
+    }
+    return doc_len(b);
+}
+
+size_t buffer_offset_to_line(Buffer *b, size_t offset) {
+    if (!b) return 0;
+    size_t total = doc_len(b);
+    if (offset > total) offset = total;
+    size_t lines = 0;
+    PieceNode *n = b->root;
+    while (n != b->nil) {
+        size_t left_len = n->left->subtree_len;
+        if (offset < left_len) {
+            n = n->left;
+            continue;
+        }
+        lines += n->left->subtree_lines;
+        offset -= left_len;
+        if (n->buf_len > 0 && offset <= n->buf_len) {
+            const char *src = piece_src(b, n) + n->buf_start;
+            lines += count_newlines(src, offset);
+            return lines;
+        }
+        offset -= n->buf_len;
+        lines += n->own_lines;
+        n = n->right;
+    }
+    return lines;
+}
+
+static PieceNode *piece_successor(Buffer *b, PieceNode *n) {
+    if (n->right != b->nil) {
+        n = n->right;
+        while (n->left != b->nil) n = n->left;
+        return n;
+    }
+    PieceNode *parent = n->parent;
+    while (parent != b->nil && n == parent->right) {
+        n = parent;
+        parent = parent->parent;
+    }
+    return parent;
+}
+
+size_t buffer_read_range(Buffer *b, size_t offset, char *out, size_t len) {
+    if (!b || !out || len == 0) return 0;
+    size_t total = doc_len(b);
+    if (offset >= total) return 0;
+    if (len > total - offset) len = total - offset;
+
+    size_t piece_start = 0;
+    PieceNode *n = find_piece(b, offset, &piece_start);
+    if (!n) return 0;
+    size_t copied = 0;
+    while (n != b->nil && copied < len) {
+        if (n->buf_len > 0) {
+            size_t in_piece = offset > piece_start ? offset - piece_start : 0;
+            size_t avail = n->buf_len - in_piece;
+            size_t take = len - copied < avail ? len - copied : avail;
+            memcpy(out + copied, piece_src(b, n) + n->buf_start + in_piece, take);
+            copied += take;
+            offset += take;
+        }
+        size_t next_start = piece_start + n->buf_len;
+        n = piece_successor(b, n);
+        piece_start = next_start;
+    }
+    return copied;
+}
 
 char *buffer_get_text(Buffer *b) {
-    cache_rebuild(b);
-    size_t len  = doc_len(b);
-    char  *copy = malloc(len + 1);
-    memcpy(copy, b->cached_text, len);
+    if (!b) return NULL;
+    size_t len = doc_len(b);
+    char *copy = malloc(len + 1);
+    if (!copy) return NULL;
+    buffer_read_range(b, 0, copy, len);
     copy[len] = '\0';
     return copy;
 }
 
-size_t buffer_line_count(Buffer *b) {
-    cache_rebuild(b);
-    return b->line_count;
-}
-
 char *buffer_get_line(Buffer *b, int line_idx) {
-    cache_rebuild(b);
-    if (line_idx < 0 || (size_t)line_idx >= b->line_count) return NULL;
-
-    size_t start = b->line_starts[line_idx];
-    size_t end   = b->line_starts[line_idx + 1];
-    if (end > start && b->cached_text[end - 1] == '\n') end--;
-
-    size_t len    = end - start;
-    char  *result = malloc(len + 1);
-    memcpy(result, b->cached_text + start, len);
+    if (!b || line_idx < 0 || (size_t)line_idx >= buffer_line_count(b)) return NULL;
+    size_t start = buffer_line_to_offset(b, (size_t)line_idx);
+    size_t end = (size_t)line_idx + 1 < buffer_line_count(b)
+               ? buffer_line_to_offset(b, (size_t)line_idx + 1) : doc_len(b);
+    if (end > start) {
+        char last;
+        if (buffer_read_range(b, end - 1, &last, 1) == 1 && last == '\n') end--;
+    }
+    size_t len = end - start;
+    char *result = malloc(len + 1);
+    if (!result) return NULL;
+    buffer_read_range(b, start, result, len);
     result[len] = '\0';
     return result;
 }
 
 size_t buffer_get_offset(Buffer *b, int cx, int cy) {
-    cache_rebuild(b);
-    if (b->line_count == 0) return 0;
-
-    size_t line = cy < 0 ? 0
-                : (size_t)cy < b->line_count ? (size_t)cy : b->line_count - 1;
-    size_t start = b->line_starts[line];
-    size_t next  = b->line_starts[line + 1];
-
-    size_t line_len = (next > start && b->cached_text[next - 1] == '\n')
-                          ? next - start - 1
-                          : next - start;
-
-    size_t dl  = doc_len(b);
-    size_t col = cx < 0 ? 0 : ((size_t)cx < line_len ? (size_t)cx : line_len);
-    size_t off = start + col;
-    return off < dl ? off : dl;
+    if (!b) return 0;
+    size_t count = buffer_line_count(b);
+    size_t line = cy < 0 ? 0 : (size_t)cy < count ? (size_t)cy : count - 1;
+    size_t start = buffer_line_to_offset(b, line);
+    size_t end = line + 1 < count ? buffer_line_to_offset(b, line + 1) : doc_len(b);
+    if (end > start) {
+        char last;
+        if (buffer_read_range(b, end - 1, &last, 1) == 1 && last == '\n') end--;
+    }
+    size_t line_len = end - start;
+    size_t col = cx < 0 ? 0 : (size_t)cx < line_len ? (size_t)cx : line_len;
+    return start + col;
 }
 
 /* ══════════════════════════════════════════════════════════════
@@ -599,29 +651,54 @@ static int write_pieces(Buffer *b, FILE *f) {
 }
 
 int buffer_save(Buffer *b, const char *path) {
+    if (!b || !path || !path[0]) return -1;
     char real[PATH_MAX];
     const char *target = realpath(path, real) ? real : path;
 
     char tmp[PATH_MAX + 32];
-    snprintf(tmp, sizeof(tmp), "%s.forge-tmp.%d", target, (int)getpid());
+    int n = snprintf(tmp, sizeof(tmp), "%s.forge-tmp.XXXXXX", target);
+    if (n < 0 || (size_t)n >= sizeof(tmp)) return -1;
 
-    FILE *f = fopen(tmp, "wb");
-    if (f) {
-        int bad = write_pieces(b, f);
-        bad |= fflush(f);
-        bad |= fsync(fileno(f));
-        struct stat st;
-        if (stat(target, &st) == 0) bad |= fchmod(fileno(f), st.st_mode & 07777);
-        bad |= fclose(f);
-        if (!bad && rename(tmp, target) == 0) return 0;
-        remove(tmp);
-        if (bad) return -1;
+    int fd = mkstemp(tmp);
+    if (fd < 0) return -1;
+    FILE *f = fdopen(fd, "wb");
+    if (!f) {
+        close(fd);
+        unlink(tmp);
+        return -1;
     }
 
-    /* Fallback: direct write */
-    f = fopen(target, "wb");
-    if (!f) return -1;
     int bad = write_pieces(b, f);
-    bad |= fclose(f);
-    return bad ? -1 : 0;
+    if (fflush(f) != 0) bad = 1;
+    if (fsync(fileno(f)) != 0) bad = 1;
+    struct stat st;
+    if (stat(target, &st) == 0 && fchmod(fileno(f), st.st_mode & 07777) != 0)
+        bad = 1;
+    if (fclose(f) != 0) bad = 1;
+
+    if (!bad && rename(tmp, target) == 0) {
+        /* Persist the rename as well as the file data where the filesystem
+           supports directory fsync. */
+        char dir[PATH_MAX];
+        size_t target_len = strlen(target);
+        if (target_len < sizeof(dir)) {
+            memcpy(dir, target, target_len + 1);
+            char *slash = strrchr(dir, '/');
+            if (slash) {
+                if (slash == dir) slash[1] = '\0';
+                else *slash = '\0';
+            } else {
+                strcpy(dir, ".");
+            }
+            int dfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+            if (dfd >= 0) {
+                (void)fsync(dfd);
+                close(dfd);
+            }
+        }
+        return 0;
+    }
+
+    unlink(tmp);
+    return -1;
 }

@@ -62,6 +62,10 @@ enum KeyCode {
   KEY_ALT_MOUSE_LEFT = 1205,
 };
 
+/* UTF-8 input scalars are returned above the synthetic key-code range so
+   characters such as U+03E8 cannot collide with KEY_ARROW_UP. */
+#define KEY_UNICODE_BASE 0x110000
+
 /* Set by input_read_key() when a mouse key is returned.
    Both are 0-indexed terminal cell coordinates.               */
 extern int g_mouse_x;
@@ -75,7 +79,8 @@ void input_disable_raw_mode(void);
 void input_enable_mouse(void);
 void input_disable_mouse(void);
 
-/* Returns a KeyCode or ASCII value. Returns 0 on timeout (100 ms). */
+/* Returns a KeyCode, ASCII value, or KEY_UNICODE_BASE + Unicode scalar.
+   Returns 0 on timeout (100 ms). */
 int input_read_key(void);
 
 /* Terminal size */

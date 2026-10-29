@@ -6,8 +6,9 @@
 #include <sys/types.h>
 
 /* ── IPC Bridge — C ↔ forge-net (Rust) via Unix socket ──────
-   Socket lives at $HOME/.config/forge/net/forge-net.sock (mode 0600),
-   NOT in world-writable /tmp.  forge-net must use the same path.   */
+   Socket lives at $XDG_CONFIG_HOME/forge/net/forge-net.sock when the
+   XDG path is absolute, otherwise $HOME/.config/forge/net/forge-net.sock
+   (or /tmp/forge-net/forge-net.sock without HOME). forge-net shares it. */
 
 #define IPC_READ_BUF_INIT 65536
 #define IPC_MAX_MSG_SZ    (1024 * 1024)

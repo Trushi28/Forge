@@ -1,21 +1,27 @@
 //! Encrypted peer-to-peer protocol for Forge guild traffic.
 
 use crate::collab::CollabManager;
+use crate::crypto::CryptoSession;
 use crate::crypto::{ContactBook, EncryptedFrame, Identity, Invite, TrustDecision};
 use crate::guild::GuildState;
 use crate::ipc::OutgoingMsg;
+use crate::rtc_transport;
 use crate::transfer::{FilePool, SharedFile};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
+use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::{broadcast, Mutex, Semaphore};
+use tokio::time::{timeout, Duration};
 
 const MAX_PLAIN_FRAME: usize = 128 * 1024;
 const MAX_ENCRYPTED_FRAME: usize = 64 * 1024 * 1024;
-const PROTOCOL_VERSION: u16 = 1;
+const PROTOCOL_VERSION: u16 = 2;
 
 #[derive(Clone)]
 pub struct PeerRuntime {
@@ -26,6 +32,52 @@ pub struct PeerRuntime {
     pub collab_mgr: Arc<Mutex<CollabManager>>,
     pub events: broadcast::Sender<OutgoingMsg>,
     pub listen_port: u16,
+    pub rtc_peers: Arc<Mutex<std::collections::HashMap<String, Arc<RtcPeer>>>>,
+}
+
+pub struct RtcPeer {
+    pub channel: Arc<dyn webrtc::data_channel::DataChannel>,
+    pub session: Mutex<CryptoSession>,
+}
+
+impl RtcPeer {
+    pub(crate) async fn send(&self, message: &PeerMsg) -> Result<(), String> {
+        let body = serde_json::to_vec(message).map_err(|error| error.to_string())?;
+        if body.len() > rtc_transport::RTC_MAX_PEER_MESSAGE {
+            return Err("message exceeds WebRTC data-channel limit".into());
+        }
+        let mut session = self.session.lock().await;
+        let chunks = body.chunks(8 * 1024).len();
+        if chunks == 1 {
+            let frame = session.encrypt(&body)?;
+            let text = serde_json::to_string(&rtc_transport::PeerWireFrame::Encrypted(frame))
+                .map_err(|error| error.to_string())?;
+            return self
+                .channel
+                .send_text(&text)
+                .await
+                .map_err(|error| error.to_string());
+        }
+        if chunks > u16::MAX as usize {
+            return Err("message needs too many WebRTC fragments".into());
+        }
+        let message_id = rtc_transport::next_message_id();
+        for (index, chunk) in body.chunks(8 * 1024).enumerate() {
+            let frame = session.encrypt(chunk)?;
+            let wire = rtc_transport::PeerWireFrame::EncryptedChunk {
+                message_id,
+                index: index as u16,
+                total: chunks as u16,
+                frame,
+            };
+            let text = serde_json::to_string(&wire).map_err(|error| error.to_string())?;
+            self.channel
+                .send_text(&text)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +87,7 @@ pub struct PlainHello {
     pub guild: String,
     pub public_key_b64: String,
     pub fingerprint: String,
+    pub ephemeral_key_b64: String,
     /// Port the sender listens on (the connection's source port is ephemeral).
     #[serde(default)]
     pub port: u16,
@@ -114,6 +167,12 @@ impl PeerRuntime {
         relay: Option<String>,
     ) -> Result<String, String> {
         let gs = self.guild_state.lock().await;
+        let signal_url = std::env::var("FORGE_RENDEZVOUS_URL").ok();
+        let signal_room = signal_url.as_ref().map(|_| {
+            let mut token = [0u8; 32];
+            OsRng.fill_bytes(&mut token);
+            URL_SAFE_NO_PAD.encode(token)
+        });
         let invite = Invite {
             handle: gs.my_handle.clone(),
             guild: gs.guild_name.clone(),
@@ -121,8 +180,21 @@ impl PeerRuntime {
             fingerprint: self.identity.fingerprint(),
             addr: addr.or_else(|| local_endpoint(self.listen_port)),
             relay,
+            signal_url: signal_url.clone(),
+            signal_room: signal_room.clone(),
         };
-        invite.encode()
+        let encoded = invite.encode()?;
+        drop(gs);
+        if let (Some(url), Some(room)) = (signal_url, signal_room) {
+            validate_signal_endpoint(&url)?;
+            let runtime = self.clone();
+            tokio::spawn(async move {
+                if let Err(error) = rtc_transport::run(runtime, url, room, false).await {
+                    eprintln!("forge-net: Guild WebRTC host session failed: {error}");
+                }
+            });
+        }
+        Ok(encoded)
     }
 
     pub async fn accept_invite(&self, code: &str) -> Result<Invite, String> {
@@ -137,21 +209,33 @@ impl PeerRuntime {
                 String::new(),
             );
         }
-        if let Some(addr) = &invite.addr {
+        if let Some(addr) = invite.addr.clone() {
+            let runtime = self.clone();
             let (from, guild) = {
                 let gs = self.guild_state.lock().await;
                 (gs.my_handle.clone(), gs.guild_name.clone())
             };
-            let _ = self
-                .send_to_addr(
-                    addr,
-                    PeerMsg::Presence {
-                        from,
-                        guild,
-                        file: String::new(),
-                    },
-                )
-                .await;
+            tokio::spawn(async move {
+                let message = PeerMsg::Presence {
+                    from,
+                    guild,
+                    file: String::new(),
+                };
+                if let Err(error) = runtime.send_to_addr(&addr, message).await {
+                    eprintln!("forge-net: direct invite probe failed: {error}");
+                }
+            });
+        }
+        if let (Some(url), Some(room)) = (&invite.signal_url, &invite.signal_room) {
+            validate_signal_endpoint(url)?;
+            let runtime = self.clone();
+            let url = url.clone();
+            let room = room.clone();
+            tokio::spawn(async move {
+                if let Err(error) = rtc_transport::run(runtime, url, room, true).await {
+                    eprintln!("forge-net: Guild WebRTC guest session failed: {error}");
+                }
+            });
         }
         Ok(invite)
     }
@@ -166,7 +250,7 @@ impl PeerRuntime {
             let runtime = self.clone();
             let msg = msg.clone();
             tokio::spawn(async move {
-                if let Err(e) = runtime.send_to_addr(&peer.addr, msg).await {
+                if let Err(e) = runtime.send_to_handle(&peer.handle, msg).await {
                     eprintln!("forge-net: failed to send to {}: {}", peer.handle, e);
                 }
             });
@@ -174,6 +258,12 @@ impl PeerRuntime {
     }
 
     pub async fn send_to_handle(&self, handle: &str, msg: PeerMsg) -> Result<(), String> {
+        let rtc_peer = self.rtc_peers.lock().await.get(handle).cloned();
+        if let Some(peer) = rtc_peer {
+            if let Ok(()) = peer.send(&msg).await {
+                return Ok(());
+            }
+        }
         let addr = {
             let gs = self.guild_state.lock().await;
             gs.find_peer(handle).map(|p| p.addr.clone())
@@ -193,19 +283,24 @@ impl PeerRuntime {
 
     pub async fn send_to_addr(&self, addr: &str, msg: PeerMsg) -> Result<(), String> {
         let mut stream = TcpStream::connect(addr).await.map_err(|e| e.to_string())?;
-        let hello = self.local_hello().await;
+        let (ephemeral_secret, ephemeral_public) = Identity::new_ephemeral();
+        let hello = self.local_hello(ephemeral_public).await;
         write_json(&mut stream, &hello, MAX_PLAIN_FRAME).await?;
         let remote: PlainHello = read_json(&mut stream, MAX_PLAIN_FRAME).await?;
         self.verify_remote(&remote, Some(addr.to_string())).await?;
 
-        let mut session = self.identity.session(&remote.public_key_b64)?;
+        let mut session = self.identity.session_with_ephemeral(
+            &remote.public_key_b64,
+            &ephemeral_secret,
+            &remote.ephemeral_key_b64,
+        )?;
         let body = serde_json::to_vec(&msg).map_err(|e| e.to_string())?;
         let frame = session.encrypt(&body)?;
         write_json(&mut stream, &frame, MAX_ENCRYPTED_FRAME).await?;
         Ok(())
     }
 
-    async fn local_hello(&self) -> PlainHello {
+    pub(crate) async fn local_hello(&self, ephemeral_key_b64: String) -> PlainHello {
         let gs = self.guild_state.lock().await;
         PlainHello {
             version: PROTOCOL_VERSION,
@@ -213,31 +308,58 @@ impl PeerRuntime {
             guild: gs.guild_name.clone(),
             public_key_b64: self.identity.public_key_b64(),
             fingerprint: self.identity.fingerprint(),
+            ephemeral_key_b64,
             port: self.listen_port,
         }
     }
 
-    async fn verify_remote(&self, hello: &PlainHello, addr: Option<String>) -> Result<(), String> {
+    pub(crate) async fn verify_remote(
+        &self,
+        hello: &PlainHello,
+        addr: Option<String>,
+    ) -> Result<(), String> {
         if hello.version != PROTOCOL_VERSION {
             return Err(format!("unsupported peer protocol {}", hello.version));
         }
 
-        let decision = self.contacts.lock().await.verify_or_trust(
-            &hello.handle,
-            &hello.guild,
-            &hello.public_key_b64,
-            addr,
-            None,
-        )?;
+        let (decision, previous_pending) = {
+            let mut contacts = self.contacts.lock().await;
+            let previous = contacts
+                .pending_fingerprint(&hello.handle)
+                .map(str::to_string);
+            let decision = contacts.verify_or_trust(
+                &hello.handle,
+                &hello.guild,
+                &hello.public_key_b64,
+                addr,
+                None,
+            )?;
+            (decision, previous)
+        };
 
         match decision {
-            TrustDecision::Trusted | TrustDecision::NewTrusted => Ok(()),
+            TrustDecision::Trusted => Ok(()),
+            TrustDecision::PendingTrust { fingerprint } => {
+                if previous_pending.as_deref() != Some(fingerprint.as_str()) {
+                    let _ = self.events.send(OutgoingMsg::TrustWarning {
+                        handle: hello.handle.clone(),
+                        expected: String::new(),
+                        received: fingerprint,
+                    });
+                }
+                Err(format!(
+                    "peer '{}' is awaiting fingerprint approval",
+                    hello.handle
+                ))
+            }
             TrustDecision::ChangedKey { expected, received } => {
-                let _ = self.events.send(OutgoingMsg::TrustWarning {
-                    handle: hello.handle.clone(),
-                    expected,
-                    received: received.clone(),
-                });
+                if previous_pending.as_deref() != Some(received.as_str()) {
+                    let _ = self.events.send(OutgoingMsg::TrustWarning {
+                        handle: hello.handle.clone(),
+                        expected,
+                        received: received.clone(),
+                    });
+                }
                 Err(format!(
                     "peer '{}' key changed; received {}",
                     hello.handle, received
@@ -247,14 +369,36 @@ impl PeerRuntime {
     }
 }
 
+fn validate_signal_endpoint(url: &str) -> Result<(), String> {
+    if url.starts_with("wss://")
+        || url.starts_with("ws://127.0.0.1:")
+        || url.starts_with("ws://localhost:")
+        || url.starts_with("ws://[::1]:")
+    {
+        Ok(())
+    } else {
+        Err("rendezvous URL must use wss:// (ws:// is allowed only on loopback)".into())
+    }
+}
+
 pub async fn listen(port: u16, runtime: PeerRuntime) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(format!("0.0.0.0:{port}")).await?;
+    let connections = Arc::new(Semaphore::new(64));
     eprintln!("forge-net: encrypted peer listener on port {port}");
 
     loop {
         let (stream, addr) = listener.accept().await?;
+        let permit = match connections.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                eprintln!("forge-net: rejecting peer connection at capacity");
+                drop(stream);
+                continue;
+            }
+        };
         let runtime = runtime.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             if let Err(e) = handle_inbound(stream, addr.to_string(), runtime).await {
                 eprintln!("forge-net: peer connection failed: {e}");
             }
@@ -267,8 +411,14 @@ async fn handle_inbound(
     addr: String,
     runtime: PeerRuntime,
 ) -> Result<(), String> {
-    let remote: PlainHello = read_json(&mut stream, MAX_PLAIN_FRAME).await?;
-    let hello = runtime.local_hello().await;
+    let remote: PlainHello = timeout(
+        Duration::from_secs(10),
+        read_json(&mut stream, MAX_PLAIN_FRAME),
+    )
+    .await
+    .map_err(|_| "peer handshake timed out".to_string())??;
+    let (ephemeral_secret, ephemeral_public) = Identity::new_ephemeral();
+    let hello = runtime.local_hello(ephemeral_public).await;
     write_json(&mut stream, &hello, MAX_PLAIN_FRAME).await?;
     // `addr` is the connection's source address (ephemeral port). Reply to the
     // peer's advertised listen port instead, or later sends to it would fail.
@@ -279,7 +429,11 @@ async fn handle_inbound(
     runtime
         .verify_remote(
             &remote,
-            if peer_addr.is_empty() { None } else { Some(peer_addr.clone()) },
+            if peer_addr.is_empty() {
+                None
+            } else {
+                Some(peer_addr.clone())
+            },
         )
         .await?;
 
@@ -293,7 +447,11 @@ async fn handle_inbound(
         );
     }
 
-    let session = runtime.identity.session(&remote.public_key_b64)?;
+    let session = runtime.identity.session_with_ephemeral(
+        &remote.public_key_b64,
+        &ephemeral_secret,
+        &remote.ephemeral_key_b64,
+    )?;
 
     loop {
         let frame: EncryptedFrame = match read_json(&mut stream, MAX_ENCRYPTED_FRAME).await {
@@ -306,7 +464,7 @@ async fn handle_inbound(
     }
 }
 
-async fn handle_peer_msg(msg: PeerMsg, runtime: &PeerRuntime) {
+pub(crate) async fn handle_peer_msg(msg: PeerMsg, runtime: &PeerRuntime) {
     match msg {
         PeerMsg::Presence { from, guild, file } => {
             runtime.guild_state.lock().await.add_or_update_peer(
@@ -366,9 +524,12 @@ async fn handle_peer_msg(msg: PeerMsg, runtime: &PeerRuntime) {
                 .lock()
                 .await
                 .add_shared_file(name.clone(), from.clone(), size);
-            let _ = runtime
-                .events
-                .send(OutgoingMsg::FileReceived { name, from, size, data_b64: None });
+            let _ = runtime.events.send(OutgoingMsg::FileReceived {
+                name,
+                from,
+                size,
+                data_b64: None,
+            });
         }
         PeerMsg::FileDrop { from, name } => {
             runtime.file_pool.lock().await.remove_file(&from, &name);
@@ -388,11 +549,12 @@ async fn handle_peer_msg(msg: PeerMsg, runtime: &PeerRuntime) {
             // found no session and nothing was ever sent back.
             let peer = runtime.guild_state.lock().await.find_peer(&from).cloned();
             if let Some(peer) = peer {
-                runtime
-                    .collab_mgr
-                    .lock()
-                    .await
-                    .accept_session(session_id, &file, &peer, &initial_text);
+                runtime.collab_mgr.lock().await.accept_session(
+                    session_id,
+                    &file,
+                    &peer,
+                    &initial_text,
+                );
             }
             let _ = runtime.events.send(OutgoingMsg::CollabRequest {
                 session_id,

@@ -25,6 +25,7 @@ else
 endif
 
 SRCS = $(SRCDIR)/arena.c      \
+       $(SRCDIR)/utf8.c       \
        $(SRCDIR)/buffer.c     \
        $(SRCDIR)/config.c     \
        $(SRCDIR)/theme.c      \

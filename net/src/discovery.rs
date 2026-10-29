@@ -5,10 +5,11 @@
 
 use crate::crypto::ContactBook;
 use crate::guild::{GuildPeer, GuildState};
+use crate::ipc::OutgoingMsg;
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use std::sync::Arc;
 use std::time::SystemTime;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, broadcast};
 
 const SERVICE_TYPE: &str = "_forge._tcp.local.";
 
@@ -46,6 +47,7 @@ pub fn announce(
 pub async fn run_discovery(
     guild_state: Arc<Mutex<GuildState>>,
     contacts: Arc<Mutex<ContactBook>>,
+    events: broadcast::Sender<OutgoingMsg>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mdns = ServiceDaemon::new()?;
     let receiver = mdns.browse(SERVICE_TYPE)?;
@@ -92,13 +94,28 @@ pub async fn run_discovery(
                         let peer_addr = format!("{}:{}", addr, port);
 
                         if !public_key.is_empty() {
-                            let _ = contacts.lock().await.verify_or_trust(
+                            let decision = contacts.lock().await.verify_or_trust(
                                 &handle,
                                 &guild_name,
                                 &public_key,
                                 Some(peer_addr.clone()),
                                 None,
                             );
+                            match decision {
+                                Ok(crate::crypto::TrustDecision::PendingTrust { fingerprint }) => {
+                                    let _ = events.send(OutgoingMsg::TrustWarning {
+                                        handle: handle.clone(),
+                                        expected: String::new(),
+                                        received: fingerprint,
+                                    });
+                                }
+                                Ok(crate::crypto::TrustDecision::ChangedKey { expected, received }) => {
+                                    let _ = events.send(OutgoingMsg::TrustWarning {
+                                        handle: handle.clone(), expected, received,
+                                    });
+                                }
+                                Ok(crate::crypto::TrustDecision::Trusted) | Err(_) => {}
+                            }
                         }
 
                         let peer = GuildPeer {

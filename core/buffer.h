@@ -29,11 +29,6 @@ typedef struct Buffer {
   size_t      dead_count;     /* zero-length nodes awaiting compaction */
   PieceNode  *free_list;      /* recycled nodes (linked via ->right)   */
 
-  /* ── lazy line cache ─────────────────────────────────────── */
-  char       *cached_text;    /* full flattened text (NULL = dirty)   */
-  size_t     *line_starts;    /* line_starts[i] = byte offset of line i */
-  size_t      line_count;
-  bool        line_cache_dirty;
 } Buffer;
 
 Buffer *buffer_new   (const char *initial_content, size_t len);
@@ -45,6 +40,11 @@ void    buffer_delete(Buffer *b, size_t char_pos, size_t len);
 char   *buffer_get_text  (Buffer *b);               /* caller frees */
 char   *buffer_get_line  (Buffer *b, int line_idx); /* caller frees */
 size_t  buffer_get_offset(Buffer *b, int cx, int cy);
+/* Line starts are found from subtree newline counts; offsets and columns are bytes. */
+size_t  buffer_line_to_offset(Buffer *b, size_t line);
+size_t  buffer_offset_to_line(Buffer *b, size_t offset);
+/* Copy up to len bytes beginning at offset. Returns bytes copied. */
+size_t  buffer_read_range(Buffer *b, size_t offset, char *out, size_t len);
 size_t  buffer_line_count(Buffer *b);
 int     buffer_save      (Buffer *b, const char *path);
 size_t  buffer_total_len (Buffer *b);  /* total byte length, no allocation */

@@ -12,16 +12,20 @@
 #include "render.h"
 #include "theme.h"
 #include "ui.h"
+#include "utf8.h"
 #include "undo.h"
 #include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
+#include <limits.h>
+#include <locale.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
 #include <sys/inotify.h>
+#include <sys/stat.h>
 #include <libgen.h>
 
 extern Arena *session_arena;
@@ -29,6 +33,13 @@ extern Arena *session_arena;
 /* ── Multi-buffer entry (one per open file) ─────────────────── */
 
 #define MAX_BUFFERS 32
+#define MAX_LSP_SESSIONS 8
+
+typedef struct {
+  LSPClient *client;
+  char server[128];
+  char root[1024];
+} LspSession;
 
 typedef struct {
   Buffer    *buf;
@@ -38,6 +49,8 @@ typedef struct {
   bool       modified;
   UndoStack  undo;
   GitState   git;
+  int        lsp_session;
+  bool       lsp_did_open_sent;
 } BufferEntry;
 
 typedef struct {
@@ -45,6 +58,8 @@ typedef struct {
   BufferEntry buffers[MAX_BUFFERS];
   int buffer_count;
   int active_buf;
+  LspSession lsp_sessions[MAX_LSP_SESSIONS];
+  int lsp_session_count;
 
   /* ── Active buffer shortcuts (point into buffers[active_buf]) */
   Buffer *buf;
@@ -132,6 +147,7 @@ static EditorState E;
 
 static Buffer *load_file(const char *path);
 static void open_file_at_path(const char *path);
+static void activate_lsp_for_active_buffer(void);
 
 /* ── Buffer switching ───────────────────────────────────────── */
 
@@ -145,6 +161,7 @@ static void save_active_buffer(void) {
   be->modified = E.modified;
   be->undo     = E.undo;
   be->git      = E.git;
+  be->lsp_did_open_sent = E.lsp_did_open_sent;
   if (E.filepath)
     snprintf(be->filepath, sizeof(be->filepath), "%s", E.filepath);
   memcpy(be->file_uri, E.file_uri, sizeof(be->file_uri));
@@ -161,9 +178,11 @@ static void load_buffer(int idx) {
   E.modified   = be->modified;
   E.undo       = be->undo;
   E.git        = be->git;
+  E.lsp_did_open_sent = be->lsp_did_open_sent;
   E.filepath   = be->filepath;
   memcpy(E.file_uri, be->file_uri, sizeof(E.file_uri));
   E.extra_cursor_count = 0;
+  activate_lsp_for_active_buffer();
 }
 
 /* Switch to a different buffer index */
@@ -190,6 +209,8 @@ static int add_buffer(Buffer *buf, const char *path) {
   be->modified = false;
   undo_init(&be->undo);
   memset(&be->git, 0, sizeof(be->git));
+  be->lsp_session = -1;
+  be->lsp_did_open_sent = false;
   if (path)
     snprintf(be->filepath, sizeof(be->filepath), "%s", path);
   else
@@ -237,6 +258,95 @@ static void git_reopen(void) {
   }
 }
 
+static bool directory_has_workspace_marker(const char *dir) {
+  static const char *markers[] = {
+    ".git", "compile_commands.json", "Cargo.toml", "package.json",
+    "go.mod", "pyproject.toml", "Makefile", "CMakeLists.txt"
+  };
+  char candidate[1200];
+  struct stat st;
+  for (size_t i = 0; i < sizeof(markers) / sizeof(markers[0]); i++) {
+    if (snprintf(candidate, sizeof(candidate), "%s/%s", dir, markers[i]) >=
+        (int)sizeof(candidate)) continue;
+    if (stat(candidate, &st) == 0) return true;
+  }
+  return false;
+}
+
+static void lsp_workspace_root(const char *filepath, char *root, size_t cap) {
+  char path[1024];
+  if (!filepath || !filepath[0] || strlen(filepath) >= sizeof(path)) {
+    if (!getcwd(root, cap)) snprintf(root, cap, ".");
+    return;
+  }
+  snprintf(path, sizeof(path), "%s", filepath);
+  char *dir = dirname(path);
+  if (!dir || !dir[0]) dir = ".";
+  char current[1024];
+  /* Walk upward to the closest workspace marker. */
+  snprintf(current, sizeof(current), "%s", dir);
+  for (;;) {
+    if (directory_has_workspace_marker(current)) break;
+    char *slash = strrchr(current, '/');
+    if (!slash) {
+      snprintf(current, sizeof(current), ".");
+      break;
+    }
+    if (slash == current) {
+      current[1] = '\0';
+      break;
+    }
+    *slash = '\0';
+  }
+  snprintf(root, cap, "%s", current);
+}
+
+static void activate_lsp_for_active_buffer(void) {
+  E.lsp = NULL;
+  E.file_uri[0] = '\0';
+  if (!E.filepath || !E.filepath[0] || !E.cfg.lsp_auto_detect) return;
+  const char *server = lsp_detect_server(E.filepath);
+  if (!server) return;
+
+  BufferEntry *be = &E.buffers[E.active_buf];
+  char root[1024];
+  lsp_workspace_root(E.filepath, root, sizeof(root));
+  int idx = -1;
+  for (int i = 0; i < E.lsp_session_count; i++) {
+    if (strcmp(E.lsp_sessions[i].server, server) == 0 &&
+        strcmp(E.lsp_sessions[i].root, root) == 0) {
+      idx = i;
+      break;
+    }
+  }
+  if (idx < 0) {
+    if (E.lsp_session_count >= MAX_LSP_SESSIONS) {
+      render_set_status(&E.render, "LSP session limit reached (%d)",
+                        MAX_LSP_SESSIONS);
+      return;
+    }
+    idx = E.lsp_session_count++;
+    LspSession *session = &E.lsp_sessions[idx];
+    memset(session, 0, sizeof(*session));
+    snprintf(session->server, sizeof(session->server), "%s", server);
+    snprintf(session->root, sizeof(session->root), "%s", root);
+  }
+  if (!E.lsp_sessions[idx].client || !E.lsp_sessions[idx].client->running) {
+    if (E.lsp_sessions[idx].client)
+      lsp_stop(E.lsp_sessions[idx].client);
+    E.lsp_sessions[idx].client = lsp_start(server, root);
+    for (int bi = 0; bi < E.buffer_count; bi++) {
+      if (E.buffers[bi].lsp_session == idx)
+        E.buffers[bi].lsp_did_open_sent = false;
+    }
+  }
+  be->lsp_session = idx;
+  E.lsp = E.lsp_sessions[idx].client;
+  E.lsp_did_open_sent = be->lsp_did_open_sent;
+  if (E.lsp)
+    lsp_path_to_uri(E.filepath, E.file_uri, sizeof(E.file_uri));
+}
+
 static void open_file_at_path(const char *path) {
   if (!path || !path[0]) return;
 
@@ -282,20 +392,6 @@ static void open_file_at_path(const char *path) {
       undo_init(&E.undo);
     }
 
-    /* Restart LSP for new file */
-    if (E.lsp) {
-      lsp_stop(E.lsp);
-      E.lsp = NULL;
-    }
-    E.lsp_did_open_sent = false;
-    if (E.cfg.lsp_auto_detect) {
-      const char *server = lsp_detect_server(E.filepath);
-      if (server) {
-        E.lsp = lsp_start(server, NULL);
-        if (E.lsp)
-          lsp_path_to_uri(E.filepath, E.file_uri, sizeof(E.file_uri));
-      }
-    }
   }
 
   /* Refresh git for new file */
@@ -304,6 +400,7 @@ static void open_file_at_path(const char *path) {
   /* Fire on_open hook */
   if (E.cfg.hook_on_open[0])
     plugin_run_hook(E.cfg.hook_on_open, E.filepath);
+  plugin_on_open(&E.plugins, E.filepath);
 
   /* Update plugin context to point to new buffer */
   if (g_plugin_ctx) g_plugin_ctx->buf = E.buf;
@@ -601,34 +698,64 @@ static int line_len(Buffer *b, int cy) {
   return n;
 }
 
+static int line_byte_col_at_display(Buffer *b, int cy, int display_col) {
+  if (display_col < 0) display_col = 0;
+  char *line = buffer_get_line(b, cy);
+  if (!line) return 0;
+  size_t byte_col = utf8_byte_col(line, strlen(line), (size_t)display_col);
+  free(line);
+  return byte_col > INT_MAX ? INT_MAX : (int)byte_col;
+}
+
+static int cursor_lsp_utf16_col(void) {
+  char *line = buffer_get_line(E.buf, E.cy);
+  if (!line) return E.cx;
+  size_t units = utf8_utf16_col(line, strlen(line), (size_t)E.cx);
+  free(line);
+  return units > INT_MAX ? INT_MAX : (int)units;
+}
+
+static int line_byte_col_from_lsp_utf16(Buffer *b, int row, int utf16_col) {
+  if (utf16_col <= 0) return 0;
+  char *line = buffer_get_line(b, row);
+  if (!line) return utf16_col;
+  size_t i = utf8_byte_from_utf16_col(line, strlen(line), (size_t)utf16_col);
+  free(line);
+  return i > INT_MAX ? INT_MAX : (int)i;
+}
+
+static int cursor_display_col(void) {
+  char *line = buffer_get_line(E.buf, E.cy);
+  if (!line) return E.cx;
+  int col = (int)utf8_display_col(line, strlen(line), (size_t)E.cx);
+  free(line);
+  return col;
+}
+
 static void clamp_cx(int *cx, int cy) {
   int max = line_len(E.buf, cy);
   if (*cx > max)
     *cx = max;
   if (*cx < 0)
     *cx = 0;
+  if (*cx > 0) {
+    char *line = buffer_get_line(E.buf, cy);
+    if (line) {
+      size_t prev = utf8_prev(line, (size_t)max, (size_t)*cx);
+      if (utf8_next(line, (size_t)max, prev) != (size_t)*cx)
+        *cx = (int)prev;
+      free(line);
+    }
+  }
 }
 
-/* ── Convert flat buffer offset → (row, col) ────────────────── */
-/* Requires the buffer's line cache to be valid.
-   Call after buffer_get_text() which always rebuilds it.       */
+/* ── Convert flat byte offset → (row, byte column) ──────────── */
 static void offset_to_rowcol(size_t offset, int *out_row, int *out_col) {
-  size_t lc = E.buf->line_count;
-  if (lc == 0) {
-    *out_row = 0;
-    *out_col = 0;
-    return;
-  }
-  size_t lo = 0, hi = lc - 1;
-  while (lo < hi) {
-    size_t mid = (lo + hi + 1) / 2;
-    if (E.buf->line_starts[mid] <= offset)
-      lo = mid;
-    else
-      hi = mid - 1;
-  }
-  *out_row = (int)lo;
-  *out_col = (int)(offset - E.buf->line_starts[lo]);
+  size_t row = buffer_offset_to_line(E.buf, offset);
+  size_t start = buffer_line_to_offset(E.buf, row);
+  *out_row = row > INT_MAX ? INT_MAX : (int)row;
+  *out_col = offset >= start && offset - start <= INT_MAX
+           ? (int)(offset - start) : INT_MAX;
 }
 
 /* ── Incremental search ─────────────────────────────────────── */
@@ -707,11 +834,15 @@ static void move_word_left(void) {
   char *line = buffer_get_line(E.buf, E.cy);
   if (!line)
     return;
-  int x = E.cx - 1;
+  size_t len = strlen(line);
+  int x = (int)utf8_prev(line, len, (size_t)E.cx);
   while (x > 0 && !is_word_char(line[x]))
-    x--;
-  while (x > 0 && is_word_char(line[x - 1]))
-    x--;
+    x = (int)utf8_prev(line, len, (size_t)x);
+  while (x > 0) {
+    int prev = (int)utf8_prev(line, len, (size_t)x);
+    if (!is_word_char(line[prev])) break;
+    x = prev;
+  }
   E.cx = x;
   free(line);
 }
@@ -729,11 +860,12 @@ static void move_word_right(void) {
   char *line = buffer_get_line(E.buf, E.cy);
   if (!line)
     return;
+  size_t len = strlen(line);
   int x = E.cx;
-  while (line[x] && is_word_char(line[x]))
-    x++;
-  while (line[x] && !is_word_char(line[x]))
-    x++;
+  while ((size_t)x < len && is_word_char(line[x]))
+    x = (int)utf8_next(line, len, (size_t)x);
+  while ((size_t)x < len && !is_word_char(line[x]))
+    x = (int)utf8_next(line, len, (size_t)x);
   E.cx = x;
   clamp_cx(&E.cx, E.cy);
   free(line);
@@ -815,13 +947,13 @@ static void maybe_request_completion(int key) {
 
   if (is_completion_trigger(key)) {
     /* Always trigger on special characters */
-    lsp_request_completion(E.lsp, E.file_uri, E.cy, E.cx);
+    lsp_request_completion(E.lsp, E.file_uri, E.cy, cursor_lsp_utf16_col());
   } else if (is_identifier_char(key)) {
     /* Trigger on identifier chars if we have at least 2 chars typed */
     char word[128];
     get_word_at_cursor(word, sizeof(word));
     if ((int)strlen(word) >= 2) {
-      lsp_request_completion(E.lsp, E.file_uri, E.cy, E.cx);
+      lsp_request_completion(E.lsp, E.file_uri, E.cy, cursor_lsp_utf16_col());
     }
   }
 }
@@ -978,17 +1110,26 @@ static void cmd_format(void *ctx) {
 
 static void cmd_lsp_restart(void *ctx) {
   (void)ctx;
-  if (E.lsp) {
-    lsp_stop(E.lsp);
-    E.lsp = NULL;
+  if (!E.filepath || E.active_buf < 0 || E.active_buf >= E.buffer_count) return;
+  BufferEntry *be = &E.buffers[E.active_buf];
+  if (be->lsp_session < 0 || be->lsp_session >= E.lsp_session_count) {
+    activate_lsp_for_active_buffer();
+    if (!E.lsp) return;
+    be->lsp_session = E.active_buf < E.buffer_count ?
+                       E.buffers[E.active_buf].lsp_session : -1;
   }
-  if (E.filepath) {
-    const char *server = lsp_detect_server(E.filepath);
-    if (server) {
-      E.lsp = lsp_start(server, NULL);
-      render_set_status(&E.render, "LSP: restarting %s...", server);
-    }
+  int idx = be->lsp_session;
+  if (idx < 0 || idx >= E.lsp_session_count) return;
+  LspSession *session = &E.lsp_sessions[idx];
+  if (session->client) lsp_stop(session->client);
+  session->client = lsp_start(session->server, session->root);
+  E.lsp = session->client;
+  for (int i = 0; i < E.buffer_count; i++) {
+    if (E.buffers[i].lsp_session == idx)
+      E.buffers[i].lsp_did_open_sent = false;
   }
+  E.lsp_did_open_sent = false;
+  render_set_status(&E.render, "LSP: restarting %s...", session->server);
 }
 
 static void cmd_toggle_blame(void *ctx) {
@@ -1032,7 +1173,7 @@ static void cmd_toggle_timeline(void *ctx) {
 static void cmd_find_references(void *ctx) {
   (void)ctx;
   if (E.lsp && E.lsp->running && E.lsp->initialized) {
-    lsp_request_references(E.lsp, E.file_uri, E.cy, E.cx);
+    lsp_request_references(E.lsp, E.file_uri, E.cy, cursor_lsp_utf16_col());
     render_set_status(&E.render, "Finding references...");
   } else {
     render_set_status(&E.render, "No LSP server running");
@@ -1042,7 +1183,7 @@ static void cmd_find_references(void *ctx) {
 static void cmd_goto_definition(void *ctx) {
   (void)ctx;
   if (E.lsp && E.lsp->running && E.lsp->initialized) {
-    lsp_request_definition(E.lsp, E.file_uri, E.cy, E.cx);
+    lsp_request_definition(E.lsp, E.file_uri, E.cy, cursor_lsp_utf16_col());
     render_set_status(&E.render, "Finding definition...");
   } else {
     render_set_status(&E.render, "No LSP server running");
@@ -1052,7 +1193,7 @@ static void cmd_goto_definition(void *ctx) {
 static void cmd_show_hover(void *ctx) {
   (void)ctx;
   if (E.lsp && E.lsp->running && E.lsp->initialized) {
-    lsp_request_hover(E.lsp, E.file_uri, E.cy, E.cx);
+    lsp_request_hover(E.lsp, E.file_uri, E.cy, cursor_lsp_utf16_col());
     E.show_hover = true;
     render_set_status(&E.render, "Fetching hover docs...");
   } else {
@@ -1252,8 +1393,36 @@ static void send_collab_op(int pos, bool is_insert, const char *text, int len) {
   ipc_send(&E.ipc, json, jlen);
 }
 
+/* Worker edits enter through the same buffer, undo, and collaboration path as
+   keyboard edits. The IPC poll invokes this on the editor thread. */
+static void apply_worker_insert(const char *text, size_t len) {
+  if (!text || len == 0 || len > 1024 || !E.buf) return;
+  size_t pos = buffer_get_offset(E.buf, E.cx, E.cy);
+  buffer_insert(E.buf, pos, text, len);
+  undo_record(&E.undo, UNDO_INSERT, pos, text, len, E.cx, E.cy);
+  int row, col;
+  offset_to_rowcol(pos + len, &row, &col);
+  E.cy = row;
+  E.cx = col;
+  clamp_cx(&E.cx, E.cy);
+  mark_modified();
+  send_collab_op((int)pos, true, text, (int)len);
+  E.render.full_redraw = true;
+}
+
 /* ── Guild Layer colon-command dispatcher ──────────────────────── */
 static void handle_guild_command(const char *cmd) {
+  if (strncmp(cmd, ":trust accept ", 14) == 0) {
+    char fingerprint[96] = "";
+    if (sscanf(cmd + 14, "%95s", fingerprint) == 1 && E.ipc.connected &&
+        ipc_send_kv("TRUST_ACCEPT", "fingerprint", fingerprint, NULL)) {
+      render_set_status(&E.render, "Trust approval sent; reconnect to peer");
+    } else {
+      render_set_status(&E.render, "Usage: :trust accept <full fingerprint>");
+    }
+    return;
+  }
+
   /* :collab <peer> — start collab session with peer */
   if (strncmp(cmd, ":collab_accept", 14) == 0) {
     if (E.collab_session_id > 0 && E.ipc.connected) {
@@ -1588,10 +1757,31 @@ static void handle_net_message(const char *msg) {
     snprintf(E.guild_last_event, sizeof(E.guild_last_event),
              "Invite created; fingerprint %s", fp);
     render_set_status(&E.render, "%s", E.guild_last_event);
-  } else if (strcmp(type, "TRUST_WARNING") == 0 || strcmp(type, "ERROR") == 0) {
+  } else if (strcmp(type, "TRUST_WARNING") == 0) {
+    char handle[64] = "peer", expected[96] = "", received[96] = "";
+    json_get_string(msg, "handle", handle, sizeof(handle));
+    json_get_string(msg, "expected", expected, sizeof(expected));
+    json_get_string(msg, "received", received, sizeof(received));
+    if (expected[0]) {
+      snprintf(E.guild_last_event, sizeof(E.guild_last_event),
+               "KEY CHANGE for %s: expected %.40s got %.40s", handle,
+               expected, received);
+      render_set_status(&E.render, "forge-net: %s", E.guild_last_event);
+    } else {
+      snprintf(E.guild_last_event, sizeof(E.guild_last_event),
+               "Untrusted %s; fingerprint %.47s; verify then :trust accept %.47s",
+               handle, received, received);
+      render_set_status(&E.render, "%s", E.guild_last_event);
+    }
+    E.render.full_redraw = true;
+  } else if (strcmp(type, "TRUST_ACCEPTED") == 0) {
+    char handle[64] = "peer";
+    json_get_string(msg, "handle", handle, sizeof(handle));
+    render_set_status(&E.render, "Trusted peer %s", handle);
+    E.render.full_redraw = true;
+  } else if (strcmp(type, "ERROR") == 0) {
     char text[192];
-    if (!json_get_string(msg, "message", text, sizeof(text)))
-      json_get_string(msg, "received", text, sizeof(text));
+    json_get_string(msg, "message", text, sizeof(text));
     snprintf(E.guild_last_event, sizeof(E.guild_last_event), "%s", text);
     render_set_status(&E.render, "forge-net: %s", text);
     E.render.full_redraw = true;
@@ -1898,7 +2088,11 @@ static void render_references_panel(void) {
       if (line_text) {
         char *trimmed = line_text;
         while (*trimmed == ' ' || *trimmed == '\t') trimmed++;
-        snprintf(row_content, sizeof(row_content), " %s:%d:%d │ %s", display_path, loc->line + 1, loc->col + 1, trimmed);
+        size_t line_bytes = strlen(line_text);
+        size_t byte_col = utf8_byte_from_utf16_col(line_text, line_bytes,
+                                                    (size_t)(loc->col < 0 ? 0 : loc->col));
+        int display_col = (int)utf8_display_col(line_text, line_bytes, byte_col) + 1;
+        snprintf(row_content, sizeof(row_content), " %s:%d:%d │ %s", display_path, loc->line + 1, display_col, trimmed);
         free(line_text);
       } else {
         snprintf(row_content, sizeof(row_content), " %s:%d:%d", display_path, loc->line + 1, loc->col + 1);
@@ -2264,25 +2458,33 @@ static void multi_cursor_backspace(void) {
     for (int k = total - 1; k >= 0; k--) {
         size_t pos = tcs[k].offset;
         if (pos > 0) {
-            char deleted_char;
+            char deleted_text[4];
+            size_t deleted_len = 1;
+            size_t delete_pos = pos - 1;
             if (tcs[k].cx > 0) {
                 char *ln = buffer_get_line(E.buf, tcs[k].cy);
-                deleted_char = (ln && tcs[k].cx <= (int)strlen(ln)) ? ln[tcs[k].cx - 1] : '\0';
+                size_t len = ln ? strlen(ln) : 0;
+                size_t prev = ln ? utf8_prev(ln, len, (size_t)tcs[k].cx) : (size_t)tcs[k].cx - 1;
+                deleted_len = (size_t)tcs[k].cx - prev;
+                delete_pos = pos - deleted_len;
+                if (ln && deleted_len <= sizeof(deleted_text))
+                    memcpy(deleted_text, ln + prev, deleted_len);
+                else { deleted_len = 1; deleted_text[0] = '\0'; }
                 free(ln);
             } else {
-                deleted_char = '\n';
+                deleted_text[0] = '\n';
             }
             
-            buffer_delete(E.buf, pos - 1, 1);
+            buffer_delete(E.buf, delete_pos, deleted_len);
             
-            if (!undo_try_merge(&E.undo, UNDO_DELETE, pos - 1, &deleted_char, 1, tcs[k].cx, tcs[k].cy)) {
-                undo_record(&E.undo, UNDO_DELETE, pos - 1, &deleted_char, 1, tcs[k].cx, tcs[k].cy);
+            if (!undo_try_merge(&E.undo, UNDO_DELETE, delete_pos, deleted_text, deleted_len, tcs[k].cx, tcs[k].cy)) {
+                undo_record(&E.undo, UNDO_DELETE, delete_pos, deleted_text, deleted_len, tcs[k].cx, tcs[k].cy);
             }
-            send_collab_op((int)(pos - 1), false, &deleted_char, 1);
+            send_collab_op((int)delete_pos, false, deleted_text, deleted_len);
             
-            final_offsets[k] -= 1;
+            final_offsets[k] -= deleted_len;
             for (int m = k + 1; m < total; m++) {
-                final_offsets[m] -= 1;
+                final_offsets[m] -= deleted_len;
             }
         }
     }
@@ -2339,21 +2541,30 @@ static void multi_cursor_delete(void) {
         size_t pos = tcs[k].offset;
         size_t tlen = buffer_total_len(E.buf);
         if (pos < tlen) {
-            char deleted_char;
+            char deleted_text[4];
+            size_t deleted_len = 1;
             char *ln = buffer_get_line(E.buf, tcs[k].cy);
             int ll = ln ? (int)strlen(ln) : 0;
-            deleted_char = (ln && tcs[k].cx < ll) ? ln[tcs[k].cx] : '\n';
+            if (ln && tcs[k].cx < ll) {
+                size_t next = utf8_next(ln, (size_t)ll, (size_t)tcs[k].cx);
+                deleted_len = next - (size_t)tcs[k].cx;
+                if (deleted_len <= sizeof(deleted_text))
+                    memcpy(deleted_text, ln + tcs[k].cx, deleted_len);
+                else { deleted_len = 1; deleted_text[0] = '\0'; }
+            } else {
+                deleted_text[0] = '\n';
+            }
             free(ln);
             
-            buffer_delete(E.buf, pos, 1);
+            buffer_delete(E.buf, pos, deleted_len);
             
-            if (!undo_try_merge(&E.undo, UNDO_DELETE, pos, &deleted_char, 1, tcs[k].cx, tcs[k].cy)) {
-                undo_record(&E.undo, UNDO_DELETE, pos, &deleted_char, 1, tcs[k].cx, tcs[k].cy);
+            if (!undo_try_merge(&E.undo, UNDO_DELETE, pos, deleted_text, deleted_len, tcs[k].cx, tcs[k].cy)) {
+                undo_record(&E.undo, UNDO_DELETE, pos, deleted_text, deleted_len, tcs[k].cx, tcs[k].cy);
             }
-            send_collab_op((int)pos, false, &deleted_char, 1);
+            send_collab_op((int)pos, false, deleted_text, deleted_len);
             
             for (int m = k + 1; m < total; m++) {
-                final_offsets[m] -= 1;
+                final_offsets[m] -= deleted_len;
             }
         }
     }
@@ -2532,6 +2743,9 @@ static void multi_cursor_enter(void) {
 
 /* ---- main ---- */
 int main(int argc, char **argv) {
+  if (argc >= 2 && strcmp(argv[1], "plugin") == 0)
+    return plugin_cli(argc - 1, argv + 1);
+  setlocale(LC_CTYPE, "");
   E.filepath = (argc >= 2) ? argv[1] : NULL;
 
   /* Resolve filepath to absolute path so git_reopen() and other
@@ -2601,15 +2815,27 @@ int main(int argc, char **argv) {
   plugin_ctx.cy       = &E.cy;
   plugin_ctx.render   = &E.render;
   plugin_ctx.filepath = &E.filepath;
+  plugin_ctx.worker_insert = apply_worker_insert;
   g_plugin_ctx = &plugin_ctx;
   plugin_set_editor_context(&plugin_ctx);
 
-  /* Load plugins from default directories */
-  for (int i = 0; i < E.plugins.search_path_count; i++)
-    plugin_host_load_dir(&E.plugins, E.plugins.search_paths[i]);
+  if (E.cfg.allow_plugin_workers) {
+    for (int i = 0; i < E.plugins.search_path_count; i++)
+      plugin_workers_load_dir(&E.plugins, E.plugins.search_paths[i]);
+  }
+
+  /* Legacy native .so files execute inside the editor process. Require an
+     explicit trust opt-in; worker plugins use a separate process protocol. */
+  if (E.cfg.allow_legacy_native_plugins) {
+    for (int i = 0; i < E.plugins.search_path_count; i++)
+      plugin_host_load_dir(&E.plugins, E.plugins.search_paths[i]);
+  }
+  if (E.filepath)
+    plugin_on_open(&E.plugins, E.filepath);
 
   /* ── Initialize ForgeScript VM ────────────────────────── */
   fs_vm_init(&E.scripts);
+  fs_vm_set_shell_enabled(&E.scripts, E.cfg.scripts_allow_shell);
   {
     char script_dir[1024];
     const char *home = getenv("HOME");
@@ -2674,17 +2900,9 @@ int main(int argc, char **argv) {
   palette_add_command(&E.palette, "Copy Selection", "Copy selected text to clipboard", "",
                       cmd_copy_selection, NULL);
 
-  /* ── Start LSP ────────────────────────────────────────── */
-  E.lsp = NULL;
-  if (E.filepath && E.cfg.lsp_auto_detect) {
-    const char *server = lsp_detect_server(E.filepath);
-    if (server) {
-      E.lsp = lsp_start(server, NULL);
-      if (E.lsp) {
-        lsp_path_to_uri(E.filepath, E.file_uri, sizeof(E.file_uri));
-      }
-    }
-  }
+  /* ── Start/reuse the language server for this workspace ── */
+  E.lsp_session_count = 0;
+  activate_lsp_for_active_buffer();
 
   if (E.filepath) {
     if (E.git.repo_open)
@@ -2721,6 +2939,9 @@ int main(int argc, char **argv) {
 
   while (E.running) {
 
+    /* Workers communicate through nonblocking, bounded JSON-line pipes. */
+    plugin_workers_poll(&E.plugins);
+
     /* Handle terminal resize */
     if (g_resized) {
       g_resized = 0;
@@ -2737,7 +2958,15 @@ int main(int argc, char **argv) {
       char ibuf[4096] __attribute__ ((aligned(__alignof__(struct inotify_event))));
       ssize_t ilen = read(E.config_inotify_fd, ibuf, sizeof(ibuf));
       if (ilen > 0) {
+        bool workers_were_enabled = E.cfg.allow_plugin_workers;
         if (config_poll_reload(&E.cfg)) {
+          if (E.cfg.allow_plugin_workers) {
+            for (int i = 0; i < E.plugins.search_path_count; i++)
+              plugin_workers_load_dir(&E.plugins, E.plugins.search_paths[i]);
+          } else if (workers_were_enabled) {
+            plugin_workers_stop_all(&E.plugins);
+          }
+          fs_vm_set_shell_enabled(&E.scripts, E.cfg.scripts_allow_shell);
           theme_load(&E.theme, E.cfg.theme_name);
           render_set_theme(&E.render, &E.theme);
           render_set_status(&E.render, "config reloaded");
@@ -2751,7 +2980,15 @@ int main(int argc, char **argv) {
     } else {
       if (++E.config_poll_counter >= 200) {
         E.config_poll_counter = 0;
+        bool workers_were_enabled = E.cfg.allow_plugin_workers;
         if (config_poll_reload(&E.cfg)) {
+          if (E.cfg.allow_plugin_workers) {
+            for (int i = 0; i < E.plugins.search_path_count; i++)
+              plugin_workers_load_dir(&E.plugins, E.plugins.search_paths[i]);
+          } else if (workers_were_enabled) {
+            plugin_workers_stop_all(&E.plugins);
+          }
+          fs_vm_set_shell_enabled(&E.scripts, E.cfg.scripts_allow_shell);
           theme_load(&E.theme, E.cfg.theme_name);
           render_set_theme(&E.render, &E.theme);
           render_set_status(&E.render, "config reloaded");
@@ -2763,8 +3000,12 @@ int main(int argc, char **argv) {
     lsp_debounce_sync();
 
     /* Poll LSP */
+    for (int si = 0; si < E.lsp_session_count; si++) {
+      LSPClient *client = E.lsp_sessions[si].client;
+      if (client && client->running) lsp_poll(client);
+    }
+
     if (E.lsp && E.lsp->running) {
-      lsp_poll(E.lsp);
 
       /* Send didOpen after initialization */
       if (E.lsp->initialized && !E.lsp_did_open_sent && E.filepath) {
@@ -2772,6 +3013,7 @@ int main(int argc, char **argv) {
         lsp_send_did_open(E.lsp, E.file_uri, lsp_language_id(E.filepath), text);
         free(text);
         E.lsp_did_open_sent = true;
+        E.buffers[E.active_buf].lsp_did_open_sent = true;
         render_set_status(&E.render, "%s  [%s]", E.filepath,
                           E.lsp->server_name);
       }
@@ -2809,9 +3051,11 @@ int main(int argc, char **argv) {
             open_file_at_path(target_path);
           }
           E.cy = E.lsp->definition.line;
-          E.cx = E.lsp->definition.col;
+          E.cx = line_byte_col_from_lsp_utf16(E.buf, E.cy,
+                                              E.lsp->definition.col);
           clamp_cx(&E.cx, E.cy);
-          render_set_status(&E.render, "→ Ln %d, Col %d", E.cy + 1, E.cx + 1);
+          render_set_status(&E.render, "→ Ln %d, Col %d", E.cy + 1,
+                            cursor_display_col() + 1);
           E.render.full_redraw = true;
         }
         E.lsp->definition_ready = false;
@@ -2868,7 +3112,7 @@ int main(int argc, char **argv) {
     /* Render overlays */
     if (E.completion.visible) {
       int screen_row = E.cy - E.render.scroll_row + 1;
-      int screen_col = E.cx - E.render.scroll_col + GUTTER_WIDTH + 2;
+      int screen_col = cursor_display_col() - E.render.scroll_col + GUTTER_WIDTH + 2;
       completion_render(&E.completion, &E.theme, screen_row, screen_col,
                         E.render.width, E.render.height);
     }
@@ -3060,9 +3304,10 @@ int main(int argc, char **argv) {
             open_file_at_path(target_path);
           }
           E.cy = loc->line;
-          E.cx = loc->col;
+          E.cx = line_byte_col_from_lsp_utf16(E.buf, E.cy, loc->col);
           clamp_cx(&E.cx, E.cy);
-          render_set_status(&E.render, "Jumped to reference %d: Ln %d, Col %d", idx + 1, E.cy + 1, E.cx + 1);
+          render_set_status(&E.render, "Jumped to reference %d: Ln %d, Col %d",
+                            idx + 1, E.cy + 1, cursor_display_col() + 1);
         }
         E.render.full_redraw = true;
         continue;
@@ -3079,7 +3324,7 @@ int main(int argc, char **argv) {
     /* ── Ctrl+K: Hover docs ──────────────────────────── */
     if (key == KEY_CTRL_K) {
       if (E.lsp && E.lsp->running && E.lsp->initialized) {
-        lsp_request_hover(E.lsp, E.file_uri, E.cy, E.cx);
+        lsp_request_hover(E.lsp, E.file_uri, E.cy, cursor_lsp_utf16_col());
         render_set_status(&E.render, "Fetching hover docs...");
       } else {
         render_set_status(&E.render, "No LSP server running");
@@ -3397,7 +3642,7 @@ int main(int argc, char **argv) {
         if (buf_col < 0)
           buf_col = 0;
         E.cy = buf_row;
-        E.cx = buf_col;
+        E.cx = line_byte_col_at_display(E.buf, buf_row, buf_col);
         clamp_cx(&E.cx, E.cy);
         E.render.full_redraw = true;
       }
@@ -3416,7 +3661,7 @@ int main(int argc, char **argv) {
           buf_row = 0;
         if (buf_col < 0)
           buf_col = 0;
-        int target_cx = buf_col;
+        int target_cx = line_byte_col_at_display(E.buf, buf_row, buf_col);
         int target_cy = buf_row;
         clamp_cx(&target_cx, target_cy);
 
@@ -3523,11 +3768,17 @@ int main(int argc, char **argv) {
         size_t lc = buffer_line_count(E.buf);
         if (lc > 0 && (size_t)E.cy < lc - 1) { E.cy++; clamp_cx(&E.cx, E.cy); }
       } else if (key == KEY_SHIFT_LEFT) {
-        if (E.cx > 0) { E.cx--; }
+        if (E.cx > 0) {
+          char *line = buffer_get_line(E.buf, E.cy);
+          if (line) { E.cx = (int)utf8_prev(line, strlen(line), (size_t)E.cx); free(line); }
+        }
         else if (E.cy > 0) { E.cy--; E.cx = line_len(E.buf, E.cy); }
       } else if (key == KEY_SHIFT_RIGHT) {
         int ll = line_len(E.buf, E.cy);
-        if (E.cx < ll) { E.cx++; }
+        if (E.cx < ll) {
+          char *line = buffer_get_line(E.buf, E.cy);
+          if (line) { E.cx = (int)utf8_next(line, strlen(line), (size_t)E.cx); free(line); }
+        }
         else { size_t lc = buffer_line_count(E.buf); if ((size_t)E.cy < lc - 1) { E.cy++; E.cx = 0; } }
       }
       E.render.full_redraw = true;
@@ -3628,11 +3879,15 @@ int main(int argc, char **argv) {
         char *line = buffer_get_line(E.buf, E.cy);
         if (!line)
           continue;
-        int x = E.cx - 1;
+        size_t line_bytes = strlen(line);
+        int x = (int)utf8_prev(line, line_bytes, (size_t)E.cx);
         while (x > 0 && !is_word_char(line[x]))
-          x--;
-        while (x > 0 && is_word_char(line[x - 1]))
-          x--;
+          x = (int)utf8_prev(line, line_bytes, (size_t)x);
+        while (x > 0) {
+          int prev = (int)utf8_prev(line, line_bytes, (size_t)x);
+          if (!is_word_char(line[prev])) break;
+          x = prev;
+        }
         int del_len = E.cx - x;
         size_t del_pos = buffer_get_offset(E.buf, x, E.cy);
         char *text = buffer_get_text(E.buf);
@@ -3688,7 +3943,8 @@ int main(int argc, char **argv) {
 
     } else if (key == KEY_ARROW_LEFT) {
       if (E.cx > 0) {
-        E.cx--;
+        char *line = buffer_get_line(E.buf, E.cy);
+        if (line) { E.cx = (int)utf8_prev(line, strlen(line), (size_t)E.cx); free(line); }
       } else if (E.cy > 0) {
         E.cy--;
         E.cx = line_len(E.buf, E.cy);
@@ -3697,7 +3953,8 @@ int main(int argc, char **argv) {
     } else if (key == KEY_ARROW_RIGHT) {
       int ll = line_len(E.buf, E.cy);
       if (E.cx < ll) {
-        E.cx++;
+        char *line = buffer_get_line(E.buf, E.cy);
+        if (line) { E.cx = (int)utf8_next(line, strlen(line), (size_t)E.cx); free(line); }
       } else {
         size_t lc = buffer_line_count(E.buf);
         if ((size_t)E.cy < lc - 1) {
@@ -3791,35 +4048,44 @@ int main(int argc, char **argv) {
       } else {
         size_t pos = buffer_get_offset(E.buf, E.cx, E.cy);
         if (pos > 0) {
-          /* Get deleted char cheaply — single line alloc, not full text */
-          char deleted_char;
+          char deleted_text[4];
+          size_t deleted_len = 1;
           if (E.cx > 0) {
             char *ln = buffer_get_line(E.buf, E.cy);
-            deleted_char = (ln && E.cx <= (int)strlen(ln)) ? ln[E.cx - 1] : '\0';
+            size_t line_len_bytes = ln ? strlen(ln) : 0;
+            size_t prev = ln ? utf8_prev(ln, line_len_bytes, (size_t)E.cx) : (size_t)E.cx - 1;
+            deleted_len = (size_t)E.cx - prev;
+            if (ln && deleted_len <= sizeof(deleted_text))
+              memcpy(deleted_text, ln + prev, deleted_len);
+            else {
+              deleted_len = 1;
+              deleted_text[0] = '\0';
+            }
             free(ln);
           } else {
-            deleted_char = '\n'; /* joining lines */
+            deleted_text[0] = '\n'; /* joining lines */
           }
 
           int old_cx = E.cx, old_cy = E.cy;
-          buffer_delete(E.buf, pos - 1, 1);
+          size_t delete_pos = pos - deleted_len;
+          buffer_delete(E.buf, delete_pos, deleted_len);
 
           if (E.cx > 0) {
-            E.cx--;
+            E.cx -= (int)deleted_len;
           } else if (E.cy > 0) {
             E.cy--;
             E.cx = line_len(E.buf, E.cy);
           }
 
           /* Record for undo (try merging consecutive backspaces) */
-          if (!undo_try_merge(&E.undo, UNDO_DELETE, pos - 1, &deleted_char, 1,
+          if (!undo_try_merge(&E.undo, UNDO_DELETE, delete_pos, deleted_text, deleted_len,
                               old_cx, old_cy)) {
-            undo_record(&E.undo, UNDO_DELETE, pos - 1, &deleted_char, 1, old_cx,
+            undo_record(&E.undo, UNDO_DELETE, delete_pos, deleted_text, deleted_len, old_cx,
                         old_cy);
           }
 
           mark_modified();
-          send_collab_op((int)(pos - 1), false, &deleted_char, 1);
+          send_collab_op((int)delete_pos, false, deleted_text, deleted_len);
         }
       }
 
@@ -3835,22 +4101,31 @@ int main(int argc, char **argv) {
         size_t tlen = buffer_total_len(E.buf); /* No alloc! */
         if (pos < tlen) {
           /* Get deleted char cheaply — single line alloc */
-          char deleted_char;
+          char deleted_text[4];
+          size_t deleted_len = 1;
           char *ln = buffer_get_line(E.buf, E.cy);
           int ll = ln ? (int)strlen(ln) : 0;
-          deleted_char = (ln && E.cx < ll) ? ln[E.cx] : '\n';
+          if (ln && E.cx < ll) {
+            size_t next = utf8_next(ln, (size_t)ll, (size_t)E.cx);
+            deleted_len = next - (size_t)E.cx;
+            if (deleted_len <= sizeof(deleted_text))
+              memcpy(deleted_text, ln + E.cx, deleted_len);
+            else { deleted_len = 1; deleted_text[0] = '\0'; }
+          } else {
+            deleted_text[0] = '\n';
+          }
           free(ln);
 
-          buffer_delete(E.buf, pos, 1);
+          buffer_delete(E.buf, pos, deleted_len);
 
           /* Record for undo */
-          if (!undo_try_merge(&E.undo, UNDO_DELETE, pos, &deleted_char, 1, E.cx,
+          if (!undo_try_merge(&E.undo, UNDO_DELETE, pos, deleted_text, deleted_len, E.cx,
                               E.cy)) {
-            undo_record(&E.undo, UNDO_DELETE, pos, &deleted_char, 1, E.cx, E.cy);
+            undo_record(&E.undo, UNDO_DELETE, pos, deleted_text, deleted_len, E.cx, E.cy);
           }
 
           mark_modified();
-          send_collab_op((int)pos, false, &deleted_char, 1);
+          send_collab_op((int)pos, false, deleted_text, deleted_len);
         }
       }
 
@@ -3906,29 +4181,34 @@ int main(int argc, char **argv) {
       }
 
       /* ── Printable characters ─────────────────────────── */
-    } else if (key >= 32 && key <= 126) {
+    } else if ((key >= 32 && key <= 126) ||
+               (key >= KEY_UNICODE_BASE + 128 &&
+                key <= KEY_UNICODE_BASE + 0x10ffff)) {
+      char encoded[4];
+      uint32_t codepoint = key >= KEY_UNICODE_BASE
+          ? (uint32_t)(key - KEY_UNICODE_BASE) : (uint32_t)key;
+      size_t encoded_len = utf8_encode(codepoint, encoded);
       if (E.extra_cursor_count > 0) {
-        char c = (char)key;
-        multi_cursor_insert(&c, 1);
+        multi_cursor_insert(encoded, encoded_len);
       } else {
-        char c = (char)key;
         size_t pos = buffer_get_offset(E.buf, E.cx, E.cy);
-        buffer_insert(E.buf, pos, &c, 1);
+        buffer_insert(E.buf, pos, encoded, encoded_len);
 
         /* Try merging with previous undo entry for word-level undo */
-        if (!undo_try_merge(&E.undo, UNDO_INSERT, pos, &c, 1, E.cx, E.cy)) {
-          undo_record(&E.undo, UNDO_INSERT, pos, &c, 1, E.cx, E.cy);
+        if (!undo_try_merge(&E.undo, UNDO_INSERT, pos, encoded, encoded_len, E.cx, E.cy)) {
+          undo_record(&E.undo, UNDO_INSERT, pos, encoded, encoded_len, E.cx, E.cy);
         }
 
-        E.cx++;
+        E.cx += (int)encoded_len;
         mark_modified();
-        send_collab_op((int)pos, true, &c, 1);
+        send_collab_op((int)pos, true, encoded, encoded_len);
 
         /* Auto-trigger completion on identifier chars and trigger chars */
-        maybe_request_completion(key);
+        if (codepoint < 128)
+          maybe_request_completion(key);
 
         /* Fire keypress to plugins (e.g., autopairs auto-closes brackets) */
-        plugin_on_keypress(&E.plugins, key, E.buf);
+        plugin_on_keypress(&E.plugins, (int)codepoint, E.buf);
 
         /* Update completion filter if visible */
         if (E.completion.visible) {
@@ -3942,15 +4222,21 @@ int main(int argc, char **argv) {
   }
 
   /* ── Cleanup ──────────────────────────────────────────── */
-  if (E.lsp) {
-    if (E.file_uri[0])
-      lsp_send_did_close(E.lsp, E.file_uri);
-    lsp_stop(E.lsp);
+  for (int si = 0; si < E.lsp_session_count; si++) {
+    LSPClient *client = E.lsp_sessions[si].client;
+    if (!client) continue;
+    for (int bi = 0; bi < E.buffer_count; bi++) {
+      BufferEntry *be = &E.buffers[bi];
+      if (be->lsp_session == si && be->lsp_did_open_sent && be->file_uri[0])
+        lsp_send_did_close(client, be->file_uri);
+    }
+    lsp_stop(client);
   }
 
   /* Fire on_close hook */
   if (E.cfg.hook_on_close[0] && E.filepath)
     plugin_run_hook(E.cfg.hook_on_close, E.filepath);
+  plugin_on_close(&E.plugins, E.filepath);
 
   input_disable_mouse();
   (void)write(STDOUT_FILENO, "\x1b[?25h", 6);     /* show cursor  */

@@ -14,11 +14,22 @@
 /* Messages are length-prefixed: [4 bytes big-endian length][JSON] */
 
 void ipc_socket_path(char *out, size_t out_sz) {
+    if (!out || out_sz == 0) return;
+
+    const char *config_home = getenv("XDG_CONFIG_HOME");
+    if (config_home && config_home[0] == '/') {
+        int n = snprintf(out, out_sz, "%s/forge/net/forge-net.sock", config_home);
+        if (n < 0 || (size_t)n >= out_sz) out[0] = '\0';
+        return;
+    }
+
     const char *home = getenv("HOME");
+    int n;
     if (home && home[0])
-        snprintf(out, out_sz, "%s/.config/forge/net/forge-net.sock", home);
+        n = snprintf(out, out_sz, "%s/.config/forge/net/forge-net.sock", home);
     else
-        snprintf(out, out_sz, "/tmp/forge-net/forge-net.sock");
+        n = snprintf(out, out_sz, "/tmp/forge-net/forge-net.sock");
+    if (n < 0 || (size_t)n >= out_sz) out[0] = '\0';
 }
 
 void ipc_init(IPCBridge *ipc) {
@@ -43,8 +54,9 @@ bool ipc_connect(IPCBridge *ipc) {
     addr.sun_family = AF_UNIX;
     char path[sizeof(addr.sun_path) + 64];
     ipc_socket_path(path, sizeof(path));
-    if (strlen(path) >= sizeof(addr.sun_path)) { close(fd); return false; }
-    strcpy(addr.sun_path, path);
+    size_t path_len = strlen(path);
+    if (path_len == 0 || path_len >= sizeof(addr.sun_path)) { close(fd); return false; }
+    memcpy(addr.sun_path, path, path_len + 1);
 
     if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         close(fd);

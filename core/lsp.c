@@ -2,12 +2,14 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
+#include <strings.h>
 #include <unistd.h>
 
 /* ══════════════════════════════════════════════════════════════
@@ -418,8 +420,17 @@ static void lsp_send_raw(LSPClient *c, const char *json, int json_len) {
     char header[128];
     int hlen = snprintf(header, sizeof(header),
                         "Content-Length: %d\r\n\r\n", json_len);
-    (void)write(c->stdin_fd, header, hlen);
-    (void)write(c->stdin_fd, json, json_len);
+    const char *parts[] = { header, json };
+    size_t sizes[] = { (size_t)hlen, (size_t)json_len };
+    for (int part = 0; part < 2; part++) {
+        size_t sent = 0;
+        while (sent < sizes[part]) {
+            ssize_t n = write(c->stdin_fd, parts[part] + sent, sizes[part] - sent);
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) { c->running = false; return; }
+            sent += (size_t)n;
+        }
+    }
 }
 
 static void lsp_send_request(LSPClient *c, const char *method,
@@ -470,9 +481,27 @@ static void lsp_send_notification(LSPClient *c, const char *method,
    ══════════════════════════════════════════════════════════════ */
 
 static bool cmd_exists(const char *cmd) {
-    char check[512];
-    snprintf(check, sizeof(check), "which %s >/dev/null 2>&1", cmd);
-    return system(check) == 0;
+    if (!cmd || !cmd[0]) return false;
+    if (strchr(cmd, '/')) return access(cmd, X_OK) == 0;
+    const char *path = getenv("PATH");
+    if (!path) return false;
+    const char *part = path;
+    while (1) {
+        const char *end = strchr(part, ':');
+        size_t dir_len = end ? (size_t)(end - part) : strlen(part);
+        char candidate[PATH_MAX];
+        int n;
+        if (dir_len == 0)
+            n = snprintf(candidate, sizeof(candidate), "%s", cmd);
+        else
+            n = snprintf(candidate, sizeof(candidate), "%.*s/%s",
+                         (int)dir_len, part, cmd);
+        if (n > 0 && (size_t)n < sizeof(candidate) && access(candidate, X_OK) == 0)
+            return true;
+        if (!end) break;
+        part = end + 1;
+    }
+    return false;
 }
 
 const char *lsp_detect_server(const char *filepath) {
@@ -535,31 +564,106 @@ const char *lsp_language_id(const char *filepath) {
 }
 
 void lsp_path_to_uri(const char *path, char *uri, size_t uri_sz) {
-    if (path[0] == '/')
-        snprintf(uri, uri_sz, "file://%s", path);
-    else {
-        char abs[1024];
-        if (realpath(path, abs))
-            snprintf(uri, uri_sz, "file://%s", abs);
-        else
-            snprintf(uri, uri_sz, "file://%s", path);
+    if (!uri || uri_sz == 0) return;
+    uri[0] = '\0';
+    if (!path) return;
+    char abs[PATH_MAX];
+    const char *source = path;
+    if (path[0] != '/') source = realpath(path, abs) ? abs : path;
+    size_t used = 0;
+    const char prefix[] = "file://";
+    if (sizeof(prefix) - 1 >= uri_sz) return;
+    memcpy(uri, prefix, sizeof(prefix) - 1);
+    used = sizeof(prefix) - 1;
+    static const char hex[] = "0123456789ABCDEF";
+    for (const unsigned char *p = (const unsigned char *)source; *p; p++) {
+        bool safe = (*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+                    (*p >= '0' && *p <= '9') || *p == '/' || *p == '-' ||
+                    *p == '_' || *p == '.' || *p == '~';
+        size_t need = safe ? 1 : 3;
+        if (used + need >= uri_sz) { uri[0] = '\0'; return; }
+        if (safe) uri[used++] = (char)*p;
+        else {
+            uri[used++] = '%';
+            uri[used++] = hex[*p >> 4];
+            uri[used++] = hex[*p & 15];
+        }
     }
+    uri[used] = '\0';
 }
 
 /* ══════════════════════════════════════════════════════════════
    Start / Stop
    ══════════════════════════════════════════════════════════════ */
 
+/* Split a configured executable and arguments without invoking a shell.
+   Whitespace separates arguments; single/double quotes and backslash escapes
+   are supported. Shell expansion, pipes, and command substitution are not. */
+static char **parse_command_argv(const char *command, char **storage_out) {
+    enum { MAX_ARGS = 32 };
+    if (!command || !command[0]) return NULL;
+    char *storage = strdup(command);
+    char **argv = calloc(MAX_ARGS + 1, sizeof(*argv));
+    if (!storage || !argv) { free(storage); free(argv); return NULL; }
+
+    char *readp = storage, *writep = storage;
+    int argc = 0;
+    while (*readp) {
+        while (*readp == ' ' || *readp == '\t' || *readp == '\r' || *readp == '\n')
+            readp++;
+        if (!*readp) break;
+        if (argc == MAX_ARGS) { free(storage); free(argv); return NULL; }
+
+        argv[argc++] = writep;
+        char quote = 0;
+        bool started = false;
+        while (*readp) {
+            char ch = *readp++;
+            if (quote) {
+                if (ch == quote) { quote = 0; started = true; continue; }
+                if (ch == '\\' && quote == '"' && *readp) ch = *readp++;
+                *writep++ = ch;
+                started = true;
+                continue;
+            }
+            if (ch == '\'' || ch == '"') { quote = ch; started = true; continue; }
+            if (ch == '\\' && *readp) { *writep++ = *readp++; started = true; continue; }
+            if (ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n') break;
+            *writep++ = ch;
+            started = true;
+        }
+        if (quote || !started) { free(storage); free(argv); return NULL; }
+        *writep++ = '\0';
+    }
+    if (argc == 0) { free(storage); free(argv); return NULL; }
+    argv[argc] = NULL;
+    *storage_out = storage;
+    return argv;
+}
+
 LSPClient *lsp_start(const char *server_cmd, const char *root_path) {
     if (!server_cmd) return NULL;
 
+    char *argv_storage = NULL;
+    char **argv = parse_command_argv(server_cmd, &argv_storage);
+    if (!argv) return NULL;
+
     int pipe_stdin[2], pipe_stdout[2];
-    if (pipe(pipe_stdin) < 0 || pipe(pipe_stdout) < 0) return NULL;
+    if (pipe(pipe_stdin) < 0) { free(argv); free(argv_storage); return NULL; }
+    if (pipe(pipe_stdout) < 0) {
+        close(pipe_stdin[0]); close(pipe_stdin[1]);
+        free(argv); free(argv_storage); return NULL;
+    }
 
     pid_t pid = fork();
-    if (pid < 0) return NULL;
+    if (pid < 0) {
+        close(pipe_stdin[0]); close(pipe_stdin[1]);
+        close(pipe_stdout[0]); close(pipe_stdout[1]);
+        free(argv); free(argv_storage); return NULL;
+    }
 
     if (pid == 0) {
+        (void)setpgid(0, 0);
         /* Child: redirect stdin/stdout */
         dup2(pipe_stdin[0],  STDIN_FILENO);
         dup2(pipe_stdout[1], STDOUT_FILENO);
@@ -572,16 +676,25 @@ LSPClient *lsp_start(const char *server_cmd, const char *root_path) {
         int devnull = open("/dev/null", O_WRONLY);
         if (devnull >= 0) { dup2(devnull, STDERR_FILENO); close(devnull); }
 
-        /* Execute via shell for complex commands */
-        execlp("sh", "sh", "-c", server_cmd, (char*)NULL);
+        execvp(argv[0], argv);
         _exit(127);
     }
+
+    (void)setpgid(pid, pid);
+    free(argv);
+    free(argv_storage);
 
     /* Parent */
     close(pipe_stdin[0]);
     close(pipe_stdout[1]);
 
     LSPClient *c = calloc(1, sizeof(LSPClient));
+    if (!c) {
+        close(pipe_stdin[1]); close(pipe_stdout[0]);
+        kill(-pid, SIGTERM);
+        waitpid(pid, NULL, 0);
+        return NULL;
+    }
     c->child_pid = pid;
     c->stdin_fd  = pipe_stdin[1];
     c->stdout_fd = pipe_stdout[0];
@@ -595,6 +708,12 @@ LSPClient *lsp_start(const char *server_cmd, const char *root_path) {
     /* Read buffer */
     c->read_cap = 65536;
     c->read_buf = malloc(c->read_cap);
+    if (!c->read_buf) {
+        close(c->stdin_fd); close(c->stdout_fd);
+        kill(-pid, SIGTERM); waitpid(pid, NULL, 0);
+        free(c);
+        return NULL;
+    }
     c->read_len = 0;
 
     /* Store server name */
@@ -671,10 +790,15 @@ void lsp_stop(LSPClient *c) {
         lsp_send_notification(c, "exit", "null", 4);
         usleep(50000);
 
-        close(c->stdin_fd);
-        close(c->stdout_fd);
-        kill(c->child_pid, SIGTERM);
-        waitpid(c->child_pid, NULL, WNOHANG);
+        kill(-c->child_pid, SIGTERM);
+    }
+    if (c->stdin_fd >= 0) close(c->stdin_fd);
+    if (c->stdout_fd >= 0) close(c->stdout_fd);
+    int status;
+    pid_t waited = waitpid(c->child_pid, &status, WNOHANG);
+    if (waited == 0) {
+        kill(-c->child_pid, SIGKILL);
+        (void)waitpid(c->child_pid, &status, 0);
     }
     free(c->read_buf);
     free(c);
@@ -1089,41 +1213,79 @@ void lsp_poll(LSPClient *c) {
         return;
     }
 
-    /* Non-blocking read */
+    /* Non-blocking read with a hard upper bound against a misbehaving server. */
     struct pollfd pfd = { .fd = c->stdout_fd, .events = POLLIN };
-    while (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN)) {
-        /* Grow read buffer if needed */
-        if (c->read_len + 4096 > c->read_cap) {
-            c->read_cap *= 2;
-            c->read_buf = realloc(c->read_buf, c->read_cap);
+    while (poll(&pfd, 1, 0) > 0 && (pfd.revents & (POLLIN | POLLHUP))) {
+        if (c->read_len == c->read_cap) {
+            int max_cap = LSP_MAX_FRAME_SIZE + LSP_MAX_HEADER_SIZE;
+            if (c->read_cap >= max_cap) {
+                c->running = false;
+                kill(-c->child_pid, SIGTERM);
+                return;
+            }
+            int ncap = c->read_cap > max_cap / 2 ? max_cap : c->read_cap * 2;
+            char *new_buf = realloc(c->read_buf, (size_t)ncap);
+            if (!new_buf) {
+                c->running = false;
+                kill(-c->child_pid, SIGTERM);
+                return;
+            }
+            c->read_buf = new_buf;
+            c->read_cap = ncap;
         }
 
         ssize_t n = read(c->stdout_fd, c->read_buf + c->read_len,
-                         c->read_cap - c->read_len);
-        if (n <= 0) break;
+                         (size_t)(c->read_cap - c->read_len));
+        if (n == 0) { c->running = false; return; }
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
         c->read_len += (int)n;
+        pfd.revents = 0;
     }
 
     /* Try to parse complete messages from read buffer */
     while (c->read_len > 0) {
         /* Find Content-Length header */
         char *header_end = memmem(c->read_buf, c->read_len, "\r\n\r\n", 4);
-        if (!header_end) break;
+        if (!header_end) {
+            if (c->read_len > LSP_MAX_HEADER_SIZE) {
+                c->running = false;
+                kill(-c->child_pid, SIGTERM);
+            }
+            break;
+        }
 
         int header_len = (int)(header_end - c->read_buf) + 4;
+        if (header_len > LSP_MAX_HEADER_SIZE) {
+            c->running = false;
+            kill(-c->child_pid, SIGTERM);
+            return;
+        }
 
         /* Parse Content-Length */
-        int content_length = 0;
         char *cl = memmem(c->read_buf, header_len, "Content-Length:", 15);
         if (!cl) {
-            /* Malformed — skip this header */
-            memmove(c->read_buf, c->read_buf + header_len,
-                    c->read_len - header_len);
-            c->read_len -= header_len;
-            continue;
+            c->running = false;
+            kill(-c->child_pid, SIGTERM);
+            return;
         }
-        content_length = atoi(cl + 15);
-        if (content_length < 0) content_length = 0;
+        char *length_start = cl + 15;
+        char *header_limit = c->read_buf + header_len;
+        while (length_start < header_limit && (*length_start == ' ' || *length_start == '\t'))
+            length_start++;
+        errno = 0;
+        char *length_end = NULL;
+        long parsed_length = strtol(length_start, &length_end, 10);
+        if (errno || length_end == length_start || parsed_length <= 0 ||
+            parsed_length > LSP_MAX_FRAME_SIZE || length_end >= header_limit ||
+            (*length_end != '\r' && *length_end != ' ' && *length_end != '\t')) {
+            c->running = false;
+            kill(-c->child_pid, SIGTERM);
+            return;
+        }
+        int content_length = (int)parsed_length;
 
         int total_msg = header_len + content_length;
         if (c->read_len < total_msg) break;  /* Wait for more data */

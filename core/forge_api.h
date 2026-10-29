@@ -1,10 +1,11 @@
 /*
  * forge_api.h — Plugin API for Forge Editor
  *
- * C plugins (.so) include this header to access the editor API.
- * Plugins run in a child process (forge-plugin-host) and communicate
- * with the editor via pipes. The API functions below are implemented
- * as IPC calls that cross the process boundary.
+ * Legacy C plugins (.so) include this header to access the editor API.
+ * API v1 is loaded with dlopen inside the editor and has full process
+ * privileges. It is disabled by default and must only be enabled for
+ * plugins the user trusts. Worker protocol v2 is a separate JSON-lines
+ * process API documented in README.md; these C functions remain v1 only.
  *
  * Usage:
  *   #include "forge_api.h"
@@ -27,7 +28,7 @@
 
 /* ── Plugin version ────────────────────────────────────────── */
 
-#define FORGE_API_VERSION  1
+#define FORGE_API_VERSION  1 /* legacy in-process ABI */
 
 /* ── Buffer handle (opaque to plugins) ─────────────────────── */
 

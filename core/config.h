@@ -74,6 +74,11 @@ typedef struct {
     bool  right_panel_visible;
     int   right_panel_width;
 
+    /* [plugins] and [scripts] */
+    bool  allow_plugin_workers;
+    bool  allow_legacy_native_plugins;
+    bool  scripts_allow_shell;
+
     /* Internal */
     char  filepath[FORGE_MAX_PATH];
     time_t last_mtime;

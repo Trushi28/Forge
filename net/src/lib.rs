@@ -10,4 +10,6 @@ pub mod discovery;
 pub mod guild;
 pub mod ipc;
 pub mod peer;
+pub mod rendezvous;
+pub mod rtc_transport;
 pub mod transfer;

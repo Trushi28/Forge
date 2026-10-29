@@ -441,6 +441,7 @@ async fn test_ipc_chat_does_not_deadlock_daemon() {
         collab_mgr: collab_mgr.clone(),
         events: events.clone(),
         listen_port: 0,
+        rtc_peers: Arc::new(Mutex::new(std::collections::HashMap::new())),
     };
 
     let (mut client, server) = tokio::net::UnixStream::pair().unwrap();

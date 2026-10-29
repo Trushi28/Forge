@@ -102,6 +102,8 @@ typedef struct {
 } LSPPendingRequest;
 
 #define LSP_MAX_PENDING 32
+#define LSP_MAX_FRAME_SIZE (16 * 1024 * 1024)
+#define LSP_MAX_HEADER_SIZE 8192
 
 /* ── LSP Client ─────────────────────────────────────────────── */
 

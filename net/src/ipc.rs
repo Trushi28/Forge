@@ -29,7 +29,7 @@ pub enum IncomingMsg {
     InviteAccept { code: String },
 
     #[serde(rename = "TRUST_ACCEPT")]
-    TrustAccept { handle: String, fingerprint: String },
+    TrustAccept { fingerprint: String },
 
     #[serde(rename = "COLLAB_START")]
     CollabStart {
@@ -93,6 +93,9 @@ pub enum OutgoingMsg {
         expected: String,
         received: String,
     },
+
+    #[serde(rename = "TRUST_ACCEPTED")]
+    TrustAccepted { handle: String, fingerprint: String },
 
     #[serde(rename = "ERROR")]
     Error { message: String },
@@ -277,10 +280,19 @@ pub async fn handle_connection(
             },
 
             IncomingMsg::TrustAccept {
-                handle,
                 fingerprint,
             } => {
-                eprintln!("forge-net: trust accepted for {handle} ({fingerprint})");
+                let result = peer_runtime.contacts.lock().await.accept_pending_fingerprint(&fingerprint);
+                match result {
+                    Ok(contact) => {
+                        write_message(&mut writer, &OutgoingMsg::TrustAccepted {
+                            handle: contact.handle, fingerprint: contact.fingerprint,
+                        }).await?;
+                    }
+                    Err(e) => {
+                        write_message(&mut writer, &OutgoingMsg::Error { message: e }).await?;
+                    }
+                }
             }
 
             IncomingMsg::ChatSend { guild: _, text } => {

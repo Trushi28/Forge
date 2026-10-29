@@ -1,4 +1,5 @@
 #include "render.h"
+#include "utf8.h"
 #include "buffer.h"
 #include "theme.h"
 #include "ui.h"
@@ -158,7 +159,27 @@ int render_get_diag_severity(RenderState *r, int line) {
 
 /* ── Scroll adjustment ───────────────────────────────────────*/
 
-static void adjust_scroll(RenderState *r, UIRegistry *ui, int cx, int cy, int text_rows) {
+static int line_display_col(Buffer *b, int line_no, int byte_col) {
+    if (byte_col < 0) byte_col = 0;
+    char *line = buffer_get_line(b, line_no);
+    if (!line) return byte_col;
+    int col = (int)utf8_display_col(line, strlen(line), (size_t)byte_col);
+    free(line);
+    return col;
+}
+
+static const char *visible_glyph(const char *src, size_t src_len, uint32_t cp,
+                                 char replacement[4], size_t *out_len) {
+    if (cp < 0x20 || (cp >= 0x7f && cp <= 0x9f) ||
+        (cp == 0xfffd && src_len == 1)) {
+        *out_len = utf8_encode(0xfffd, replacement);
+        return replacement;
+    }
+    *out_len = src_len;
+    return src;
+}
+
+static void adjust_scroll(RenderState *r, Buffer *b, UIRegistry *ui, int cx, int cy, int text_rows) {
     /* Scrolloff: keep cursor this many lines from the viewport edge */
     int scrolloff = 0;
     if (r->cfg && r->cfg->scrolloff > 0)
@@ -175,10 +196,13 @@ static void adjust_scroll(RenderState *r, UIRegistry *ui, int cx, int cy, int te
 
     int gutter_w = ui->slots[SLOT_GUTTER].visible ? ui->slots[SLOT_GUTTER].width : 0;
     int text_cols = r->width - gutter_w;
-    if (cx < r->scroll_col)
-        r->scroll_col = cx;
-    if (cx >= r->scroll_col + text_cols)
-        r->scroll_col = cx - text_cols + 1;
+    char *line = buffer_get_line(b, cy);
+    int visual_cx = line ? (int)utf8_display_col(line, strlen(line), (size_t)cx) : cx;
+    free(line);
+    if (visual_cx < r->scroll_col)
+        r->scroll_col = visual_cx;
+    if (visual_cx >= r->scroll_col + text_cols)
+        r->scroll_col = visual_cx - text_cols + 1;
     if (r->scroll_col < 0) r->scroll_col = 0;
 }
 
@@ -474,6 +498,11 @@ static void statusbar_widget_render(Widget *self, RenderState *r, Buffer *b) {
     int cy = r->cy;
     int cx = r->cx;
     size_t total_lines = b ? buffer_line_count(b) : 0;
+    char *cursor_line = b ? buffer_get_line(b, cy) : NULL;
+    int display_col = cursor_line
+        ? (int)utf8_display_col(cursor_line, strlen(cursor_line), (size_t)cx) + 1
+        : cx + 1;
+    free(cursor_line);
 
     stream_printf(r, "\x1b[%d;1H", r->height);
 
@@ -500,7 +529,7 @@ static void statusbar_widget_render(Widget *self, RenderState *r, Buffer *b) {
         stream_str(r, " ");
         stream_str(r, msg);
         stream_str(r, " ");
-        left_len += (int)strlen(msg) + 2;
+        left_len += (int)utf8_display_width(msg, strlen(msg)) + 2;
 
         /* ── Right section ── */
         char right_buf[256] = "";
@@ -514,11 +543,13 @@ static void statusbar_widget_render(Widget *self, RenderState *r, Buffer *b) {
         if (branch)
             right_len = snprintf(right_buf, sizeof(right_buf),
                 "  %s │ %s │ UTF-8 │ %zu lines │ Ln %d, Col %d  ",
-                branch, t->name, total_lines, cy + 1, cx + 1);
+                branch, t->name, total_lines, cy + 1, display_col);
         else
             right_len = snprintf(right_buf, sizeof(right_buf),
                 " %s │ UTF-8 │ %zu lines │ Ln %d, Col %d  ",
-                t->name, total_lines, cy + 1, cx + 1);
+                t->name, total_lines, cy + 1, display_col);
+
+        right_len = (int)utf8_display_width(right_buf, strlen(right_buf));
 
         int pad = r->width - left_len - right_len;
         if (pad < 0) pad = 0;
@@ -535,7 +566,7 @@ static void statusbar_widget_render(Widget *self, RenderState *r, Buffer *b) {
         stream_append(r, left, ll < (int)sizeof(left) - 1 ? ll : (int)sizeof(left) - 1);
 
         char right[64];
-        int rl = snprintf(right, sizeof(right), " Ln %d, Col %d  ", cy + 1, cx + 1);
+        int rl = snprintf(right, sizeof(right), " Ln %d, Col %d  ", cy + 1, display_col);
         int pad = r->width - ll - rl;
         for (int i = 0; i < pad; i++) stream_append(r, " ", 1);
         stream_append(r, right, rl < (int)sizeof(right) - 1 ? rl : (int)sizeof(right) - 1);
@@ -834,7 +865,7 @@ void render_frame(RenderState *r, Buffer *b, UIRegistry *ui,
     /* Reduce text area when references panel is visible */
     if (r->refs_panel_visible)
         text_rows -= REFS_PANEL_HEIGHT;
-    adjust_scroll(r, ui, cx, cy, text_rows);
+    adjust_scroll(r, b, ui, cx, cy, text_rows);
 
     r->out_len = 0;
     stream_str(r, ESC_HIDE_CURSOR);
@@ -1107,33 +1138,77 @@ void render_frame(RenderState *r, Buffer *b, UIRegistry *ui,
                     sel_bg_color = (ThemeColor){80, 80, 120};
                 }
 
-                for (int x = 0; x < text_cols; x++) {
-                    int src_col = start_col + x;
-                    bool in_selection = (sel_start_col >= 0 && src_col >= sel_start_col && src_col < sel_end_col);
-                    if (in_selection) {
-                        stream_bg(r, sel_bg_color);
-                    } else {
+                size_t byte_pos = line
+                    ? utf8_byte_col(line, (size_t)llen, (size_t)start_col) : 0;
+                size_t display_pos = line
+                    ? utf8_display_col(line, (size_t)llen, byte_pos) : 0;
+                int x = 0;
+                while (x < text_cols) {
+                    if (!line || byte_pos >= (size_t)llen) {
                         stream_bg(r, row_bg);
-                    }
-                    if (src_col < llen && line) {
-                        HighlightKind kind = hl[src_col];
-                        ThemeColor fc = hl_to_color(t, kind);
-
-                        if (first || fc.r != prev_color.r ||
-                            fc.g != prev_color.g || fc.b != prev_color.b) {
-                            stream_fg(r, fc);
-                            if (kind == HL_KEYWORD)
-                                stream_str(r, ESC_BOLD);
-                            else if (kind == HL_COMMENT)
-                                stream_str(r, ESC_ITALIC);
-                            prev_color = fc;
-                            first = false;
-                        }
-                        char ch = line[src_col];
-                        stream_append(r, &ch, 1);
-                    } else {
                         stream_append(r, " ", 1);
+                        x++;
+                        continue;
                     }
+
+                    uint32_t cp;
+                    size_t n = utf8_decode(line + byte_pos,
+                                           (size_t)llen - byte_pos, &cp);
+                    if (!n) break;
+                    int width = utf8_codepoint_width(cp);
+                    if (display_pos < (size_t)start_col) {
+                        /* The left half of a wide glyph is scrolled away. */
+                        size_t hidden = (size_t)start_col - display_pos;
+                        int spaces = width > 0 ? width - (int)hidden : 0;
+                        if (spaces < 1) spaces = 1;
+                        while (spaces-- > 0 && x < text_cols) {
+                            stream_bg(r, row_bg);
+                            stream_append(r, " ", 1);
+                            x++;
+                        }
+                        display_pos += (size_t)(width > 0 ? width : 0);
+                        byte_pos += n;
+                        continue;
+                    }
+
+                    bool in_selection = sel_start_col >= 0 &&
+                        (int)byte_pos >= sel_start_col && (int)byte_pos < sel_end_col;
+                    stream_bg(r, in_selection ? sel_bg_color : row_bg);
+                    HighlightKind kind = hl ? hl[byte_pos] : HL_NORMAL;
+                    ThemeColor fc = hl_to_color(t, kind);
+                    if (first || fc.r != prev_color.r ||
+                        fc.g != prev_color.g || fc.b != prev_color.b) {
+                        stream_fg(r, fc);
+                        if (kind == HL_KEYWORD)
+                            stream_str(r, ESC_BOLD);
+                        else if (kind == HL_COMMENT)
+                            stream_str(r, ESC_ITALIC);
+                        prev_color = fc;
+                        first = false;
+                    }
+
+                    if (width <= 0) {
+                        char replacement[4];
+                        size_t glyph_len;
+                        const char *glyph = visible_glyph(line + byte_pos, n, cp,
+                                                          replacement, &glyph_len);
+                        stream_append(r, glyph, glyph_len);
+                    } else if (x + width > text_cols) {
+                        while (x < text_cols) {
+                            stream_append(r, " ", 1);
+                            x++;
+                        }
+                        break;
+                    } else {
+                        char replacement[4];
+                        size_t glyph_len;
+                        const char *glyph = visible_glyph(line + byte_pos, n, cp,
+                                                          replacement, &glyph_len);
+                        stream_append(r, glyph, glyph_len);
+                        x += width;
+                        display_pos += (size_t)width;
+                    }
+                    byte_pos += n;
                 }
 
                 if (hl) free(hl);
@@ -1157,7 +1232,48 @@ void render_frame(RenderState *r, Buffer *b, UIRegistry *ui,
             int gutter_w_fb = ui->slots[SLOT_GUTTER].visible ? ui->slots[SLOT_GUTTER].width : GUTTER_WIDTH;
             stream_append(r, row, gutter_w_fb);
             stream_str(r, ESC_RESET);
-            stream_append(r, row + gutter_w_fb, r->width - gutter_w_fb);
+            char *plain_line = (size_t)logical < total_lines
+                ? buffer_get_line(b, logical) : NULL;
+            int x = 0, cols = r->width - gutter_w_fb;
+            if (plain_line) {
+                size_t plain_len = strlen(plain_line);
+                size_t byte_pos = utf8_byte_col(plain_line, plain_len,
+                                                (size_t)r->scroll_col);
+                size_t display_pos = utf8_display_col(plain_line, plain_len,
+                                                      byte_pos);
+                while (x < cols && byte_pos < plain_len) {
+                    uint32_t cp;
+                    size_t n = utf8_decode(plain_line + byte_pos,
+                                           plain_len - byte_pos, &cp);
+                    int width = utf8_codepoint_width(cp);
+                    char replacement[4];
+                    size_t glyph_len;
+                    const char *glyph = visible_glyph(plain_line + byte_pos, n,
+                                                      cp, replacement, &glyph_len);
+                    if (display_pos < (size_t)r->scroll_col) {
+                        int hidden = r->scroll_col - (int)display_pos;
+                        int spaces = width > hidden ? width - hidden : 1;
+                        while (spaces-- > 0 && x < cols) {
+                            stream_append(r, " ", 1);
+                            x++;
+                        }
+                    } else if (width <= 0) {
+                        stream_append(r, glyph, glyph_len);
+                    } else if (x + width <= cols) {
+                        stream_append(r, glyph, glyph_len);
+                        x += width;
+                    } else {
+                        break;
+                    }
+                    if (width > 0) display_pos += (size_t)width;
+                    byte_pos += n;
+                }
+                free(plain_line);
+            }
+            while (x < cols) {
+                stream_append(r, " ", 1);
+                x++;
+            }
         }
 
         memcpy(r->front_buffer[y], row, r->width);
@@ -1189,16 +1305,28 @@ void render_frame(RenderState *r, Buffer *b, UIRegistry *ui,
         if (peer_y >= 0 && peer_y < text_rows) {
             int gutter_w = ui->slots[SLOT_GUTTER].visible ? ui->slots[SLOT_GUTTER].width : GUTTER_WIDTH;
             int text_cols = r->width - gutter_w - 1;
-            int peer_x = r->collab_peer_cursor_col - r->scroll_col;
+            int peer_x = line_display_col(b, r->collab_peer_cursor_line,
+                                         r->collab_peer_cursor_col) - r->scroll_col;
             if (peer_x >= 0 && peer_x <= text_cols) {
                 int p_screen_row = peer_y + 1 + row_offset;
                 int p_screen_col = peer_x + gutter_w + 1 + 1;
                 
-                char ch = ' ';
+                char glyph[5] = " ";
+                size_t glyph_len = 1;
                 char *line = buffer_get_line(b, r->collab_peer_cursor_line);
                 if (line) {
-                    if (r->collab_peer_cursor_col >= 0 && r->collab_peer_cursor_col < (int)strlen(line)) {
-                        ch = line[r->collab_peer_cursor_col];
+                    size_t len = strlen(line);
+                    if (r->collab_peer_cursor_col >= 0 &&
+                        (size_t)r->collab_peer_cursor_col < len) {
+                        uint32_t cp;
+                        size_t source_len = utf8_decode(line + r->collab_peer_cursor_col,
+                            len - (size_t)r->collab_peer_cursor_col, &cp);
+                        char replacement[4];
+                        const char *shown = visible_glyph(line + r->collab_peer_cursor_col,
+                            source_len, cp, replacement, &glyph_len);
+                        if (glyph_len > sizeof(glyph) - 1) glyph_len = 1;
+                        memcpy(glyph, shown, glyph_len);
+                        glyph[glyph_len] = '\0';
                     }
                     free(line);
                 }
@@ -1206,16 +1334,18 @@ void render_frame(RenderState *r, Buffer *b, UIRegistry *ui,
                 char cbuf[256];
                 int clen;
                 if (r->theme) {
-                    clen = snprintf(cbuf, sizeof(cbuf), "\x1b[%d;%dH\x1b[48;2;%u;%u;%um\x1b[38;2;%u;%u;%um%c\x1b[0m",
+                    clen = snprintf(cbuf, sizeof(cbuf), "\x1b[%d;%dH\x1b[48;2;%u;%u;%um\x1b[38;2;%u;%u;%um",
                                     p_screen_row, p_screen_col,
                                     r->theme->accent.r, r->theme->accent.g, r->theme->accent.b,
-                                    r->theme->bg.r, r->theme->bg.g, r->theme->bg.b, ch);
+                                    r->theme->bg.r, r->theme->bg.g, r->theme->bg.b);
                 } else {
-                    clen = snprintf(cbuf, sizeof(cbuf), "\x1b[%d;%dH\x1b[43m%c\x1b[0m",
-                                    p_screen_row, p_screen_col, ch);
+                    clen = snprintf(cbuf, sizeof(cbuf), "\x1b[%d;%dH\x1b[43m",
+                                    p_screen_row, p_screen_col);
                 }
                 if (clen > 0) {
                     (void)write(STDOUT_FILENO, cbuf, clen);
+                    (void)write(STDOUT_FILENO, glyph, glyph_len);
+                    (void)write(STDOUT_FILENO, "\x1b[0m", 4);
                 }
             }
         }
@@ -1227,16 +1357,26 @@ void render_frame(RenderState *r, Buffer *b, UIRegistry *ui,
         if (e_y >= 0 && e_y < text_rows) {
             int gutter_w = ui->slots[SLOT_GUTTER].visible ? ui->slots[SLOT_GUTTER].width : GUTTER_WIDTH;
             int text_cols = r->width - gutter_w - 1;
-            int e_x = r->extra_cx[i] - r->scroll_col;
+            int e_x = line_display_col(b, r->extra_cy[i], r->extra_cx[i]) - r->scroll_col;
             if (e_x >= 0 && e_x <= text_cols) {
                 int screen_row = e_y + 1 + row_offset;
                 int screen_col = e_x + gutter_w + 1 + 1;
                 
-                char ch = ' ';
+                char glyph[5] = " ";
+                size_t glyph_len = 1;
                 char *line = buffer_get_line(b, r->extra_cy[i]);
                 if (line) {
-                    if (r->extra_cx[i] >= 0 && r->extra_cx[i] < (int)strlen(line)) {
-                        ch = line[r->extra_cx[i]];
+                    size_t len = strlen(line);
+                    if (r->extra_cx[i] >= 0 && (size_t)r->extra_cx[i] < len) {
+                        uint32_t cp;
+                        size_t source_len = utf8_decode(line + r->extra_cx[i],
+                            len - (size_t)r->extra_cx[i], &cp);
+                        char replacement[4];
+                        const char *shown = visible_glyph(line + r->extra_cx[i],
+                            source_len, cp, replacement, &glyph_len);
+                        if (glyph_len > sizeof(glyph) - 1) glyph_len = 1;
+                        memcpy(glyph, shown, glyph_len);
+                        glyph[glyph_len] = '\0';
                     }
                     free(line);
                 }
@@ -1244,15 +1384,17 @@ void render_frame(RenderState *r, Buffer *b, UIRegistry *ui,
                 char cbuf[256];
                 int clen;
                 if (r->theme) {
-                    clen = snprintf(cbuf, sizeof(cbuf), "\x1b[%d;%dH\x1b[38;2;%u;%u;%um\x1b[4m%c\x1b[0m",
+                    clen = snprintf(cbuf, sizeof(cbuf), "\x1b[%d;%dH\x1b[38;2;%u;%u;%um\x1b[4m",
                                     screen_row, screen_col,
-                                    r->theme->accent.r, r->theme->accent.g, r->theme->accent.b, ch);
+                                    r->theme->accent.r, r->theme->accent.g, r->theme->accent.b);
                 } else {
-                    clen = snprintf(cbuf, sizeof(cbuf), "\x1b[%d;%dH\x1b[33m\x1b[4m%c\x1b[0m",
-                                    screen_row, screen_col, ch);
+                    clen = snprintf(cbuf, sizeof(cbuf), "\x1b[%d;%dH\x1b[33m\x1b[4m",
+                                    screen_row, screen_col);
                 }
                 if (clen > 0) {
                     (void)write(STDOUT_FILENO, cbuf, clen);
+                    (void)write(STDOUT_FILENO, glyph, glyph_len);
+                    (void)write(STDOUT_FILENO, "\x1b[0m", 4);
                 }
             }
         }
@@ -1261,7 +1403,12 @@ void render_frame(RenderState *r, Buffer *b, UIRegistry *ui,
     /* ── Place cursor ────────────────────────────────────────*/
     int screen_row = cy - r->scroll_row + 1 + row_offset;
     int final_gutter_w = ui->slots[SLOT_GUTTER].visible ? ui->slots[SLOT_GUTTER].width : GUTTER_WIDTH;
-    int screen_col = cx - r->scroll_col + final_gutter_w + 1 + 1; /* +1 for diag col */
+    char *cursor_line = buffer_get_line(b, cy);
+    int visual_cx = cursor_line
+        ? (int)utf8_display_col(cursor_line, strlen(cursor_line), (size_t)cx)
+        : cx;
+    free(cursor_line);
+    int screen_col = visual_cx - r->scroll_col + final_gutter_w + 1 + 1; /* +1 for diag col */
     
     char cbuf[128];
     int clen = snprintf(cbuf, sizeof(cbuf), "\x1b[%d;%dH" ESC_SHOW_CURSOR, screen_row, screen_col);

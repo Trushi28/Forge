@@ -199,6 +199,16 @@ static void apply_setting(ForgeConfig *cfg, const char *section,
         else if (strcmp(key, "announce_lan") == 0)
             cfg->guild_announce_lan = parse_bool(val);
     }
+    else if (strcmp(section, "plugins") == 0) {
+        if (strcmp(key, "allow_workers") == 0)
+            cfg->allow_plugin_workers = parse_bool(val);
+        else if (strcmp(key, "allow_legacy_native") == 0)
+            cfg->allow_legacy_native_plugins = parse_bool(val);
+    }
+    else if (strcmp(section, "scripts") == 0) {
+        if (strcmp(key, "allow_shell") == 0)
+            cfg->scripts_allow_shell = parse_bool(val);
+    }
     /* [hooks] */
     else if (strcmp(section, "hooks") == 0) {
         if (strcmp(key, "on_save") == 0)

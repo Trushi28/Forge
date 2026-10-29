@@ -1,0 +1,10 @@
+#!/bin/sh
+# Example protocol-v2 worker. Enable with [plugins] allow_workers = true,
+# then copy this executable into ~/.config/forge/plugins/.
+while IFS= read -r event; do
+    case "$event" in
+        *'"event":"save"'*)
+            printf '%s\n' '{"protocol":2,"action":"notify","message":"Save event received"}'
+            ;;
+    esac
+done
