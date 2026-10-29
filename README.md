@@ -1,163 +1,158 @@
 # Forge
 
-Forge is a terminal code editor written in C with an optional Rust networking
-companion. The current implementation includes a piece-tree text buffer,
-multi-buffer editing, undo/redo, a command palette and file finder, syntax
-highlighting, themes, optional libgit2 integration, an LSP client, native C
-plugins, ForgeScript, and an experimental Guild layer.
+A terminal code editor in C, with an optional Rust companion (`forge-net`) for LAN/remote collaboration.
 
-The longer [`Readme.md`](Readme.md) is the architecture and product roadmap.
-It contains design targets that are still in progress; use the status below and
-the source code to determine what is currently supported.
+- Piece-tree buffer, multi-buffer tabs, undo tree, multi-cursor, incremental search
+- LSP client: completion, diagnostics, hover, go-to-definition, find references
+- Optional git integration via libgit2: diff gutter, inline blame, commit timeline
+- Command palette, fuzzy file finder, six themes, live config reload
+- Extensible with ForgeScript, shell hooks, and out-of-process worker plugins
+- **Guild** (experimental): peer chat, file sharing, pings, and CRDT co-editing
+
+Linux only for now.
 
 ## Build
 
-The C editor requires GCC or Clang and Make. libgit2 is optional: install its
-development headers to enable the Git gutter, blame, and timeline.
+Requires GCC or Clang and Make. libgit2 (with headers) and a Rust toolchain are optional.
 
 ```sh
-make
+make                 # builds ./forge (libgit2 auto-detected; WITH_GIT=0/1 to force)
 ./forge path/to/file.c
+
+make net             # builds forge-net (needs cargo)
+make plugins         # builds the example .so plugins
 ```
 
-Build the optional networking companion and example plugins with:
+`./build.sh` wraps the same steps with dependency checks (`./build.sh all`, `release`, `install`, `setup`).
 
-```sh
-make net
-make plugins
-```
+## Keys
 
-Run the C and Rust test suites with:
-
-```sh
-make test
-(cd net && cargo test)
-```
-
-`./build.sh` provides dependency checks and release builds. `./build.sh all`
-builds the editor, networking companion, and bundled plugins.
-
-## Feature status
-
-| Area | Current status |
+| Key | Action |
 |---|---|
-| Editing | Core editing, multiple buffers, undo/redo, search, and multi-cursor are implemented. UTF-8 scalar input, cursor stepping, display-cell rendering, and LSP UTF-16 columns are implemented; grapheme-cluster behavior remains in progress. |
-| LSP | Completion, diagnostics, hover, definition, and references are implemented; server launch avoids a shell, message sizes are bounded, and sessions are reused by server and workspace root across buffers. |
-| Git | Optional libgit2 support provides branch, diff, blame, and timeline data. |
-| Plugins | ForgeScript requires no build step. Simple C workers build with `forge plugin build <file.c>` and run as opt-in processes with bounded event, insert, and notification IPC. Legacy `.so` plugins remain in-process and disabled by default. |
-| Guild | The Rust companion supports LAN discovery, encrypted TCP peer messages, chat, sharing, and experimental collaboration. Opt-in WebRTC uses room-based signaling, STUN/ICE, optional external TURN credentials, and the existing fingerprint plus ephemeral-DH application handshake. Remote use needs a deployed WSS broker; Forge does not host signaling or TURN services. |
-| UI customization | Themes and basic slot/widget registration exist; arbitrary config-driven widget layouts are not fully implemented. |
-
-## Improvement roadmap
-
-The broad improvement work is ordered so each layer has a testable boundary:
-
-1. **Editor Unicode support:** decode UTF-8 input, render codepoints using
-   terminal cell widths, and keep byte offsets safe for storage. Then cover
-   grapheme-cluster selections, clipboard, and remaining LSP position cases.
-   Outgoing requests and definition/reference navigation now convert UTF-16
-   columns. `build.sh` is valid UTF-8; Forge's old byte-per-cell input and
-   rendering path caused the display problem shown in your screenshot.
-2. **Plugin workers:** define a versioned, bounded RPC protocol; run native
-   extensions out of process with timeouts and explicit capabilities; migrate
-   built-ins and add lifecycle/restart handling. Keep legacy `dlopen` opt-in
-   until migration is complete.
-3. **LSP workspaces:** reuse sessions per server and nearest workspace root;
-   track open documents per buffer and restart the active workspace session.
-   Remaining work: nonblocking queued writes, cancellation, response timeouts,
-   and diagnostics indexed by URI.
-4. **Remote Guild:** WebRTC data-channel transport, room-based offer/answer
-   signaling, trickled ICE, STUN, and optional TURN configuration are wired.
-   Still needed: production deployment behind TLS, time-limited TURN credentials,
-   reconnect/ICE restart, multi-network interoperability coverage, and careful
-   resource limits for long-lived data channels. Data-channel messages up to
-   10 MiB are fragmented into ordered encrypted frames; larger payloads try the
-   existing TCP path. The signaling broker carries only bounded setup messages;
-   peer payloads stay end-to-end encrypted.
-5. **Guild trust and protocol:** complete reviewed identity persistence,
-   replay/ordering protections, bounded resource use, transfer limits, and
-   independently reviewed cryptographic design before calling Guild
-   production-ready.
-
-The implementation currently has foundations for Unicode and the worker
-protocol, a multi-workspace LSP manager, and opt-in Guild rendezvous/WebRTC
-transport. Full grapheme editing, worker capabilities and built-in migration,
-LSP cancellation and queued writes, and production deployment/interoperability
-work for remote Guild remain unfinished.
-Track those items here; the checklist in `Readme.md` is the original proposal.
-
-Forge targets Linux first. Guild is optional; the editor remains usable without
-the Rust companion. Guild remains experimental and its peer protocol has not
-received an independent security audit; do not treat it as production-ready for
-sensitive data.
+| `Ctrl+S` / `Ctrl+Q` | Save / quit |
+| `Ctrl+P` | Command palette (`>` for files, `:` for go-to-line) |
+| `Ctrl+F` / `Ctrl+R` | Search forward / backward |
+| `Ctrl+Z` / `Ctrl+Y` | Undo / redo |
+| `Ctrl+K` | Hover docs |
+| `Ctrl+]` | Go to definition |
+| `Ctrl+T` | Git timeline (`←` `→` browse, `Enter` view commit, `Esc` back) |
+| `Ctrl+B` | Git blame |
+| `Ctrl+G` | Guild panel |
+| `Ctrl+D` | Duplicate line |
+| `Ctrl+U` / `Ctrl+W` | Delete to line start / delete word |
+| `Ctrl+A` / `Ctrl+E` | Line start / end |
+| `Ctrl+←` / `Ctrl+→` | Word jump |
+| `Shift+arrows` | Select (`Ctrl+C` copies via `xclip` or `xsel`) |
+| `Alt+click`, `Ctrl+Alt+↑/↓` | Add cursor (`Esc` clears) |
+| `Ctrl+PgUp` / `Ctrl+PgDn` | Switch buffers |
 
 ## Configuration
 
-The editor reads `~/.config/forge/config.toml`; ForgeScript files can be placed
-in `~/.config/forge/scripts`, and native plugins in
-`~/.config/forge/plugins`. See the example configuration in `build.sh` and the
-architecture roadmap for the current settings.
-
-Native shared-object plugins execute inside Forge with full user privileges.
-They are disabled by default. Worker plugins are also opt-in; their separate
-process prevents a crash from taking down Forge, but workers still run with the
-user's permissions and are not sandboxed:
+`~/.config/forge/config.toml`, reloaded on change. `./build.sh setup` writes a starter file.
 
 ```toml
-[plugins]
-allow_workers = false
-allow_legacy_native = false
+[editor]
+tab_width  = 4
+use_spaces = true
+scrolloff  = 8
+theme      = "catppuccin"   # catppuccin | dracula | tokyo_night | gruvbox | solarized | light
 
-[scripts]
-allow_shell = false
+[lsp]
+auto_detect = true
+
+[git]
+timeline = true
+
+[hooks]
+on_save = "clang-format -i $FILE"   # runs via sh; $FILE is quoted for you
+
+[lang.c]
+formatter = "clang-format -i $FILE"
 ```
 
-When enabled, Forge starts executable `*.forge-plugin` files from
-`~/.config/forge/plugins`. Protocol v2 uses one JSON object per line on stdin
-and stdout. Forge sends `save`, `open`, `close`, or `keypress` events with the
-file path and key. Workers may return bounded notification or insert actions:
+Language servers are found on `$PATH`: `clangd`, `pyright-langserver` / `pylsp`, `rust-analyzer`,
+`typescript-language-server`, `gopls`, `lua-language-server`.
 
-```json
-{"protocol":2,"event":"save","key":0,"file":"/path/to/file.c"}
-{"protocol":2,"action":"notify","message":"Saved successfully"}
-{"protocol":2,"action":"insert","text":"generated text"}
+## Extending Forge
+
+Everything below is off by default except hooks, which you write yourself.
+
+| Mechanism | Runs | Enable |
+|---|---|---|
+| Shell hooks (`[hooks]`) | `sh -c`, as you | set a command |
+| ForgeScript (`~/.config/forge/scripts/*.fs`) | in-editor VM | drop a file in; `run` needs `[scripts] allow_shell = true` |
+| Worker plugins (`~/.config/forge/plugins/*.forge-plugin`) | separate process | `[plugins] allow_workers = true` |
+| Native `.so` plugins | **inside the editor, full privileges** | `[plugins] allow_legacy_native = true` |
+
+None of these are sandboxed. Workers can't crash the editor, but they run with your permissions.
+
+**ForgeScript**
+
 ```
-
-Each worker has nonblocking pipes and a 4 KiB response limit; slow workers drop
-events instead of blocking editing. `insert` text is UTF-8 validated and enters
-Forge's undo and collaboration paths. Worker stdout is reserved for protocol
-messages. An executable example
-is in [`plugins/notify-on-save.forge-plugin`](plugins/notify-on-save.forge-plugin);
-copy it into the user plugin directory to try it.
-
-You do not need to edit `build.sh` for a custom plugin. A ForgeScript plugin can
-be saved directly under `~/.config/forge/scripts`:
-
-```text
 on save {
-    notify "Saved from my script"
+    notify "saved"
 }
 ```
 
-For a simple C worker, write a `main` loop that reads event lines and prints
-protocol responses, then use Forge's compiler command:
+(`wrap selection with ...` parses but is not implemented yet.)
 
-```sh
-./forge plugin build plugins/hello_worker.c
+**Worker plugins** speak one JSON object per line over stdin/stdout:
+
+```json
+{"protocol":2,"event":"save","key":0,"file":"/path/to/file.c"}
+{"protocol":2,"action":"notify","message":"Saved"}
+{"protocol":2,"action":"insert","text":"generated text"}
 ```
 
-That compiles it into `~/.config/forge/plugins/hello_worker.forge-plugin`.
-Set `allow_workers = true` and reload config or restart Forge to start it;
-with workers enabled, config reload also discovers newly built plugins. See
-[`plugins/hello_worker.c`](plugins/hello_worker.c) for the complete example.
+Events: `save`, `open`, `close`, `keypress`. Actions: `notify`, `insert`. Responses over 4 KiB or invalid output stop the worker; a slow worker drops events rather than blocking the editor.
+Build a C worker with `./forge plugin build plugins/hello_worker.c`; see also `plugins/notify-on-save.forge-plugin`.
+
+## Guild (experimental)
+
+`forge-net` is started automatically by the editor and talks to it over a Unix socket
+(`~/.config/forge/net/forge-net.sock`). Set your identity in `~/.config/forge/profile.toml`:
+
+```toml
+handle = "yourname"
+guild  = "your guild"
+color  = "cyan"
+```
+
+- **Discovery:** mDNS on the LAN. Optional WebRTC for other networks (see below).
+- **Transport:** TCP with X25519 key exchange (identity + per-connection ephemeral keys), XChaCha20-Poly1305.
+- **Trust:** first contact is pinned by fingerprint. Verify it out-of-band, then approve with `:trust accept <fingerprint>`. A changed key is rejected until you approve it again.
+- **Commands** (palette): `:chat <text>`, `:ping`, `:share`, `:grab <peer> <file>`, `:drop <file>`, `:collab <peer>`, `:collab_accept`.
+- **Limits:** shared files and collab buffers are capped at 700 KB.
+
+**Remote peers.** Set `FORGE_RENDEZVOUS_URL` (a `wss://` signaling broker) before `forge-net` starts. ICE uses
+`FORGE_STUN_SERVERS`, and optionally `FORGE_TURN_URL` / `FORGE_TURN_USERNAME` / `FORGE_TURN_CREDENTIAL`.
+Run a broker with `forge-net --rendezvous-server 127.0.0.1:8765` behind a TLS proxy. Forge does not host a broker or TURN server.
+
+The protocol has not been independently audited. Don't use Guild for sensitive data.
+
+## Known limitations
+
+- Unicode: codepoint input, cell-width rendering, and LSP UTF-16 columns work; grapheme-cluster editing doesn't.
+- Syntax highlighting is a generic tokenizer (C/Rust/Go/JS-style keywords), not per-language grammars.
+- Clipboard is copy-only; paste with your terminal.
+- No split panes, no modal editing.
+- Layout slots exist, but config-driven widget layout is only partly implemented.
 
 ## Development
 
 ```sh
-make test
-make fuzz
+make test            # C unit tests
+make fuzz            # ASan/UBSan: piece-tree fuzz, IPC framing, LSP JSON, palette rendering
+make gittest         # libgit2 integration (WITH_GIT=1)
 (cd net && cargo test)
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for development workflow and
-[Readme.md](Readme.md) for the evolving design and roadmap.
+```
+core/      C editor (buffer, render, lsp, git, palette, plugins, ipc, ...)
+net/       Rust: forge-net (guild, crypto, CRDT, WebRTC, rendezvous broker)
+plugins/   example plugins
+scripts/   example ForgeScript
+tests/     C tests
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).
