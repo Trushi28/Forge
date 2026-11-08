@@ -7,10 +7,16 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <pthread.h>
+static pthread_mutex_t echo_gate_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t echo_gate_cv = PTHREAD_COND_INITIALIZER;
+static int request_send_done;
 static void *echo(void *a){ int fd=*(int*)a; // reader: swallow a big frame, answer with a big frame
   unsigned char h[4]; size_t got=0; while(got<4){ssize_t n=read(fd,h+got,4-got); if(n<=0)return 0; got+=n;}
   size_t len=(h[0]<<24)|(h[1]<<16)|(h[2]<<8)|h[3]; char *b=malloc(len); got=0; while(got<len){ssize_t n=read(fd,b+got,len-got); if(n<=0)return 0; got+=n;}
   assert(len==900000);
+  pthread_mutex_lock(&echo_gate_mu);
+  while(!request_send_done) pthread_cond_wait(&echo_gate_cv,&echo_gate_mu);
+  pthread_mutex_unlock(&echo_gate_mu);
   unsigned char hh[4]={h[0],h[1],h[2],h[3]}; write(fd,hh,4); size_t w=0; while(w<len){ssize_t n=write(fd,b+w,len-w); if(n<=0)return 0; w+=n;}
   free(b); return 0; }
 int main(void){ int sv[2]; socketpair(AF_UNIX,SOCK_STREAM,0,sv);
@@ -18,6 +24,10 @@ int main(void){ int sv[2]; socketpair(AF_UNIX,SOCK_STREAM,0,sv);
   pthread_t t; pthread_create(&t,0,echo,&sv[1]);
   char *msg=malloc(900000); memset(msg,'a',900000); msg[0]='{'; msg[899999]='}';
   assert(ipc_send(&ipc,msg,900000)); // > socket buffer: exercises EAGAIN path
+  pthread_mutex_lock(&echo_gate_mu);
+  request_send_done=1;
+  pthread_cond_signal(&echo_gate_cv);
+  pthread_mutex_unlock(&echo_gate_mu);
   int n=0; for(int i=0;i<2000 && n==0;i++){ n=ipc_poll(&ipc); usleep(1000);} assert(n==1);
   char *r=ipc_read_message(&ipc); assert(r && strlen(r)==900000 && r[0]=='{'); free(r);
   assert(ipc_read_message(&ipc)==NULL);

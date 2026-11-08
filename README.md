@@ -13,7 +13,8 @@ Linux only for now.
 
 ## Build
 
-Requires GCC or Clang and Make. libgit2 (with headers) and a Rust toolchain are optional.
+Requires GCC or Clang and Make. libgit2 (with headers), utf8proc, and a Rust toolchain are optional.
+When available, utf8proc improves grapheme segmentation and terminal-cell width handling.
 
 ```sh
 make                 # builds ./forge (libgit2 auto-detected; WITH_GIT=0/1 to force)
@@ -132,7 +133,7 @@ The protocol has not been independently audited. Don't use Guild for sensitive d
 
 ## Known limitations
 
-- Unicode: codepoint input, cell-width rendering, and LSP UTF-16 columns work; grapheme-cluster editing doesn't.
+- Unicode: cursor movement and deletion operate on grapheme clusters. utf8proc provides current Unicode segmentation when installed; the built-in fallback is approximate, and glyph width still depends on the terminal and font.
 - Syntax highlighting is a generic tokenizer (C/Rust/Go/JS-style keywords), not per-language grammars.
 - Clipboard is copy-only; paste with your terminal.
 - No split panes, no modal editing.

@@ -10,6 +10,7 @@
 #include <string.h>
 #include <sys/wait.h>
 #include <strings.h>
+#include <time.h>
 #include <unistd.h>
 
 /* ══════════════════════════════════════════════════════════════
@@ -416,21 +417,79 @@ static int jv_int(JValue *v) {
    LSP transport — Content-Length framing
    ══════════════════════════════════════════════════════════════ */
 
+static unsigned long long lsp_now_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return (unsigned long long)ts.tv_sec * 1000ULL +
+           (unsigned long long)ts.tv_nsec / 1000000ULL;
+}
+
+static bool lsp_queue_bytes(LSPClient *c, const char *data, size_t len) {
+    if (!c || !c->running || c->write_failed || len == 0) return false;
+    size_t queued = c->write_len - c->write_off;
+    if (len > LSP_MAX_QUEUED_BYTES || queued > LSP_MAX_QUEUED_BYTES - len) {
+        c->write_failed = true;
+        c->running = false;
+        kill(-c->child_pid, SIGTERM);
+        return false;
+    }
+    if (c->write_off && (c->write_cap - c->write_len < len)) {
+        memmove(c->write_buf, c->write_buf + c->write_off, queued);
+        c->write_len = queued;
+        c->write_off = 0;
+    }
+    size_t need = c->write_len + len;
+    if (need > c->write_cap) {
+        size_t cap = c->write_cap ? c->write_cap : 4096;
+        while (cap < need) {
+            if (cap > LSP_MAX_QUEUED_BYTES / 2) {
+                cap = LSP_MAX_QUEUED_BYTES;
+                break;
+            }
+            cap *= 2;
+        }
+        char *next = realloc(c->write_buf, cap);
+        if (!next) {
+            c->write_failed = true;
+            c->running = false;
+            kill(-c->child_pid, SIGTERM);
+            return false;
+        }
+        c->write_buf = next;
+        c->write_cap = cap;
+    }
+    memcpy(c->write_buf + c->write_len, data, len);
+    c->write_len += len;
+    return true;
+}
+
+static void lsp_flush_writes(LSPClient *c) {
+    if (!c || !c->running) return;
+    while (c->write_off < c->write_len) {
+        ssize_t n = write(c->stdin_fd, c->write_buf + c->write_off,
+                          c->write_len - c->write_off);
+        if (n > 0) {
+            c->write_off += (size_t)n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+        c->running = false;
+        kill(-c->child_pid, SIGTERM);
+        return;
+    }
+    if (c->write_off == c->write_len)
+        c->write_off = c->write_len = 0;
+}
+
 static void lsp_send_raw(LSPClient *c, const char *json, int json_len) {
+    if (!c || json_len < 0) return;
     char header[128];
     int hlen = snprintf(header, sizeof(header),
                         "Content-Length: %d\r\n\r\n", json_len);
-    const char *parts[] = { header, json };
-    size_t sizes[] = { (size_t)hlen, (size_t)json_len };
-    for (int part = 0; part < 2; part++) {
-        size_t sent = 0;
-        while (sent < sizes[part]) {
-            ssize_t n = write(c->stdin_fd, parts[part] + sent, sizes[part] - sent);
-            if (n < 0 && errno == EINTR) continue;
-            if (n <= 0) { c->running = false; return; }
-            sent += (size_t)n;
-        }
-    }
+    if (hlen <= 0 || (size_t)hlen >= sizeof(header)) return;
+    (void)lsp_queue_bytes(c, header, (size_t)hlen);
+    (void)lsp_queue_bytes(c, json, (size_t)json_len);
 }
 
 static void lsp_send_request(LSPClient *c, const char *method,
@@ -449,13 +508,17 @@ static void lsp_send_request(LSPClient *c, const char *method,
     jw_str_raw(&w, ",");
     jw_obj_end(&w);
 
+    if (resp_type != LSP_RESP_NONE && c->pending_count >= LSP_MAX_PENDING) {
+        jw_free(&w);
+        return;
+    }
     lsp_send_raw(c, w.buf, w.len);
     jw_free(&w);
 
-    /* Track pending */
-    if (c->pending_count < LSP_MAX_PENDING) {
-        c->pending[c->pending_count].id   = id;
+    if (resp_type != LSP_RESP_NONE && c->running) {
+        c->pending[c->pending_count].id = id;
         c->pending[c->pending_count].type = resp_type;
+        c->pending[c->pending_count].sent_ms = lsp_now_ms();
         c->pending_count++;
     }
 }
@@ -704,6 +767,13 @@ LSPClient *lsp_start(const char *server_cmd, const char *root_path) {
     /* Make stdout non-blocking */
     int flags = fcntl(c->stdout_fd, F_GETFL, 0);
     fcntl(c->stdout_fd, F_SETFL, flags | O_NONBLOCK);
+    flags = fcntl(c->stdin_fd, F_GETFL, 0);
+    if (flags < 0 || fcntl(c->stdin_fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        close(c->stdin_fd); close(c->stdout_fd);
+        kill(-pid, SIGTERM); waitpid(pid, NULL, 0);
+        free(c);
+        return NULL;
+    }
 
     /* Read buffer */
     c->read_cap = 65536;
@@ -784,11 +854,17 @@ void lsp_stop(LSPClient *c) {
     if (c->running) {
         /* Send shutdown request */
         lsp_send_request(c, "shutdown", "null", 4, LSP_RESP_NONE);
-        /* Give it a moment */
-        usleep(100000);
+        unsigned long long deadline = lsp_now_ms() + 120;
+        while (c->write_len > c->write_off && lsp_now_ms() < deadline) {
+            lsp_flush_writes(c);
+            if (c->write_len > c->write_off) {
+                struct pollfd pfd = { .fd = c->stdin_fd, .events = POLLOUT };
+                (void)poll(&pfd, 1, 5);
+            }
+        }
         /* Send exit notification */
         lsp_send_notification(c, "exit", "null", 4);
-        usleep(50000);
+        lsp_flush_writes(c);
 
         kill(-c->child_pid, SIGTERM);
     }
@@ -801,6 +877,7 @@ void lsp_stop(LSPClient *c) {
         (void)waitpid(c->child_pid, &status, 0);
     }
     free(c->read_buf);
+    free(c->write_buf);
     free(c);
 }
 
@@ -868,6 +945,41 @@ void lsp_send_did_close(LSPClient *c, const char *uri) {
 
     lsp_send_notification(c, "textDocument/didClose", w.buf, w.len);
     jw_free(&w);
+
+    if (uri) {
+        for (int i = 0; i < LSP_MAX_DOCUMENTS; i++) {
+            if (c->documents[i].used && strcmp(c->documents[i].uri, uri) == 0)
+                memset(&c->documents[i], 0, sizeof(c->documents[i]));
+        }
+        if (strcmp(c->active_uri, uri) == 0)
+            lsp_activate_document(c, "");
+    }
+}
+
+void lsp_activate_document(LSPClient *c, const char *uri) {
+    if (!c) return;
+    const char *next_uri = uri ? uri : "";
+    if (strcmp(c->active_uri, next_uri) != 0) {
+        lsp_cancel_requests(c, LSP_RESP_COMPLETION);
+        lsp_cancel_requests(c, LSP_RESP_HOVER);
+        lsp_cancel_requests(c, LSP_RESP_DEFINITION);
+        lsp_cancel_requests(c, LSP_RESP_REFERENCES);
+        c->completion_ready = false;
+        c->hover_ready = false;
+        c->definition_ready = false;
+        c->references_ready = false;
+    }
+    snprintf(c->active_uri, sizeof(c->active_uri), "%s", next_uri);
+    c->diagnostic_count = 0;
+    c->diagnostics_ready = true;
+    for (int i = 0; i < LSP_MAX_DOCUMENTS; i++) {
+        LSPDocumentDiagnostics *doc = &c->documents[i];
+        if (!doc->used || strcmp(doc->uri, c->active_uri) != 0) continue;
+        c->diagnostic_count = doc->diagnostic_count;
+        memcpy(c->diagnostics, doc->diagnostics,
+               (size_t)doc->diagnostic_count * sizeof(c->diagnostics[0]));
+        return;
+    }
 }
 
 /* ══════════════════════════════════════════════════════════════
@@ -892,6 +1004,7 @@ static void build_text_document_position(JsonWriter *w, const char *uri,
 void lsp_request_completion(LSPClient *c, const char *uri,
                             int line, int col) {
     if (!c || !c->running || !c->initialized) return;
+    lsp_cancel_requests(c, LSP_RESP_COMPLETION);
 
     JsonWriter w;
     jw_init(&w);
@@ -904,6 +1017,7 @@ void lsp_request_completion(LSPClient *c, const char *uri,
 void lsp_request_hover(LSPClient *c, const char *uri,
                        int line, int col) {
     if (!c || !c->running || !c->initialized) return;
+    lsp_cancel_requests(c, LSP_RESP_HOVER);
 
     JsonWriter w;
     jw_init(&w);
@@ -916,6 +1030,7 @@ void lsp_request_hover(LSPClient *c, const char *uri,
 void lsp_request_definition(LSPClient *c, const char *uri,
                             int line, int col) {
     if (!c || !c->running || !c->initialized) return;
+    lsp_cancel_requests(c, LSP_RESP_DEFINITION);
 
     JsonWriter w;
     jw_init(&w);
@@ -928,6 +1043,7 @@ void lsp_request_definition(LSPClient *c, const char *uri,
 void lsp_request_references(LSPClient *c, const char *uri,
                             int line, int col) {
     if (!c || !c->running || !c->initialized) return;
+    lsp_cancel_requests(c, LSP_RESP_REFERENCES);
 
     JsonWriter w;
     jw_init(&w);
@@ -950,6 +1066,33 @@ void lsp_request_references(LSPClient *c, const char *uri,
     lsp_send_request(c, "textDocument/references", w.buf, w.len,
                      LSP_RESP_REFERENCES);
     jw_free(&w);
+}
+
+static void send_cancel_request(LSPClient *c, int id) {
+    JsonWriter w;
+    jw_init(&w);
+    jw_obj_start(&w);
+    jw_key(&w, "jsonrpc"); jw_string(&w, "2.0");
+    jw_key(&w, "method"); jw_string(&w, "$/cancelRequest");
+    jw_key(&w, "params");
+    jw_obj_start(&w);
+      jw_key(&w, "id"); jw_int(&w, id);
+    jw_obj_end(&w);
+    jw_obj_end(&w);
+    lsp_send_raw(c, w.buf, w.len);
+    jw_free(&w);
+}
+
+void lsp_cancel_requests(LSPClient *c, LSPResponseType type) {
+    if (!c || type == LSP_RESP_NONE) return;
+    for (int i = 0; i < c->pending_count;) {
+        if (c->pending[i].type != type) { i++; continue; }
+        int id = c->pending[i].id;
+        send_cancel_request(c, id);
+        memmove(&c->pending[i], &c->pending[i + 1],
+                (size_t)(c->pending_count - i - 1) * sizeof(c->pending[0]));
+        c->pending_count--;
+    }
 }
 
 /* ══════════════════════════════════════════════════════════════
@@ -1107,17 +1250,46 @@ static void handle_references_response(LSPClient *c, JValue *result) {
 static void handle_diagnostics_notification(LSPClient *c, JValue *params) {
     if (!params || params->type != JV_OBJECT) return;
 
-    c->diagnostic_count = 0;
-    c->diagnostics_ready = true;
+    JValue *uri_value = jv_get(params, "uri");
+    const char *uri = jv_str(uri_value);
+    if (!uri[0]) return;
+    LSPDocumentDiagnostics *doc = NULL;
+    LSPDocumentDiagnostics *available = NULL;
+    for (int i = 0; i < LSP_MAX_DOCUMENTS; i++) {
+        if (c->documents[i].used && strcmp(c->documents[i].uri, uri) == 0) {
+            doc = &c->documents[i];
+            break;
+        }
+        if (!c->documents[i].used && !available) available = &c->documents[i];
+    }
+    if (!doc) {
+        doc = available;
+        if (!doc) {
+            for (int i = 0; i < LSP_MAX_DOCUMENTS; i++) {
+                if (strcmp(c->documents[i].uri, c->active_uri) != 0) {
+                    doc = &c->documents[i];
+                    break;
+                }
+            }
+        }
+        if (!doc) doc = &c->documents[0];
+        memset(doc, 0, sizeof(*doc));
+        doc->used = true;
+        snprintf(doc->uri, sizeof(doc->uri), "%s", uri);
+    }
+    doc->diagnostic_count = 0;
 
     JValue *diags = jv_get(params, "diagnostics");
-    if (!diags || diags->type != JV_ARRAY) return;
+    if (!diags || diags->type != JV_ARRAY) {
+        if (strcmp(c->active_uri, uri) == 0) lsp_activate_document(c, uri);
+        return;
+    }
 
-    for (int i = 0; i < diags->arr.count && c->diagnostic_count < LSP_MAX_DIAGNOSTICS; i++) {
+    for (int i = 0; i < diags->arr.count && doc->diagnostic_count < LSP_MAX_DIAGNOSTICS; i++) {
         JValue *d = diags->arr.items[i];
         if (!d || d->type != JV_OBJECT) continue;
 
-        LSPDiagnostic *ld = &c->diagnostics[c->diagnostic_count++];
+        LSPDiagnostic *ld = &doc->diagnostics[doc->diagnostic_count++];
         memset(ld, 0, sizeof(*ld));
 
         JValue *range = jv_get(d, "range");
@@ -1140,6 +1312,7 @@ static void handle_diagnostics_notification(LSPClient *c, JValue *params) {
         const char *msg = jv_str(jv_get(d, "message"));
         strncpy(ld->message, msg, sizeof(ld->message) - 1);
     }
+    if (strcmp(c->active_uri, uri) == 0) lsp_activate_document(c, uri);
 }
 
 static void handle_message(LSPClient *c, const char *json, int json_len) {
@@ -1162,6 +1335,37 @@ static void handle_message(LSPClient *c, const char *json, int json_len) {
         LSPResponseType rtype = find_pending_type(c, id);
 
         JValue *result = jv_get(root, "result");
+        JValue *error = jv_get(root, "error");
+
+        if (error) {
+            switch (rtype) {
+                case LSP_RESP_INITIALIZE:
+                    c->running = false;
+                    kill(-c->child_pid, SIGTERM);
+                    break;
+                case LSP_RESP_COMPLETION:
+                    c->completion_count = 0;
+                    c->completion_ready = true;
+                    break;
+                case LSP_RESP_HOVER:
+                    c->hover.valid = false;
+                    c->hover_ready = true;
+                    break;
+                case LSP_RESP_DEFINITION:
+                    c->definition.valid = false;
+                    c->definition_ready = true;
+                    break;
+                case LSP_RESP_REFERENCES:
+                    c->references.count = 0;
+                    c->references.valid = false;
+                    c->references_ready = true;
+                    break;
+                default:
+                    break;
+            }
+            ja_free(arena);
+            return;
+        }
 
         switch (rtype) {
             case LSP_RESP_INITIALIZE:
@@ -1198,12 +1402,57 @@ static void handle_message(LSPClient *c, const char *json, int json_len) {
     ja_free(arena);
 }
 
+static void expire_pending_requests(LSPClient *c) {
+    unsigned long long now = lsp_now_ms();
+    for (int i = 0; i < c->pending_count;) {
+        LSPPendingRequest pending = c->pending[i];
+        if (now < pending.sent_ms || now - pending.sent_ms < 30000ULL) {
+            i++;
+            continue;
+        }
+        send_cancel_request(c, pending.id);
+        memmove(&c->pending[i], &c->pending[i + 1],
+                (size_t)(c->pending_count - i - 1) * sizeof(c->pending[0]));
+        c->pending_count--;
+        switch (pending.type) {
+            case LSP_RESP_INITIALIZE:
+                c->running = false;
+                kill(-c->child_pid, SIGTERM);
+                return;
+            case LSP_RESP_COMPLETION:
+                c->completion_count = 0;
+                c->completion_ready = true;
+                break;
+            case LSP_RESP_HOVER:
+                c->hover.valid = false;
+                c->hover_ready = true;
+                break;
+            case LSP_RESP_DEFINITION:
+                c->definition.valid = false;
+                c->definition_ready = true;
+                break;
+            case LSP_RESP_REFERENCES:
+                c->references.count = 0;
+                c->references.valid = false;
+                c->references_ready = true;
+                break;
+            default:
+                break;
+        }
+    }
+}
+
 /* ══════════════════════════════════════════════════════════════
    Poll — non-blocking read + message framing
    ══════════════════════════════════════════════════════════════ */
 
 void lsp_poll(LSPClient *c) {
     if (!c || !c->running) return;
+
+    lsp_flush_writes(c);
+    if (!c->running) return;
+    expire_pending_requests(c);
+    if (!c->running) return;
 
     /* Check if child is still alive */
     int status;

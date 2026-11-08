@@ -1,13 +1,14 @@
 #include "arena.h"
 #include <stdlib.h>
-#include <sys/mman.h>
+
 Arena *arena_new(size_t capacity) {
   if (capacity == 0) return NULL;
   Arena *a = malloc(sizeof(Arena));
   if (!a) return NULL;
-  a->base = mmap(NULL, capacity, PROT_READ | PROT_WRITE,
-                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  if (a->base == MAP_FAILED) {
+  /* calloc keeps the arena's previous zero-filled behavior while avoiding
+     mmap/munmap, which are not available in the Windows C runtime. */
+  a->base = calloc(1, capacity);
+  if (!a->base) {
     free(a);
     return NULL;
   }
@@ -28,6 +29,6 @@ void *arena_alloc(Arena *a, size_t size) {
 void arena_reset(Arena *a) { if (a) a->offset = 0; }
 void arena_free(Arena *a) {
   if (!a) return;
-  munmap(a->base, a->capacity);
+  free(a->base);
   free(a);
 }

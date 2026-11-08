@@ -49,6 +49,7 @@ typedef struct RenderState {
     char  *output_stream;
     int    out_len, out_cap;
     char   status_msg[256];
+    char   file_label[128];
 
     /* Theme */
     ForgeTheme *theme;

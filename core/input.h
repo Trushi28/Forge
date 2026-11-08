@@ -1,6 +1,8 @@
 #ifndef FORGE_INPUT_H
 #define FORGE_INPUT_H
 
+#include <stddef.h>
+
 /* ── Control keys (ASCII) ────────────────────────────────────── */
 enum KeyCode {
   KEY_CTRL_A = 1,  /* line start (Emacs)         */
@@ -48,6 +50,8 @@ enum KeyCode {
   KEY_CTRL_ALT_UP = 1160,
   KEY_CTRL_ALT_DOWN,
 
+  KEY_PASTE = 1250,
+
   /* ── Shift+Arrow (visual selection) ───────────────────── */
   KEY_SHIFT_UP = 1170,
   KEY_SHIFT_DOWN,
@@ -82,6 +86,8 @@ void input_disable_mouse(void);
 /* Returns a KeyCode, ASCII value, or KEY_UNICODE_BASE + Unicode scalar.
    Returns 0 on timeout (100 ms). */
 int input_read_key(void);
+/* Take ownership of the most recent bracketed paste payload. */
+char *input_take_paste(size_t *len);
 
 /* Terminal size */
 int input_get_term_size(int *rows, int *cols);

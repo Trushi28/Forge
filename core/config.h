@@ -82,6 +82,7 @@ typedef struct {
     /* Internal */
     char  filepath[FORGE_MAX_PATH];
     time_t last_mtime;
+    long  last_mtime_nsec;
 } ForgeConfig;
 
 /* Load config from path; returns 0 on success, -1 if file missing */

@@ -5,7 +5,18 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifndef _WIN32
 #include <pwd.h>
+#endif
+
+static long stat_mtime_nsec(const struct stat *st) {
+#ifdef _WIN32
+    (void)st;
+    return 0;
+#else
+    return st->st_mtim.tv_nsec;
+#endif
+}
 
 /* ══════════════════════════════════════════════════════════════
    Defaults
@@ -64,12 +75,15 @@ void config_default(ForgeConfig *cfg) {
     strcpy(cfg->gutter_widgets[1], "git_diff_gutter");
     strcpy(cfg->gutter_widgets[2], "diagnostics_gutter");
 
-    cfg->statusbar_widget_count = 5;
+    cfg->statusbar_widget_count = 8;
     strcpy(cfg->statusbar_widgets[0], "mode_indicator");
     strcpy(cfg->statusbar_widgets[1], "filename");
     strcpy(cfg->statusbar_widgets[2], "git_branch");
-    strcpy(cfg->statusbar_widgets[3], "lsp_status");
-    strcpy(cfg->statusbar_widgets[4], "cursor_pos");
+    strcpy(cfg->statusbar_widgets[3], "theme");
+    strcpy(cfg->statusbar_widgets[4], "encoding");
+    strcpy(cfg->statusbar_widgets[5], "line_count");
+    strcpy(cfg->statusbar_widgets[6], "lsp_status");
+    strcpy(cfg->statusbar_widgets[7], "cursor_pos");
 
     cfg->bottombar_widget_count = 1;
     strcpy(cfg->bottombar_widgets[0], "git_timeline");
@@ -293,8 +307,10 @@ int config_load(ForgeConfig *cfg, const char *path) {
     /* Record path and mtime for live-reload polling */
     set_string(cfg->filepath, sizeof(cfg->filepath), path);
     struct stat st;
-    if (stat(path, &st) == 0)
+    if (stat(path, &st) == 0) {
         cfg->last_mtime = st.st_mtime;
+        cfg->last_mtime_nsec = stat_mtime_nsec(&st);
+    }
 
     char section[128] = "";
     char line[1024];
@@ -342,17 +358,20 @@ bool config_poll_reload(ForgeConfig *cfg) {
 
     struct stat st;
     if (stat(cfg->filepath, &st) != 0) return false;
-    if (st.st_mtime == cfg->last_mtime) return false;
+    if (st.st_mtime == cfg->last_mtime &&
+        stat_mtime_nsec(&st) == cfg->last_mtime_nsec) return false;
 
     /* File changed — reload.
        Save filepath/mtime first: config_default() zeros the struct. */
     char saved_path[FORGE_MAX_PATH];
     memcpy(saved_path, cfg->filepath, sizeof(saved_path));
     time_t saved_mtime = st.st_mtime;
+    long saved_mtime_nsec = stat_mtime_nsec(&st);
 
     config_default(cfg);
     config_load(cfg, saved_path);
     cfg->last_mtime = saved_mtime;
+    cfg->last_mtime_nsec = saved_mtime_nsec;
     return true;
 }
 
@@ -362,11 +381,18 @@ bool config_poll_reload(ForgeConfig *cfg) {
 
 const char *config_default_path(void) {
     static char path[FORGE_MAX_PATH];
+#ifdef _WIN32
+    const char *home = getenv("APPDATA");
+    if (!home || !home[0]) home = getenv("USERPROFILE");
+    if (!home || !home[0]) home = ".";
+    snprintf(path, sizeof(path), "%s/forge/config.toml", home);
+#else
     const char *home = getenv("HOME");
     if (!home) {
         struct passwd *pw = getpwuid(getuid());
         home = pw ? pw->pw_dir : "/tmp";
     }
     snprintf(path, sizeof(path), "%s/.config/forge/config.toml", home);
+#endif
     return path;
 }

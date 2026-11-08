@@ -99,15 +99,25 @@ typedef enum {
 typedef struct {
     int             id;
     LSPResponseType type;
+    unsigned long long sent_ms;
 } LSPPendingRequest;
 
 #define LSP_MAX_PENDING 32
+#define LSP_MAX_DOCUMENTS 32
+#define LSP_MAX_QUEUED_BYTES (32 * 1024 * 1024)
 #define LSP_MAX_FRAME_SIZE (16 * 1024 * 1024)
 #define LSP_MAX_HEADER_SIZE 8192
 
+typedef struct {
+    char uri[LSP_MAX_URI];
+    LSPDiagnostic diagnostics[LSP_MAX_DIAGNOSTICS];
+    int diagnostic_count;
+    bool used;
+} LSPDocumentDiagnostics;
+
 /* ── LSP Client ─────────────────────────────────────────────── */
 
-typedef struct {
+typedef struct LSPClient {
     pid_t  child_pid;
     int    stdin_fd;     /* write requests to server */
     int    stdout_fd;    /* read responses from server */
@@ -127,6 +137,17 @@ typedef struct {
     char  *read_buf;
     int    read_len;
     int    read_cap;
+
+    /* Nonblocking, bounded output queue. */
+    char  *write_buf;
+    size_t write_len;
+    size_t write_off;
+    size_t write_cap;
+    bool   write_failed;
+
+    /* Diagnostics are owned by document URI, then copied to the active view. */
+    char   active_uri[LSP_MAX_URI];
+    LSPDocumentDiagnostics documents[LSP_MAX_DOCUMENTS];
 
     /* Last results (polled by main loop) */
     LSPCompletionItem  completions[LSP_MAX_COMPLETIONS];
@@ -161,6 +182,7 @@ void lsp_send_did_open(LSPClient *c, const char *uri,
 void lsp_send_did_change(LSPClient *c, const char *uri,
                          const char *full_text);
 void lsp_send_did_close(LSPClient *c, const char *uri);
+void lsp_activate_document(LSPClient *c, const char *uri);
 
 /* Send requests (responses come via lsp_poll) */
 void lsp_request_completion(LSPClient *c, const char *uri,
@@ -171,6 +193,7 @@ void lsp_request_definition(LSPClient *c, const char *uri,
                             int line, int col);
 void lsp_request_references(LSPClient *c, const char *uri,
                             int line, int col);
+void lsp_cancel_requests(LSPClient *c, LSPResponseType type);
 
 /* Non-blocking poll: read and parse any available responses.
    Sets completion_ready / hover_ready / etc. flags. */

@@ -1,10 +1,12 @@
 #include "input.h"
 #include "utf8.h"
 #include <errno.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <poll.h>
 #include <termios.h>
 #include <unistd.h>
 
@@ -16,6 +18,63 @@ int g_mouse_y = 0;
 static struct termios orig_termios;
 static unsigned char pending_input[4];
 static int pending_input_count;
+static char *paste_data;
+static size_t paste_len;
+static size_t paste_cap;
+
+#define INPUT_MAX_PASTE (2u * 1024u * 1024u)
+
+static void paste_append(unsigned char byte) {
+  if (paste_len >= INPUT_MAX_PASTE) return;
+  if (paste_len == paste_cap) {
+    size_t cap = paste_cap ? paste_cap * 2 : 4096;
+    if (cap > INPUT_MAX_PASTE) cap = INPUT_MAX_PASTE;
+    char *next = realloc(paste_data, cap);
+    if (!next) return;
+    paste_data = next;
+    paste_cap = cap;
+  }
+  paste_data[paste_len++] = (char)byte;
+}
+
+static void read_bracketed_paste(void) {
+  static const unsigned char end_marker[] = "\x1b[201~";
+  unsigned char pending[sizeof(end_marker) - 1];
+  size_t count = 0;
+  free(paste_data);
+  paste_data = NULL;
+  paste_len = paste_cap = 0;
+  for (;;) {
+    struct pollfd ready = { .fd = STDIN_FILENO, .events = POLLIN };
+    int available;
+    do { available = poll(&ready, 1, 2000); }
+    while (available < 0 && errno == EINTR);
+    if (available <= 0 || !(ready.revents & (POLLIN | POLLHUP))) break;
+    unsigned char byte;
+    ssize_t n = read(STDIN_FILENO, &byte, 1);
+    if (n != 1) break;
+    pending[count++] = byte;
+    while (count) {
+      bool prefix = count <= sizeof(end_marker) - 1 &&
+                    memcmp(pending, end_marker, count) == 0;
+      if (prefix) {
+        if (count == sizeof(end_marker) - 1) return;
+        break;
+      }
+      paste_append(pending[0]);
+      memmove(pending, pending + 1, --count);
+    }
+  }
+  for (size_t i = 0; i < count; i++) paste_append(pending[i]);
+}
+
+char *input_take_paste(size_t *len) {
+  if (len) *len = paste_len;
+  char *out = paste_data;
+  paste_data = NULL;
+  paste_len = paste_cap = 0;
+  return out;
+}
 
 static int read_input_byte(unsigned char *out) {
   if (pending_input_count > 0) {
@@ -35,6 +94,7 @@ static void push_input_bytes(const unsigned char *bytes, int count) {
 }
 
 void input_disable_raw_mode(void) {
+  (void)write(STDOUT_FILENO, "\x1b[?2004l", 8);
   tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
 }
 
@@ -62,9 +122,11 @@ void input_enable_mouse(void) {
   /* Enable X10 mouse (click) + SGR extended mouse (>220 columns) */
   (void)write(STDOUT_FILENO, "\x1b[?1000h", 8);
   (void)write(STDOUT_FILENO, "\x1b[?1006h", 8);
+  (void)write(STDOUT_FILENO, "\x1b[?2004h", 8);
 }
 
 void input_disable_mouse(void) {
+  (void)write(STDOUT_FILENO, "\x1b[?2004l", 8);
   (void)write(STDOUT_FILENO, "\x1b[?1006l", 8);
   (void)write(STDOUT_FILENO, "\x1b[?1000l", 8);
 }
@@ -289,6 +351,11 @@ int input_read_key(void) {
     unsigned char bytes[4] = {first, 0, 0, 0};
     int got = 1;
     while (got < need) {
+      struct pollfd ready = { .fd = STDIN_FILENO, .events = POLLIN };
+      int available;
+      do { available = poll(&ready, 1, 1000); }
+      while (available < 0 && errno == EINTR);
+      if (available <= 0 || !(ready.revents & (POLLIN | POLLHUP))) break;
       int result = read(STDIN_FILENO, &bytes[got], 1);
       if (result != 1) break;
       got++;
@@ -309,6 +376,10 @@ int input_read_key(void) {
     /* CSI sequence */
     char seq[32];
     int slen = read_escape_seq(seq, sizeof(seq));
+    if (slen == 4 && memcmp(seq, "200~", 4) == 0) {
+      read_bracketed_paste();
+      return KEY_PASTE;
+    }
     return handle_csi(seq, slen);
   }
 

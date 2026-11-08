@@ -3,6 +3,7 @@
 #include "buffer.h"
 #include "theme.h"
 #include "ui.h"
+#include "lsp.h"
 #include <ctype.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -168,6 +169,17 @@ static int line_display_col(Buffer *b, int line_no, int byte_col) {
     return col;
 }
 
+/* The active text area can be narrower than the terminal when side panels
+   are enabled. Keep scrolling and clipping inside that same slot. */
+static int content_text_columns(RenderState *r, UIRegistry *ui, int gutter_w) {
+    int cols = r->width - gutter_w - (gutter_w > 0 ? 1 : 0);
+    if (ui && ui->slots[SLOT_CONTENT].width > 0) {
+        int slot_cols = ui->slots[SLOT_CONTENT].width - (gutter_w > 0 ? 1 : 0);
+        if (slot_cols < cols) cols = slot_cols;
+    }
+    return cols > 0 ? cols : 1;
+}
+
 static const char *visible_glyph(const char *src, size_t src_len, uint32_t cp,
                                  char replacement[4], size_t *out_len) {
     if (cp < 0x20 || (cp >= 0x7f && cp <= 0x9f) ||
@@ -195,7 +207,7 @@ static void adjust_scroll(RenderState *r, Buffer *b, UIRegistry *ui, int cx, int
     if (r->scroll_row < 0) r->scroll_row = 0;
 
     int gutter_w = ui->slots[SLOT_GUTTER].visible ? ui->slots[SLOT_GUTTER].width : 0;
-    int text_cols = r->width - gutter_w;
+    int text_cols = content_text_columns(r, ui, gutter_w);
     char *line = buffer_get_line(b, cy);
     int visual_cx = line ? (int)utf8_display_col(line, strlen(line), (size_t)cx) : cx;
     free(line);
@@ -451,7 +463,14 @@ static void gutter_widget_render(Widget *self, RenderState *r, Buffer *b) {
         int logical = r->scroll_row + y;
         char *row = r->back_buffer[y];
 
-        if ((size_t)logical < total_lines) {
+        bool show_numbers = !r->cfg || r->cfg->show_line_numbers;
+        if (r->cfg) {
+            show_numbers = false;
+            for (int i = 0; i < r->cfg->gutter_widget_count; i++)
+                if (strcmp(r->cfg->gutter_widgets[i], "line_numbers") == 0)
+                    show_numbers = r->cfg->show_line_numbers;
+        }
+        if (show_numbers && (size_t)logical < total_lines) {
             int line_no = logical + 1;
             unsigned n = (unsigned)(line_no < 1 ? 1 : line_no > 9999 ? 9999 : line_no);
             row[gutter_w - 1] = ' ';
@@ -471,7 +490,8 @@ static void content_widget_render(Widget *self, RenderState *r, Buffer *b) {
     (void)self;
     int text_rows = r->height - 1;
     size_t total_lines = buffer_line_count(b);
-    int gutter_w = GUTTER_WIDTH;
+    int gutter_w = r->ui && r->ui->slots[SLOT_GUTTER].visible
+        ? r->ui->slots[SLOT_GUTTER].width : 0;
 
     for (int y = 0; y < text_rows; y++) {
         int logical = r->scroll_row + y;
@@ -480,12 +500,14 @@ static void content_widget_render(Widget *self, RenderState *r, Buffer *b) {
         if ((size_t)logical < total_lines) {
             char *line = buffer_get_line(b, logical);
             if (line) {
-                int text_cols = r->width - gutter_w;
+                int text_cols = content_text_columns(r, r->ui, gutter_w);
                 int llen      = (int)strlen(line);
-                int avail     = llen - r->scroll_col;
-                if (avail > 0) {
-                    int copy = avail < text_cols ? avail : text_cols;
-                    memcpy(row + gutter_w, line + r->scroll_col, copy);
+                size_t byte_pos = utf8_byte_col(line, (size_t)llen,
+                                                (size_t)r->scroll_col);
+                if (byte_pos < (size_t)llen && text_cols > 0) {
+                    int copy = llen - (int)byte_pos;
+                    if (copy > text_cols) copy = text_cols;
+                    memcpy(row + gutter_w, line + byte_pos, (size_t)copy);
                 }
                 free(line);
             }
@@ -493,10 +515,73 @@ static void content_widget_render(Widget *self, RenderState *r, Buffer *b) {
     }
 }
 
+static bool config_gutter_has(const ForgeConfig *cfg, const char *name) {
+    if (!cfg) return true;
+    for (int i = 0; i < cfg->gutter_widget_count; i++)
+        if (strcmp(cfg->gutter_widgets[i], name) == 0) return true;
+    return false;
+}
+
+static bool status_widget_enabled(const ForgeConfig *cfg, const char *name) {
+    if (!cfg) return true;
+    for (int i = 0; i < cfg->statusbar_widget_count; i++)
+        if (strcmp(cfg->statusbar_widgets[i], name) == 0) return true;
+    return false;
+}
+
+static void status_append(char *dst, size_t cap, size_t *used,
+                          const char *value) {
+    if (!value || !value[0] || *used >= cap - 1) return;
+    if (*used) {
+        static const char separator[] = " │ ";
+        if (*used + sizeof(separator) - 1 >= cap) return;
+        memcpy(dst + *used, separator, sizeof(separator) - 1);
+        *used += sizeof(separator) - 1;
+    }
+    size_t n = strlen(value);
+    if (n > cap - *used - 1) n = cap - *used - 1;
+    memcpy(dst + *used, value, n);
+    *used += n;
+    dst[*used] = '\0';
+}
+
+static void status_clip_cells(const char *src, int max_cells,
+                              char *dst, size_t cap) {
+    size_t len = strlen(src), used = 0, pos = 0;
+    int cells = 0;
+    bool clipped = false;
+    if (max_cells < 0) max_cells = 0;
+    while (pos < len) {
+        size_t next = utf8_grapheme_next(src, len, pos);
+        if (next <= pos) break;
+        int width = utf8_grapheme_width(src, len, pos);
+        size_t bytes = next - pos;
+        if (cells + width > max_cells || used + bytes >= cap) {
+            clipped = true;
+            break;
+        }
+        memcpy(dst + used, src + pos, bytes);
+        used += bytes;
+        cells += width;
+        pos = next;
+    }
+    if (pos < len) clipped = true;
+    if (clipped && max_cells >= 3 && used + 3 < cap) {
+        while (used && cells + 3 > max_cells) {
+            size_t prev = utf8_grapheme_prev(dst, used, used);
+            if (prev >= used) break;
+            cells -= utf8_grapheme_width(dst, used, prev);
+            used = prev;
+        }
+        memcpy(dst + used, "...", 3);
+        used += 3;
+    }
+    dst[used] = '\0';
+}
+
 static void statusbar_widget_render(Widget *self, RenderState *r, Buffer *b) {
     (void)self;
-    int cy = r->cy;
-    int cx = r->cx;
+    int cy = r->cy, cx = r->cx;
     size_t total_lines = b ? buffer_line_count(b) : 0;
     char *cursor_line = b ? buffer_get_line(b, cy) : NULL;
     int display_col = cursor_line
@@ -504,74 +589,101 @@ static void statusbar_widget_render(Widget *self, RenderState *r, Buffer *b) {
         : cx + 1;
     free(cursor_line);
 
-    stream_printf(r, "\x1b[%d;1H", r->height);
+    char right_buf[512] = "";
+    size_t right_bytes = 0;
+    const char *branch = r->git && r->git->repo_open && r->git->branch[0]
+        ? r->git->branch : "";
+    char count_buf[48], cursor_buf[64], lsp_buf[96];
+    snprintf(count_buf, sizeof(count_buf), "%zu lines", total_lines);
+    snprintf(cursor_buf, sizeof(cursor_buf), "Ln %d, Col %d", cy + 1,
+             display_col);
+    if (r->lsp && r->lsp->running)
+        snprintf(lsp_buf, sizeof(lsp_buf), "LSP: %.60s", r->lsp->server_name);
+    else
+        snprintf(lsp_buf, sizeof(lsp_buf), "LSP off");
 
-    if (r->theme) {
-        ForgeTheme *t = r->theme;
-
-        /* ── Left: Mode badge ── */
-        stream_bg(r, t->statusbar_accent);
-        stream_fg(r, t->statusbar_bg);
-        stream_str(r, ESC_BOLD);
-        stream_str(r, "  FORGE  ");
-        stream_str(r, ESC_RESET);
-
-        /* Powerline separator from accent to statusbar bg */
-        stream_fg(r, t->statusbar_accent);
-        stream_bg(r, t->statusbar_bg);
-        stream_str(r, "\xee\x82\xb0");
-        int left_len = 9 + 1; /* "  FORGE  " + powerline char */
-
-        /* ── Left: Status message ── */
-        stream_fg(r, t->statusbar_fg);
-        stream_bg(r, t->statusbar_bg);
-        const char *msg = r->status_msg[0] ? r->status_msg : "ready";
-        stream_str(r, " ");
-        stream_str(r, msg);
-        stream_str(r, " ");
-        left_len += (int)utf8_display_width(msg, strlen(msg)) + 2;
-
-        /* ── Right section ── */
-        char right_buf[256] = "";
-        int right_len = 0;
-
-        /* Git branch */
-        const char *branch = (r->git && r->git->repo_open && r->git->branch[0])
-                               ? r->git->branch : NULL;
-
-        /* Build right string with richer information */
-        if (branch)
-            right_len = snprintf(right_buf, sizeof(right_buf),
-                "  %s │ %s │ UTF-8 │ %zu lines │ Ln %d, Col %d  ",
-                branch, t->name, total_lines, cy + 1, display_col);
-        else
-            right_len = snprintf(right_buf, sizeof(right_buf),
-                " %s │ UTF-8 │ %zu lines │ Ln %d, Col %d  ",
-                t->name, total_lines, cy + 1, display_col);
-
-        right_len = (int)utf8_display_width(right_buf, strlen(right_buf));
-
-        int pad = r->width - left_len - right_len;
-        if (pad < 0) pad = 0;
-        for (int i = 0; i < pad; i++) stream_append(r, " ", 1);
-
-        stream_fg(r, t->statusbar_fg);
-        stream_append(r, right_buf, right_len < (int)sizeof(right_buf) - 1 ? right_len : (int)sizeof(right_buf) - 1);
+    bool has_custom_widgets = r->cfg && r->cfg->statusbar_widget_count > 0;
+    if (has_custom_widgets) {
+        for (int i = 0; i < r->cfg->statusbar_widget_count; i++) {
+            const char *name = r->cfg->statusbar_widgets[i];
+            const char *value = NULL;
+            if (strcmp(name, "filename") == 0) value = r->file_label;
+            else if (strcmp(name, "git_branch") == 0) value = branch;
+            else if (strcmp(name, "theme") == 0) value = r->theme ? r->theme->name : "";
+            else if (strcmp(name, "encoding") == 0) value = "UTF-8";
+            else if (strcmp(name, "line_count") == 0) value = count_buf;
+            else if (strcmp(name, "lsp_status") == 0) value = lsp_buf;
+            else if (strcmp(name, "cursor_pos") == 0) value = cursor_buf;
+            if (value) status_append(right_buf, sizeof(right_buf),
+                                     &right_bytes, value);
+        }
     } else {
-        stream_str(r, "\x1b[7m\x1b[1m");
-
-        char left[256];
-        int ll = snprintf(left, sizeof(left), "  FORGE  │  %s",
-                          r->status_msg[0] ? r->status_msg : "ready");
-        stream_append(r, left, ll < (int)sizeof(left) - 1 ? ll : (int)sizeof(left) - 1);
-
-        char right[64];
-        int rl = snprintf(right, sizeof(right), " Ln %d, Col %d  ", cy + 1, display_col);
-        int pad = r->width - ll - rl;
-        for (int i = 0; i < pad; i++) stream_append(r, " ", 1);
-        stream_append(r, right, rl < (int)sizeof(right) - 1 ? rl : (int)sizeof(right) - 1);
+        if (branch[0]) status_append(right_buf, sizeof(right_buf), &right_bytes, branch);
+        if (r->theme) status_append(right_buf, sizeof(right_buf), &right_bytes,
+                                    r->theme->name);
+        status_append(right_buf, sizeof(right_buf), &right_bytes, "UTF-8");
+        status_append(right_buf, sizeof(right_buf), &right_bytes, count_buf);
+        status_append(right_buf, sizeof(right_buf), &right_bytes, cursor_buf);
     }
 
+    bool show_badge = status_widget_enabled(r->cfg, "mode_indicator");
+    int bar_width = r->ui && r->ui->slots[SLOT_STATUSBAR].width > 0
+        ? r->ui->slots[SLOT_STATUSBAR].width : r->width;
+    int right_cells = (int)utf8_display_width(right_buf, right_bytes);
+    if (status_widget_enabled(r->cfg, "cursor_pos") &&
+        right_cells > bar_width - 30) {
+        right_buf[0] = '\0';
+        right_bytes = 0;
+        status_append(right_buf, sizeof(right_buf), &right_bytes, cursor_buf);
+        right_cells = (int)utf8_display_width(right_buf, right_bytes);
+    }
+    int badge_cells = show_badge ? 10 : 0;
+    int message_cells = bar_width - right_cells - badge_cells - 2;
+    const char *message = r->status_msg[0] ? r->status_msg : "ready";
+    char clipped_message[256];
+    status_clip_cells(message, message_cells, clipped_message,
+                      sizeof(clipped_message));
+    int clipped_cells = (int)utf8_display_width(clipped_message,
+                                               strlen(clipped_message));
+    int left_cells = badge_cells + (clipped_cells ? clipped_cells + 2 : 0);
+
+    stream_printf(r, "\x1b[%d;1H", r->height);
+    if (r->theme) {
+        ForgeTheme *t = r->theme;
+        if (show_badge) {
+            stream_bg(r, t->statusbar_accent);
+            stream_fg(r, t->statusbar_bg);
+            stream_str(r, ESC_BOLD);
+            stream_str(r, "  FORGE  ");
+            stream_str(r, ESC_RESET);
+            stream_fg(r, t->statusbar_accent);
+            stream_bg(r, t->statusbar_bg);
+            stream_str(r, "\xee\x82\xb0");
+        }
+        stream_fg(r, t->statusbar_fg);
+        stream_bg(r, t->statusbar_bg);
+        if (clipped_cells) {
+            stream_str(r, " ");
+            stream_append(r, clipped_message, (int)strlen(clipped_message));
+            stream_str(r, " ");
+        }
+        int pad = bar_width - left_cells - right_cells;
+        if (pad < 0) pad = 0;
+        for (int i = 0; i < pad; i++) stream_append(r, " ", 1);
+        stream_append(r, right_buf, (int)right_bytes);
+    } else {
+        stream_str(r, "\x1b[7m\x1b[1m");
+        if (show_badge) stream_str(r, "  FORGE  │");
+        if (clipped_cells) {
+            stream_str(r, " ");
+            stream_append(r, clipped_message, (int)strlen(clipped_message));
+            stream_str(r, " ");
+        }
+        int pad = bar_width - left_cells - right_cells;
+        if (pad < 0) pad = 0;
+        for (int i = 0; i < pad; i++) stream_append(r, " ", 1);
+        stream_append(r, right_buf, (int)right_bytes);
+    }
     stream_str(r, ESC_RESET);
 }
 
@@ -858,10 +970,12 @@ void render_frame(RenderState *r, Buffer *b, UIRegistry *ui,
         }
     }
 
-    int text_rows = r->height - 1;
+    bool show_tabs = r->tab_count > 1 || ui->slots[SLOT_TOPBAR].visible;
+    int text_rows = r->height - 1 - (show_tabs ? 1 : 0);
     /* Reduce text area when timeline is visible */
-    if (r->git && r->git->timeline_visible && r->git->commit_count > 0)
-        text_rows -= TIMELINE_HEIGHT;
+    if (ui->slots[SLOT_BOTTOMBAR].visible && r->git &&
+        r->git->timeline_visible && r->git->commit_count > 0)
+        text_rows -= ui->slots[SLOT_BOTTOMBAR].height;
     /* Reduce text area when references panel is visible */
     if (r->refs_panel_visible)
         text_rows -= REFS_PANEL_HEIGHT;
@@ -890,10 +1004,7 @@ void render_frame(RenderState *r, Buffer *b, UIRegistry *ui,
     }
 
     /* ── Tab bar (when multiple buffers open) ──────────────── */
-    bool show_tabs = r->tab_count > 1;
     if (show_tabs) {
-        text_rows--;  /* reserve top row for tab bar */
-
         stream_printf(r, "\x1b[1;1H");
         if (r->theme) {
             ForgeTheme *t = r->theme;
@@ -1027,7 +1138,8 @@ void render_frame(RenderState *r, Buffer *b, UIRegistry *ui,
             ThemeColor row_bg = is_cursor_row ? t->line_highlight : t->bg;
 
             /* ── Gutter (dynamic width from slot bounds) ────*/
-            int gutter_w = ui->slots[SLOT_GUTTER].visible ? ui->slots[SLOT_GUTTER].width : GUTTER_WIDTH;
+            int gutter_w = ui->slots[SLOT_GUTTER].visible ? ui->slots[SLOT_GUTTER].width : 0;
+            if (gutter_w > 0) {
             stream_bg(r, t->gutter_bg);
             if (is_cursor_row)
                 stream_fg(r, t->gutter_active);
@@ -1046,7 +1158,11 @@ void render_frame(RenderState *r, Buffer *b, UIRegistry *ui,
             }
 
             /* ── Diagnostic / Git diff marker after gutter ──*/
-            int diag = render_get_diag_severity(r, logical);
+            bool diag_enabled = (!r->cfg || r->cfg->lsp_diagnostics) &&
+                                config_gutter_has(r->cfg, "diagnostics_gutter");
+            bool git_enabled = (!r->cfg || r->cfg->git_show_gutter) &&
+                               config_gutter_has(r->cfg, "git_diff_gutter");
+            int diag = diag_enabled ? render_get_diag_severity(r, logical) : DIAG_NONE;
             if (diag == DIAG_ERROR) {
                 stream_fg(r, t->error);
                 stream_bg(r, row_bg);
@@ -1055,7 +1171,7 @@ void render_frame(RenderState *r, Buffer *b, UIRegistry *ui,
                 stream_fg(r, t->warning);
                 stream_bg(r, row_bg);
                 stream_str(r, "▲");
-            } else if (r->git && r->git->repo_open) {
+            } else if (git_enabled && r->git && r->git->repo_open) {
                 /* Show git diff marker if no diagnostic */
                 GitDiffStatus ds = git_line_diff_status(r->git, logical);
                 if (ds == GIT_DIFF_ADDED) {
@@ -1078,6 +1194,7 @@ void render_frame(RenderState *r, Buffer *b, UIRegistry *ui,
                 stream_bg(r, row_bg);
                 stream_append(r, " ", 1);
             }
+            }
 
             /* ── Text portion with syntax highlighting ──────*/
             if ((size_t)logical < total_lines) {
@@ -1096,7 +1213,7 @@ void render_frame(RenderState *r, Buffer *b, UIRegistry *ui,
                     highlight_line("", 0, &dummy, &in_block_comment);
                 }
 
-                int text_cols = r->width - gutter_w - 1; /* -1 for diag col */
+                int text_cols = content_text_columns(r, ui, gutter_w);
                 int start_col = r->scroll_col;
                 ThemeColor prev_color = t->fg;
                 bool first = true;
@@ -1154,8 +1271,12 @@ void render_frame(RenderState *r, Buffer *b, UIRegistry *ui,
                     uint32_t cp;
                     size_t n = utf8_decode(line + byte_pos,
                                            (size_t)llen - byte_pos, &cp);
-                    if (!n) break;
-                    int width = utf8_codepoint_width(cp);
+                    size_t cluster_end = utf8_grapheme_next(
+                        line, (size_t)llen, byte_pos);
+                    if (!n || cluster_end <= byte_pos) break;
+                    size_t cluster_len = cluster_end - byte_pos;
+                    int width = utf8_grapheme_width(line, (size_t)llen,
+                                                    byte_pos);
                     if (display_pos < (size_t)start_col) {
                         /* The left half of a wide glyph is scrolled away. */
                         size_t hidden = (size_t)start_col - display_pos;
@@ -1167,12 +1288,13 @@ void render_frame(RenderState *r, Buffer *b, UIRegistry *ui,
                             x++;
                         }
                         display_pos += (size_t)(width > 0 ? width : 0);
-                        byte_pos += n;
+                        byte_pos = cluster_end;
                         continue;
                     }
 
                     bool in_selection = sel_start_col >= 0 &&
-                        (int)byte_pos >= sel_start_col && (int)byte_pos < sel_end_col;
+                        (int)byte_pos < sel_end_col &&
+                        (int)cluster_end > sel_start_col;
                     stream_bg(r, in_selection ? sel_bg_color : row_bg);
                     HighlightKind kind = hl ? hl[byte_pos] : HL_NORMAL;
                     ThemeColor fc = hl_to_color(t, kind);
@@ -1192,7 +1314,10 @@ void render_frame(RenderState *r, Buffer *b, UIRegistry *ui,
                         size_t glyph_len;
                         const char *glyph = visible_glyph(line + byte_pos, n, cp,
                                                           replacement, &glyph_len);
-                        stream_append(r, glyph, glyph_len);
+                        if (glyph == line + byte_pos)
+                            stream_append(r, line + byte_pos, cluster_len);
+                        else
+                            stream_append(r, glyph, glyph_len);
                     } else if (x + width > text_cols) {
                         while (x < text_cols) {
                             stream_append(r, " ", 1);
@@ -1204,18 +1329,21 @@ void render_frame(RenderState *r, Buffer *b, UIRegistry *ui,
                         size_t glyph_len;
                         const char *glyph = visible_glyph(line + byte_pos, n, cp,
                                                           replacement, &glyph_len);
-                        stream_append(r, glyph, glyph_len);
+                        if (glyph == line + byte_pos)
+                            stream_append(r, line + byte_pos, cluster_len);
+                        else
+                            stream_append(r, glyph, glyph_len);
                         x += width;
                         display_pos += (size_t)width;
                     }
-                    byte_pos += n;
+                    byte_pos = cluster_end;
                 }
 
                 if (hl) free(hl);
                 if (line) free(line);
             } else {
                 /* Past EOF: fill with background */
-                int fill = r->width - gutter_w - 1;
+                int fill = content_text_columns(r, ui, gutter_w);
                 stream_bg(r, row_bg);
                 for (int x = 0; x < fill; x++)
                     stream_append(r, " ", 1);
@@ -1229,12 +1357,12 @@ void render_frame(RenderState *r, Buffer *b, UIRegistry *ui,
             else
                 stream_str(r, "\x1b[2;37m");
 
-            int gutter_w_fb = ui->slots[SLOT_GUTTER].visible ? ui->slots[SLOT_GUTTER].width : GUTTER_WIDTH;
+            int gutter_w_fb = ui->slots[SLOT_GUTTER].visible ? ui->slots[SLOT_GUTTER].width : 0;
             stream_append(r, row, gutter_w_fb);
             stream_str(r, ESC_RESET);
             char *plain_line = (size_t)logical < total_lines
                 ? buffer_get_line(b, logical) : NULL;
-            int x = 0, cols = r->width - gutter_w_fb;
+            int x = 0, cols = content_text_columns(r, ui, gutter_w_fb);
             if (plain_line) {
                 size_t plain_len = strlen(plain_line);
                 size_t byte_pos = utf8_byte_col(plain_line, plain_len,
@@ -1245,7 +1373,12 @@ void render_frame(RenderState *r, Buffer *b, UIRegistry *ui,
                     uint32_t cp;
                     size_t n = utf8_decode(plain_line + byte_pos,
                                            plain_len - byte_pos, &cp);
-                    int width = utf8_codepoint_width(cp);
+                    size_t cluster_end = utf8_grapheme_next(
+                        plain_line, plain_len, byte_pos);
+                    if (!n || cluster_end <= byte_pos) break;
+                    size_t cluster_len = cluster_end - byte_pos;
+                    int width = utf8_grapheme_width(plain_line, plain_len,
+                                                    byte_pos);
                     char replacement[4];
                     size_t glyph_len;
                     const char *glyph = visible_glyph(plain_line + byte_pos, n,
@@ -1258,15 +1391,21 @@ void render_frame(RenderState *r, Buffer *b, UIRegistry *ui,
                             x++;
                         }
                     } else if (width <= 0) {
-                        stream_append(r, glyph, glyph_len);
+                        if (glyph == plain_line + byte_pos)
+                            stream_append(r, plain_line + byte_pos, cluster_len);
+                        else
+                            stream_append(r, glyph, glyph_len);
                     } else if (x + width <= cols) {
-                        stream_append(r, glyph, glyph_len);
+                        if (glyph == plain_line + byte_pos)
+                            stream_append(r, plain_line + byte_pos, cluster_len);
+                        else
+                            stream_append(r, glyph, glyph_len);
                         x += width;
                     } else {
                         break;
                     }
                     if (width > 0) display_pos += (size_t)width;
-                    byte_pos += n;
+                    byte_pos = cluster_end;
                 }
                 free(plain_line);
             }
@@ -1303,13 +1442,14 @@ void render_frame(RenderState *r, Buffer *b, UIRegistry *ui,
     if (r->collab_active) {
         int peer_y = r->collab_peer_cursor_line - r->scroll_row;
         if (peer_y >= 0 && peer_y < text_rows) {
-            int gutter_w = ui->slots[SLOT_GUTTER].visible ? ui->slots[SLOT_GUTTER].width : GUTTER_WIDTH;
-            int text_cols = r->width - gutter_w - 1;
+            int gutter_w = ui->slots[SLOT_GUTTER].visible ? ui->slots[SLOT_GUTTER].width : 0;
+            int text_cols = content_text_columns(r, ui, gutter_w);
             int peer_x = line_display_col(b, r->collab_peer_cursor_line,
                                          r->collab_peer_cursor_col) - r->scroll_col;
             if (peer_x >= 0 && peer_x <= text_cols) {
                 int p_screen_row = peer_y + 1 + row_offset;
-                int p_screen_col = peer_x + gutter_w + 1 + 1;
+                int p_screen_col = peer_x + gutter_w +
+                    (gutter_w > 0 ? (r->theme ? 2 : 1) : 1);
                 
                 char glyph[5] = " ";
                 size_t glyph_len = 1;
@@ -1355,12 +1495,13 @@ void render_frame(RenderState *r, Buffer *b, UIRegistry *ui,
     for (int i = 0; i < r->extra_cursor_count; i++) {
         int e_y = r->extra_cy[i] - r->scroll_row;
         if (e_y >= 0 && e_y < text_rows) {
-            int gutter_w = ui->slots[SLOT_GUTTER].visible ? ui->slots[SLOT_GUTTER].width : GUTTER_WIDTH;
-            int text_cols = r->width - gutter_w - 1;
+            int gutter_w = ui->slots[SLOT_GUTTER].visible ? ui->slots[SLOT_GUTTER].width : 0;
+            int text_cols = content_text_columns(r, ui, gutter_w);
             int e_x = line_display_col(b, r->extra_cy[i], r->extra_cx[i]) - r->scroll_col;
             if (e_x >= 0 && e_x <= text_cols) {
                 int screen_row = e_y + 1 + row_offset;
-                int screen_col = e_x + gutter_w + 1 + 1;
+                int screen_col = e_x + gutter_w +
+                    (gutter_w > 0 ? (r->theme ? 2 : 1) : 1);
                 
                 char glyph[5] = " ";
                 size_t glyph_len = 1;
@@ -1402,13 +1543,14 @@ void render_frame(RenderState *r, Buffer *b, UIRegistry *ui,
 
     /* ── Place cursor ────────────────────────────────────────*/
     int screen_row = cy - r->scroll_row + 1 + row_offset;
-    int final_gutter_w = ui->slots[SLOT_GUTTER].visible ? ui->slots[SLOT_GUTTER].width : GUTTER_WIDTH;
+    int final_gutter_w = ui->slots[SLOT_GUTTER].visible ? ui->slots[SLOT_GUTTER].width : 0;
     char *cursor_line = buffer_get_line(b, cy);
     int visual_cx = cursor_line
         ? (int)utf8_display_col(cursor_line, strlen(cursor_line), (size_t)cx)
         : cx;
     free(cursor_line);
-    int screen_col = visual_cx - r->scroll_col + final_gutter_w + 1 + 1; /* +1 for diag col */
+    int screen_col = visual_cx - r->scroll_col + final_gutter_w +
+                     (final_gutter_w > 0 ? (r->theme ? 2 : 1) : 1);
     
     char cbuf[128];
     int clen = snprintf(cbuf, sizeof(cbuf), "\x1b[%d;%dH" ESC_SHOW_CURSOR, screen_row, screen_col);

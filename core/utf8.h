@@ -9,9 +9,13 @@ size_t utf8_decode(const char *s, size_t len, uint32_t *codepoint);
 size_t utf8_encode(uint32_t codepoint, char out[4]);
 size_t utf8_next(const char *s, size_t len, size_t offset);
 size_t utf8_prev(const char *s, size_t len, size_t offset);
+/* Unicode grapheme boundaries (utf8proc when available; built-in fallback). */
+size_t utf8_grapheme_next(const char *s, size_t len, size_t offset);
+size_t utf8_grapheme_prev(const char *s, size_t len, size_t offset);
 
 /* Terminal-cell width and conversions between byte and display columns. */
 int    utf8_codepoint_width(uint32_t codepoint);
+int    utf8_grapheme_width(const char *s, size_t len, size_t offset);
 size_t utf8_display_width(const char *s, size_t len);
 size_t utf8_display_col(const char *s, size_t len, size_t byte_offset);
 size_t utf8_byte_col(const char *s, size_t len, size_t display_col);

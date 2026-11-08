@@ -9,13 +9,15 @@
      row H            : STATUSBAR (height 1, handled by render_frame directly)
    RIGHT_PANEL and BOTTOMBAR default hidden.                           */
 void ui_layout(UIRegistry *ui, bool topbar_visible, bool gutter_visible, bool right_panel_visible, int right_panel_width, bool bottombar_visible) {
-    int W = ui->term_w, H = ui->term_h;
+    int W = ui->term_w > 0 ? ui->term_w : 1;
+    int H = ui->term_h > 1 ? ui->term_h : 2;
 
     int top_h = topbar_visible ? 1 : 0;
     int status_h = 1;
-    int bottom_h = bottombar_visible ? 3 : 0;
+    int bottom_h = bottombar_visible ? (H > 4 ? 3 : 1) : 0;
 
     int right_w = right_panel_visible ? (right_panel_width > 0 ? right_panel_width : 35) : 0;
+    if (right_w > W - 12) right_w = W > 12 ? W - 12 : 0;
     int gutter_w = gutter_visible ? 5 : 0;
 
     /* TOPBAR */
@@ -50,7 +52,9 @@ void ui_layout(UIRegistry *ui, bool topbar_visible, bool gutter_visible, bool ri
     ui->slots[SLOT_CONTENT].row     = top_h + 1;
     ui->slots[SLOT_CONTENT].col     = gutter_w + 1;
     ui->slots[SLOT_CONTENT].width   = W - right_w - gutter_w;
+    if (ui->slots[SLOT_CONTENT].width < 1) ui->slots[SLOT_CONTENT].width = 1;
     ui->slots[SLOT_CONTENT].height  = H - top_h - status_h - bottom_h;
+    if (ui->slots[SLOT_CONTENT].height < 1) ui->slots[SLOT_CONTENT].height = 1;
     ui->slots[SLOT_CONTENT].visible = true;
 
     /* GUTTER */
@@ -58,6 +62,7 @@ void ui_layout(UIRegistry *ui, bool topbar_visible, bool gutter_visible, bool ri
     ui->slots[SLOT_GUTTER].col     = 1;
     ui->slots[SLOT_GUTTER].width   = gutter_w;
     ui->slots[SLOT_GUTTER].height  = H - top_h - status_h - bottom_h;
+    if (ui->slots[SLOT_GUTTER].height < 1) ui->slots[SLOT_GUTTER].height = 1;
     ui->slots[SLOT_GUTTER].visible = gutter_visible;
 }
 

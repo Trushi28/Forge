@@ -17,6 +17,7 @@
 #include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <limits.h>
 #include <locale.h>
 #include <stdio.h>
@@ -148,6 +149,7 @@ static EditorState E;
 static Buffer *load_file(const char *path);
 static void open_file_at_path(const char *path);
 static void activate_lsp_for_active_buffer(void);
+static void lsp_flush_active_changes(void);
 
 /* ── Buffer switching ───────────────────────────────────────── */
 
@@ -191,6 +193,7 @@ static EditorContext *g_plugin_ctx;
 
 static void switch_buffer(int idx) {
   if (idx < 0 || idx >= E.buffer_count || idx == E.active_buf) return;
+  lsp_flush_active_changes();
   save_active_buffer();
   load_buffer(idx);
   /* Keep plugin context pointing at the active buffer */
@@ -304,9 +307,17 @@ static void lsp_workspace_root(const char *filepath, char *root, size_t cap) {
 static void activate_lsp_for_active_buffer(void) {
   E.lsp = NULL;
   E.file_uri[0] = '\0';
-  if (!E.filepath || !E.filepath[0] || !E.cfg.lsp_auto_detect) return;
+  if (!E.filepath || !E.filepath[0] || !E.cfg.lsp_auto_detect) {
+    render_clear_diagnostics(&E.render);
+    E.render.full_redraw = true;
+    return;
+  }
   const char *server = lsp_detect_server(E.filepath);
-  if (!server) return;
+  if (!server) {
+    render_clear_diagnostics(&E.render);
+    E.render.full_redraw = true;
+    return;
+  }
 
   BufferEntry *be = &E.buffers[E.active_buf];
   char root[1024];
@@ -343,8 +354,10 @@ static void activate_lsp_for_active_buffer(void) {
   be->lsp_session = idx;
   E.lsp = E.lsp_sessions[idx].client;
   E.lsp_did_open_sent = be->lsp_did_open_sent;
-  if (E.lsp)
+  if (E.lsp) {
     lsp_path_to_uri(E.filepath, E.file_uri, sizeof(E.file_uri));
+    lsp_activate_document(E.lsp, E.file_uri);
+  }
 }
 
 static void open_file_at_path(const char *path) {
@@ -679,13 +692,42 @@ static unsigned char *base64_decode_bytes(const char *input, size_t *out_len) {
   return out;
 }
 
+static bool guild_panel_requested(void) {
+  if (E.guild_panel_visible) return true;
+  if (!E.cfg.right_panel_visible) return false;
+  for (int i = 0; i < E.cfg.right_panel_widget_count; i++)
+    if (strcmp(E.cfg.right_panel_widgets[i], "guild_panel") == 0)
+      return true;
+  return false;
+}
+
 /* ── Layout update helper ── recomputes layout from config visibility ─── */
 static void update_layout(void) {
-  bool gutter_visible = E.cfg.show_line_numbers;
-  bool topbar_visible = E.cfg.topbar_visible;
-  bool right_panel_visible = E.guild_panel_visible || E.cfg.right_panel_visible;
-  int right_panel_width = E.cfg.right_panel_width > 0 ? E.cfg.right_panel_width : 35;
-  bool bottombar_visible = E.git.timeline_visible && E.cfg.git_timeline;
+  bool gutter_visible = false;
+  for (int i = 0; i < E.cfg.gutter_widget_count; i++) {
+    const char *name = E.cfg.gutter_widgets[i];
+    if ((strcmp(name, "line_numbers") == 0 && E.cfg.show_line_numbers) ||
+        (strcmp(name, "git_diff_gutter") == 0 && E.cfg.git_show_gutter) ||
+        (strcmp(name, "diagnostics_gutter") == 0 && E.cfg.lsp_diagnostics)) {
+      gutter_visible = true;
+      break;
+    }
+  }
+  bool topbar_has_tabs = false;
+  for (int i = 0; i < E.cfg.topbar_widget_count; i++)
+    if (strcmp(E.cfg.topbar_widgets[i], "buffer_tabs") == 0)
+      topbar_has_tabs = true;
+  bool topbar_visible = E.cfg.topbar_visible && topbar_has_tabs;
+  bool right_panel_visible = guild_panel_requested();
+  int right_panel_width = E.cfg.right_panel_width;
+  if (right_panel_width < 16) right_panel_width = 16;
+  if (right_panel_width > E.ui.term_w / 2) right_panel_width = E.ui.term_w / 2;
+  bool bottom_has_timeline = false;
+  for (int i = 0; i < E.cfg.bottombar_widget_count; i++)
+    if (strcmp(E.cfg.bottombar_widgets[i], "git_timeline") == 0)
+      bottom_has_timeline = true;
+  bool bottombar_visible = E.git.timeline_visible && E.cfg.git_timeline &&
+                           bottom_has_timeline;
   ui_layout(&E.ui, topbar_visible, gutter_visible, right_panel_visible, right_panel_width, bottombar_visible);
 }
 
@@ -724,12 +766,30 @@ static int line_byte_col_from_lsp_utf16(Buffer *b, int row, int utf16_col) {
   return i > INT_MAX ? INT_MAX : (int)i;
 }
 
-static int cursor_display_col(void) {
-  char *line = buffer_get_line(E.buf, E.cy);
-  if (!line) return E.cx;
-  int col = (int)utf8_display_col(line, strlen(line), (size_t)E.cx);
+static int line_display_column(int row, int byte_col) {
+  char *line = buffer_get_line(E.buf, row);
+  if (!line) return byte_col;
+  int col = (int)utf8_display_col(line, strlen(line),
+                                 byte_col > 0 ? (size_t)byte_col : 0);
   free(line);
   return col;
+}
+
+static int cursor_display_col(void) {
+  return line_display_column(E.cy, E.cx);
+}
+
+static int editor_screen_row(void) {
+  int row_offset = E.render.tab_count > 1 ||
+                   E.ui.slots[SLOT_TOPBAR].visible ? 1 : 0;
+  return E.cy - E.render.scroll_row + 1 + row_offset;
+}
+
+static int editor_screen_col(void) {
+  bool gutter = E.ui.slots[SLOT_GUTTER].visible;
+  int gutter_w = gutter ? E.ui.slots[SLOT_GUTTER].width : 0;
+  return cursor_display_col() - E.render.scroll_col + gutter_w +
+         (gutter ? (E.render.theme ? 2 : 1) : 1);
 }
 
 static void clamp_cx(int *cx, int cy) {
@@ -741,8 +801,8 @@ static void clamp_cx(int *cx, int cy) {
   if (*cx > 0) {
     char *line = buffer_get_line(E.buf, cy);
     if (line) {
-      size_t prev = utf8_prev(line, (size_t)max, (size_t)*cx);
-      if (utf8_next(line, (size_t)max, prev) != (size_t)*cx)
+      size_t prev = utf8_grapheme_prev(line, (size_t)max, (size_t)*cx);
+      if (utf8_grapheme_next(line, (size_t)max, prev) != (size_t)*cx)
         *cx = (int)prev;
       free(line);
     }
@@ -835,11 +895,11 @@ static void move_word_left(void) {
   if (!line)
     return;
   size_t len = strlen(line);
-  int x = (int)utf8_prev(line, len, (size_t)E.cx);
+  int x = (int)utf8_grapheme_prev(line, len, (size_t)E.cx);
   while (x > 0 && !is_word_char(line[x]))
-    x = (int)utf8_prev(line, len, (size_t)x);
+    x = (int)utf8_grapheme_prev(line, len, (size_t)x);
   while (x > 0) {
-    int prev = (int)utf8_prev(line, len, (size_t)x);
+    int prev = (int)utf8_grapheme_prev(line, len, (size_t)x);
     if (!is_word_char(line[prev])) break;
     x = prev;
   }
@@ -863,9 +923,9 @@ static void move_word_right(void) {
   size_t len = strlen(line);
   int x = E.cx;
   while ((size_t)x < len && is_word_char(line[x]))
-    x = (int)utf8_next(line, len, (size_t)x);
+    x = (int)utf8_grapheme_next(line, len, (size_t)x);
   while ((size_t)x < len && !is_word_char(line[x]))
-    x = (int)utf8_next(line, len, (size_t)x);
+    x = (int)utf8_grapheme_next(line, len, (size_t)x);
   E.cx = x;
   clamp_cx(&E.cx, E.cy);
   free(line);
@@ -929,6 +989,21 @@ static void lsp_debounce_sync(void) {
     }
     E.lsp_dirty = false;
   }
+}
+
+/* A tab switch must not let a pending edit follow the global active-buffer
+   pointer and get sent as didChange for the next document. */
+static void lsp_flush_active_changes(void) {
+  if (!E.lsp_dirty) return;
+  if (E.lsp && E.lsp->running && E.lsp->initialized &&
+      E.lsp_did_open_sent && E.file_uri[0]) {
+    char *text = buffer_get_text(E.buf);
+    if (text) {
+      lsp_send_did_change(E.lsp, E.file_uri, text);
+      free(text);
+    }
+  }
+  E.lsp_dirty = false;
 }
 
 /* ── Request completion (auto-trigger) ──────────────────────── */
@@ -1245,9 +1320,15 @@ static void cmd_copy_selection(void *ctx) {
 
 static void cmd_toggle_guild(void *ctx) {
   (void)ctx;
-  E.guild_panel_visible = !E.guild_panel_visible;
+  if (E.cfg.right_panel_visible) {
+    E.cfg.right_panel_visible = false;
+    E.guild_panel_visible = false;
+  } else {
+    E.guild_panel_visible = !E.guild_panel_visible;
+  }
+  update_layout();
   E.render.full_redraw = true;
-  if (E.guild_panel_visible) {
+  if (guild_panel_requested()) {
     if (!E.ipc.connected)
       ipc_try_connect(&E.ipc);
     if (E.ipc.connected) {
@@ -1355,42 +1436,134 @@ static void cmd_guild_collab(void *ctx) {
 }
 
 /* ── Send a local edit to forge-net when collab is active ──────── */
+static bool json_escape_bytes(const char *src, size_t len, char *dst,
+                              size_t cap, size_t *written) {
+  static const char hex[] = "0123456789abcdef";
+  size_t out = 0;
+  for (size_t i = 0; i < len; i++) {
+    unsigned char c = (unsigned char)src[i];
+    if (c == '"' || c == '\\') {
+      if (out + 2 >= cap) return false;
+      dst[out++] = '\\'; dst[out++] = (char)c;
+    } else if (c < 0x20) {
+      if (out + 6 >= cap) return false;
+      dst[out++] = '\\'; dst[out++] = 'u'; dst[out++] = '0'; dst[out++] = '0';
+      dst[out++] = hex[c >> 4]; dst[out++] = hex[c & 15];
+    } else {
+      if (out + 1 >= cap) return false;
+      dst[out++] = (char)c;
+    }
+  }
+  dst[out] = '\0';
+  *written = out;
+  return true;
+}
+
+/* forge-net's CRDT indexes Unicode scalar values; the editor buffer indexes
+   UTF-8 bytes. Translate the unchanged prefix to keep edits aligned. */
+static int collab_scalar_offset(int byte_pos) {
+  if (!E.buf || byte_pos <= 0) return 0;
+  char *text = buffer_get_text(E.buf);
+  if (!text) return byte_pos;
+  size_t len = strlen(text);
+  size_t limit = (size_t)byte_pos > len ? len : (size_t)byte_pos;
+  size_t pos = 0;
+  int scalars = 0;
+  while (pos < limit) {
+    size_t next = utf8_next(text, len, pos);
+    if (next <= pos || next > limit) break;
+    pos = next;
+    scalars++;
+  }
+  free(text);
+  return scalars;
+}
+
+static void send_collab_op_chunk(int scalar_pos, bool is_insert,
+                                 const char *text, size_t len) {
+
+  size_t text_cap = (size_t)len * 6 + 1;
+  char *escaped_text = malloc(text_cap);
+  if (!escaped_text) return;
+  size_t escaped_text_len = 0;
+  if (!json_escape_bytes(text, (size_t)len, escaped_text, text_cap,
+                         &escaped_text_len)) {
+    free(escaped_text);
+    return;
+  }
+
+  size_t op_cap = escaped_text_len + 160;
+  char *op_json = malloc(op_cap);
+  if (!op_json) { free(escaped_text); return; }
+  int prefix = snprintf(op_json, op_cap,
+      "{\"pos\":%d,\"is_insert\":%s,\"text\":\"",
+      scalar_pos, is_insert ? "true" : "false");
+  if (prefix < 0 || (size_t)prefix + escaped_text_len + 3 > op_cap) {
+    free(escaped_text); free(op_json); return;
+  }
+  size_t op_len = (size_t)prefix;
+  memcpy(op_json + op_len, escaped_text, escaped_text_len);
+  op_len += escaped_text_len;
+  memcpy(op_json + op_len, "\"}", 3);
+  op_len += 2;
+  free(escaped_text);
+
+  size_t outer_cap = op_len * 2 + 128;
+  if (outer_cap > IPC_MAX_MSG_SZ) { free(op_json); return; }
+  char *json = malloc(outer_cap);
+  char *escaped_op = malloc(op_len * 2 + 1);
+  if (!json || !escaped_op) {
+    free(op_json); free(json); free(escaped_op); return;
+  }
+  size_t escaped_op_len = 0;
+  if (!json_escape_bytes(op_json, op_len, escaped_op, op_len * 2 + 1,
+                         &escaped_op_len)) {
+    free(op_json); free(json); free(escaped_op); return;
+  }
+  int head = snprintf(json, outer_cap,
+      "{\"type\":\"COLLAB_OP\",\"session_id\":%d,\"op_json\":\"",
+      E.collab_session_id);
+  if (head < 0 || (size_t)head + escaped_op_len + 3 > outer_cap) {
+    free(op_json); free(json); free(escaped_op); return;
+  }
+  size_t json_len = (size_t)head;
+  memcpy(json + json_len, escaped_op, escaped_op_len);
+  json_len += escaped_op_len;
+  memcpy(json + json_len, "\"}", 3);
+  json_len += 2;
+  (void)ipc_send(&E.ipc, json, (int)json_len);
+  free(op_json); free(json); free(escaped_op);
+}
+
 static void send_collab_op(int pos, bool is_insert, const char *text, int len) {
-  if (!E.collab_active || !E.ipc.connected) return;
-  /* Build a simple edit message: {pos, is_insert, text} */
-  /* Escape text for JSON */
-  char escaped[2048] = "";
-  int eidx = 0;
-  for (int i = 0; i < len && eidx < (int)sizeof(escaped) - 6; i++) {
-    char c = text[i];
-    if (c == '"' || c == '\\') { escaped[eidx++] = '\\'; escaped[eidx++] = c; }
-    else if (c == '\n') { escaped[eidx++] = '\\'; escaped[eidx++] = 'n'; }
-    else if (c == '\t') { escaped[eidx++] = '\\'; escaped[eidx++] = 't'; }
-    else if (c == '\r') { escaped[eidx++] = '\\'; escaped[eidx++] = 'r'; }
-    else escaped[eidx++] = c;
+  if (!E.collab_active || !E.ipc.connected || !text || len < 0) return;
+  if (len == 0) {
+    if (!is_insert) send_collab_op_chunk(collab_scalar_offset(pos), false,
+                                         text, 0);
+    return;
   }
-  escaped[eidx] = '\0';
 
-  char op_json[4096];
-  int op_len = snprintf(op_json, sizeof(op_json),
-      "{\"pos\":%d,\"is_insert\":%s,\"text\":\"%s\"}",
-      pos, is_insert ? "true" : "false", escaped);
-
-  char json[8192];
-  /* Escape op_json for the outer JSON string */
-  char op_escaped[4096] = "";
-  int oeidx = 0;
-  for (int i = 0; i < op_len && oeidx < (int)sizeof(op_escaped) - 4; i++) {
-    char c = op_json[i];
-    if (c == '"' || c == '\\') { op_escaped[oeidx++] = '\\'; op_escaped[oeidx++] = c; }
-    else op_escaped[oeidx++] = c;
+  /* Bound each IPC frame and keep UTF-8 scalars intact. CRDT positions count
+     scalars; deletions all target the same position as preceding scalars go. */
+  const size_t max_chunk = 64 * 1024;
+  size_t total = (size_t)len, start = 0;
+  int scalar_pos = collab_scalar_offset(pos);
+  while (start < total) {
+    size_t end = start;
+    int scalar_count = 0;
+    while (end < total) {
+      size_t next = utf8_next(text, total, end);
+      if (next <= end) break;
+      if (end > start && next - start > max_chunk) break;
+      end = next;
+      scalar_count++;
+    }
+    if (end == start) return;
+    send_collab_op_chunk(scalar_pos, is_insert, text + start, end - start);
+    if (is_insert) scalar_pos += scalar_count;
+    start = end;
+    if (!E.collab_active || !E.ipc.connected) return;
   }
-  op_escaped[oeidx] = '\0';
-
-  int jlen = snprintf(json, sizeof(json),
-      "{\"type\":\"COLLAB_OP\",\"session_id\":%d,\"op_json\":\"%s\"}",
-      E.collab_session_id, op_escaped);
-  ipc_send(&E.ipc, json, jlen);
 }
 
 /* Worker edits enter through the same buffer, undo, and collaboration path as
@@ -1407,6 +1580,57 @@ static void apply_worker_insert(const char *text, size_t len) {
   clamp_cx(&E.cx, E.cy);
   mark_modified();
   send_collab_op((int)pos, true, text, (int)len);
+  E.render.full_redraw = true;
+}
+
+static void insert_pasted_text(void) {
+  size_t raw_len = 0;
+  char *raw = input_take_paste(&raw_len);
+  if (!raw) return;
+  if (raw_len > (SIZE_MAX - 1) / 3) { free(raw); return; }
+  char *clean = malloc(raw_len * 3 + 1);
+  if (!clean) { free(raw); return; }
+
+  size_t in = 0, out = 0;
+  while (in < raw_len) {
+    uint32_t cp = 0;
+    size_t n = utf8_decode(raw + in, raw_len - in, &cp);
+    if (!n) break;
+    if (n == 1 && cp == 0xfffd && (unsigned char)raw[in] != 0xef) {
+      cp = 0xfffd;
+      n = 1;
+    }
+    in += n;
+    if (cp == '\r') {
+      if (in < raw_len && raw[in] == '\n') in++;
+      clean[out++] = '\n';
+      continue;
+    }
+    if (cp == 0 || (cp < 0x20 && cp != '\n' && cp != '\t') ||
+        (cp >= 0x7f && cp <= 0x9f)) continue;
+    char encoded[4];
+    size_t encoded_len = utf8_encode(cp, encoded);
+    memcpy(clean + out, encoded, encoded_len);
+    out += encoded_len;
+  }
+  free(raw);
+  if (out == 0) { free(clean); return; }
+  if (E.collab_active && out > 1000) {
+    free(clean);
+    render_set_status(&E.render,
+                      "Paste exceeds the current collaboration edit limit");
+    return;
+  }
+
+  size_t pos = buffer_get_offset(E.buf, E.cx, E.cy);
+  buffer_insert(E.buf, pos, clean, out);
+  undo_record(&E.undo, UNDO_INSERT, pos, clean, out, E.cx, E.cy);
+  offset_to_rowcol(pos + out, &E.cy, &E.cx);
+  clamp_cx(&E.cx, E.cy);
+  send_collab_op((int)pos, true, clean, (int)out);
+  free(clean);
+  mark_modified();
+  update_completion_on_edit();
   E.render.full_redraw = true;
 }
 
@@ -1791,14 +2015,16 @@ static void handle_net_message(const char *msg) {
 /* ── Guild panel rendering ───────────────────────────────────── */
 
 static void render_guild_panel(void) {
-  if (!E.guild_panel_visible)
+  if (!guild_panel_requested())
     return;
 
   ForgeTheme *t = E.render.theme;
   if (!t)
     return;
 
-  int panel_width = 35;
+  int panel_width = E.cfg.right_panel_width > 0 ? E.cfg.right_panel_width : 35;
+  if (panel_width < 16) panel_width = 16;
+  if (panel_width > E.render.width / 2) panel_width = E.render.width / 2;
   int panel_x = E.render.width - panel_width;
   if (panel_x < 30)
     return;
@@ -2155,8 +2381,8 @@ static void render_hover(void) {
   int popup_height = line_count + 2; /* borders */
 
   /* Position: above cursor if possible */
-  int screen_row = E.cy - E.render.scroll_row + 1;
-  int screen_col = E.cx - E.render.scroll_col + GUTTER_WIDTH + 2;
+  int screen_row = editor_screen_row();
+  int screen_col = editor_screen_col();
   int popup_row = screen_row - popup_height;
   if (popup_row < 1)
     popup_row = screen_row + 1;
@@ -2458,21 +2684,21 @@ static void multi_cursor_backspace(void) {
     for (int k = total - 1; k >= 0; k--) {
         size_t pos = tcs[k].offset;
         if (pos > 0) {
-            char deleted_text[4];
+            const char *deleted_text = "\n";
+            char *deleted_copy = NULL;
             size_t deleted_len = 1;
             size_t delete_pos = pos - 1;
             if (tcs[k].cx > 0) {
                 char *ln = buffer_get_line(E.buf, tcs[k].cy);
                 size_t len = ln ? strlen(ln) : 0;
-                size_t prev = ln ? utf8_prev(ln, len, (size_t)tcs[k].cx) : (size_t)tcs[k].cx - 1;
+                size_t prev = ln ? utf8_grapheme_prev(ln, len, (size_t)tcs[k].cx) : (size_t)tcs[k].cx - 1;
                 deleted_len = (size_t)tcs[k].cx - prev;
                 delete_pos = pos - deleted_len;
-                if (ln && deleted_len <= sizeof(deleted_text))
-                    memcpy(deleted_text, ln + prev, deleted_len);
-                else { deleted_len = 1; deleted_text[0] = '\0'; }
+                deleted_copy = ln ? malloc(deleted_len) : NULL;
+                if (deleted_copy) memcpy(deleted_copy, ln + prev, deleted_len);
+                deleted_text = deleted_copy;
                 free(ln);
-            } else {
-                deleted_text[0] = '\n';
+                if (!deleted_copy) continue;
             }
             
             buffer_delete(E.buf, delete_pos, deleted_len);
@@ -2481,6 +2707,7 @@ static void multi_cursor_backspace(void) {
                 undo_record(&E.undo, UNDO_DELETE, delete_pos, deleted_text, deleted_len, tcs[k].cx, tcs[k].cy);
             }
             send_collab_op((int)delete_pos, false, deleted_text, deleted_len);
+            free(deleted_copy);
             
             final_offsets[k] -= deleted_len;
             for (int m = k + 1; m < total; m++) {
@@ -2541,20 +2768,20 @@ static void multi_cursor_delete(void) {
         size_t pos = tcs[k].offset;
         size_t tlen = buffer_total_len(E.buf);
         if (pos < tlen) {
-            char deleted_text[4];
+            const char *deleted_text = "\n";
+            char *deleted_copy = NULL;
             size_t deleted_len = 1;
             char *ln = buffer_get_line(E.buf, tcs[k].cy);
             int ll = ln ? (int)strlen(ln) : 0;
             if (ln && tcs[k].cx < ll) {
-                size_t next = utf8_next(ln, (size_t)ll, (size_t)tcs[k].cx);
+                size_t next = utf8_grapheme_next(ln, (size_t)ll, (size_t)tcs[k].cx);
                 deleted_len = next - (size_t)tcs[k].cx;
-                if (deleted_len <= sizeof(deleted_text))
-                    memcpy(deleted_text, ln + tcs[k].cx, deleted_len);
-                else { deleted_len = 1; deleted_text[0] = '\0'; }
-            } else {
-                deleted_text[0] = '\n';
+                deleted_copy = ln ? malloc(deleted_len) : NULL;
+                if (deleted_copy) memcpy(deleted_copy, ln + tcs[k].cx, deleted_len);
+                deleted_text = deleted_copy;
             }
             free(ln);
+            if (deleted_text == NULL) continue;
             
             buffer_delete(E.buf, pos, deleted_len);
             
@@ -2562,6 +2789,7 @@ static void multi_cursor_delete(void) {
                 undo_record(&E.undo, UNDO_DELETE, pos, deleted_text, deleted_len, tcs[k].cx, tcs[k].cy);
             }
             send_collab_op((int)pos, false, deleted_text, deleted_len);
+            free(deleted_copy);
             
             for (int m = k + 1; m < total; m++) {
                 final_offsets[m] -= deleted_len;
@@ -2620,7 +2848,8 @@ static void multi_cursor_tab(void) {
     for (int k = total - 1; k >= 0; k--) {
         size_t pos = tcs[k].offset;
         if (E.cfg.use_spaces) {
-            int spaces = E.cfg.tab_width - (tcs[k].cx % E.cfg.tab_width);
+            int visual_col = line_display_column(tcs[k].cy, tcs[k].cx);
+            int spaces = E.cfg.tab_width - (visual_col % E.cfg.tab_width);
             char tab_buf[16];
             for (int i = 0; i < spaces && i < 15; i++)
                 tab_buf[i] = ' ';
@@ -2969,6 +3198,7 @@ int main(int argc, char **argv) {
           fs_vm_set_shell_enabled(&E.scripts, E.cfg.scripts_allow_shell);
           theme_load(&E.theme, E.cfg.theme_name);
           render_set_theme(&E.render, &E.theme);
+          update_layout();
           render_set_status(&E.render, "config reloaded");
           /* Re-add watch in case inode changed */
           if (E.config_watch_fd != -1) {
@@ -3107,12 +3337,17 @@ int main(int argc, char **argv) {
     E.render.sel_anchor_cy = E.anchor_cy;
     E.render.sel_cursor_cx = E.cx;
     E.render.sel_cursor_cy = E.cy;
+    E.render.lsp = E.lsp;
+    const char *file_label = E.filepath ? strrchr(E.filepath, '/') : NULL;
+    file_label = file_label ? file_label + 1 :
+                 (E.filepath ? E.filepath : "[scratch]");
+    snprintf(E.render.file_label, sizeof(E.render.file_label), "%s", file_label);
     render_frame(&E.render, E.buf, &E.ui, E.cx, E.cy);
 
     /* Render overlays */
     if (E.completion.visible) {
-      int screen_row = E.cy - E.render.scroll_row + 1;
-      int screen_col = cursor_display_col() - E.render.scroll_col + GUTTER_WIDTH + 2;
+      int screen_row = editor_screen_row();
+      int screen_col = editor_screen_col();
       completion_render(&E.completion, &E.theme, screen_row, screen_col,
                         E.render.width, E.render.height);
     }
@@ -3126,7 +3361,7 @@ int main(int argc, char **argv) {
     }
 
     /* Guild panel overlay */
-    if (E.guild_panel_visible) {
+    if (guild_panel_requested()) {
       render_guild_panel();
     }
 
@@ -3148,7 +3383,7 @@ int main(int argc, char **argv) {
         }
         msgs--;
       }
-      if (E.guild_panel_visible) {
+      if (guild_panel_requested()) {
         if (E.guild_status_timer-- <= 0) {
           const char *json = "{\"type\":\"GUILD_STATUS\"}";
           ipc_send(&E.ipc, json, (int)strlen(json));
@@ -3161,6 +3396,11 @@ int main(int argc, char **argv) {
     }
 
     int key = input_read_key();
+
+    if (key == KEY_PASTE) {
+      insert_pasted_text();
+      continue;
+    }
 
     /* Timeout — no keypress. Re-render so LSP results appear
        as soon as they arrive without waiting for another key. */
@@ -3770,14 +4010,14 @@ int main(int argc, char **argv) {
       } else if (key == KEY_SHIFT_LEFT) {
         if (E.cx > 0) {
           char *line = buffer_get_line(E.buf, E.cy);
-          if (line) { E.cx = (int)utf8_prev(line, strlen(line), (size_t)E.cx); free(line); }
+          if (line) { E.cx = (int)utf8_grapheme_prev(line, strlen(line), (size_t)E.cx); free(line); }
         }
         else if (E.cy > 0) { E.cy--; E.cx = line_len(E.buf, E.cy); }
       } else if (key == KEY_SHIFT_RIGHT) {
         int ll = line_len(E.buf, E.cy);
         if (E.cx < ll) {
           char *line = buffer_get_line(E.buf, E.cy);
-          if (line) { E.cx = (int)utf8_next(line, strlen(line), (size_t)E.cx); free(line); }
+          if (line) { E.cx = (int)utf8_grapheme_next(line, strlen(line), (size_t)E.cx); free(line); }
         }
         else { size_t lc = buffer_line_count(E.buf); if ((size_t)E.cy < lc - 1) { E.cy++; E.cx = 0; } }
       }
@@ -3880,11 +4120,11 @@ int main(int argc, char **argv) {
         if (!line)
           continue;
         size_t line_bytes = strlen(line);
-        int x = (int)utf8_prev(line, line_bytes, (size_t)E.cx);
+        int x = (int)utf8_grapheme_prev(line, line_bytes, (size_t)E.cx);
         while (x > 0 && !is_word_char(line[x]))
-          x = (int)utf8_prev(line, line_bytes, (size_t)x);
+          x = (int)utf8_grapheme_prev(line, line_bytes, (size_t)x);
         while (x > 0) {
-          int prev = (int)utf8_prev(line, line_bytes, (size_t)x);
+          int prev = (int)utf8_grapheme_prev(line, line_bytes, (size_t)x);
           if (!is_word_char(line[prev])) break;
           x = prev;
         }
@@ -3944,7 +4184,7 @@ int main(int argc, char **argv) {
     } else if (key == KEY_ARROW_LEFT) {
       if (E.cx > 0) {
         char *line = buffer_get_line(E.buf, E.cy);
-        if (line) { E.cx = (int)utf8_prev(line, strlen(line), (size_t)E.cx); free(line); }
+        if (line) { E.cx = (int)utf8_grapheme_prev(line, strlen(line), (size_t)E.cx); free(line); }
       } else if (E.cy > 0) {
         E.cy--;
         E.cx = line_len(E.buf, E.cy);
@@ -3954,7 +4194,7 @@ int main(int argc, char **argv) {
       int ll = line_len(E.buf, E.cy);
       if (E.cx < ll) {
         char *line = buffer_get_line(E.buf, E.cy);
-        if (line) { E.cx = (int)utf8_next(line, strlen(line), (size_t)E.cx); free(line); }
+        if (line) { E.cx = (int)utf8_grapheme_next(line, strlen(line), (size_t)E.cx); free(line); }
       } else {
         size_t lc = buffer_line_count(E.buf);
         if ((size_t)E.cy < lc - 1) {
@@ -4048,22 +4288,21 @@ int main(int argc, char **argv) {
       } else {
         size_t pos = buffer_get_offset(E.buf, E.cx, E.cy);
         if (pos > 0) {
-          char deleted_text[4];
+          const char *deleted_text = "\n";
+          char *deleted_copy = NULL;
           size_t deleted_len = 1;
           if (E.cx > 0) {
             char *ln = buffer_get_line(E.buf, E.cy);
             size_t line_len_bytes = ln ? strlen(ln) : 0;
-            size_t prev = ln ? utf8_prev(ln, line_len_bytes, (size_t)E.cx) : (size_t)E.cx - 1;
+            size_t prev = ln ? utf8_grapheme_prev(ln, line_len_bytes, (size_t)E.cx) : (size_t)E.cx - 1;
             deleted_len = (size_t)E.cx - prev;
-            if (ln && deleted_len <= sizeof(deleted_text))
-              memcpy(deleted_text, ln + prev, deleted_len);
-            else {
-              deleted_len = 1;
-              deleted_text[0] = '\0';
-            }
+            deleted_copy = ln ? malloc(deleted_len) : NULL;
+            if (deleted_copy) memcpy(deleted_copy, ln + prev, deleted_len);
+            deleted_text = deleted_copy;
             free(ln);
+            if (!deleted_copy) continue;
           } else {
-            deleted_text[0] = '\n'; /* joining lines */
+            deleted_text = "\n"; /* joining lines */
           }
 
           int old_cx = E.cx, old_cy = E.cy;
@@ -4086,6 +4325,7 @@ int main(int argc, char **argv) {
 
           mark_modified();
           send_collab_op((int)delete_pos, false, deleted_text, deleted_len);
+          free(deleted_copy);
         }
       }
 
@@ -4101,20 +4341,20 @@ int main(int argc, char **argv) {
         size_t tlen = buffer_total_len(E.buf); /* No alloc! */
         if (pos < tlen) {
           /* Get deleted char cheaply — single line alloc */
-          char deleted_text[4];
+          const char *deleted_text = "\n";
+          char *deleted_copy = NULL;
           size_t deleted_len = 1;
           char *ln = buffer_get_line(E.buf, E.cy);
           int ll = ln ? (int)strlen(ln) : 0;
           if (ln && E.cx < ll) {
-            size_t next = utf8_next(ln, (size_t)ll, (size_t)E.cx);
+            size_t next = utf8_grapheme_next(ln, (size_t)ll, (size_t)E.cx);
             deleted_len = next - (size_t)E.cx;
-            if (deleted_len <= sizeof(deleted_text))
-              memcpy(deleted_text, ln + E.cx, deleted_len);
-            else { deleted_len = 1; deleted_text[0] = '\0'; }
-          } else {
-            deleted_text[0] = '\n';
+            deleted_copy = malloc(deleted_len);
+            if (deleted_copy) memcpy(deleted_copy, ln + E.cx, deleted_len);
+            deleted_text = deleted_copy;
           }
           free(ln);
+          if (deleted_text == NULL) continue;
 
           buffer_delete(E.buf, pos, deleted_len);
 
@@ -4126,6 +4366,7 @@ int main(int argc, char **argv) {
 
           mark_modified();
           send_collab_op((int)pos, false, deleted_text, deleted_len);
+          free(deleted_copy);
         }
       }
 
@@ -4159,7 +4400,7 @@ int main(int argc, char **argv) {
         if (E.extra_cursor_count > 0) {
           multi_cursor_tab();
         } else {
-          int spaces = E.cfg.tab_width - (E.cx % E.cfg.tab_width);
+          int spaces = E.cfg.tab_width - (cursor_display_col() % E.cfg.tab_width);
           size_t pos = buffer_get_offset(E.buf, E.cx, E.cy);
           if (E.cfg.use_spaces) {
             char tab_buf[16];

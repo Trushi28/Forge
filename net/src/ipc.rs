@@ -428,7 +428,11 @@ pub async fn handle_connection(
                                 ops_to_send.push(op);
                             }
                         } else {
-                            let del_len = if edit.text.is_empty() { 1 } else { edit.text.len() };
+                            let del_len = if edit.text.is_empty() {
+                                1
+                            } else {
+                                edit.text.chars().count()
+                            };
                             for _ in 0..del_len {
                                 if let Some(op) = session.local_delete(edit.pos) {
                                     ops_to_send.push(op);

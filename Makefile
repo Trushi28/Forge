@@ -6,12 +6,16 @@ BUILDDIR = build
 TESTDIR = tests
 TARGET  = forge
 
+# Do not use host pkg-config results when cross-compiling for Windows.
+WINDOWS_CROSS = $(findstring w64-mingw32,$(CC))
+
 # ── Optional libgit2 support ──────────────────────────────────
 # Auto-detected with pkg-config (needs the libgit2 *headers*: libgit2-dev /
 # libgit2-devel; on Arch just `libgit2`).  Override with:
 #   make WITH_GIT=1   force on      make WITH_GIT=0   force off
 # Without libgit2 the editor works fine — git features (diff gutter, blame,
 # timeline) are simply disabled.
+ifeq ($(WINDOWS_CROSS),)
 ifeq ($(origin WITH_GIT),undefined)
   ifneq ($(shell pkg-config --exists libgit2 2>/dev/null && echo yes),)
     WITH_GIT = 1
@@ -22,6 +26,14 @@ ifeq ($(WITH_GIT),1)
   GIT_LDFLAGS = $(or $(shell pkg-config --libs libgit2 2>/dev/null),-lgit2)
 else
   GIT_LDFLAGS =
+endif
+
+# Use utf8proc for current Unicode grapheme boundaries and widths when present.
+# The built-in implementation remains available for minimal systems.
+ifneq ($(shell pkg-config --exists libutf8proc 2>/dev/null && echo yes),)
+  CFLAGS += -DHAS_UTF8PROC $(shell pkg-config --cflags libutf8proc 2>/dev/null)
+  UTF8PROC_LDFLAGS = $(shell pkg-config --libs libutf8proc 2>/dev/null)
+endif
 endif
 
 SRCS = $(SRCDIR)/arena.c      \
@@ -56,14 +68,14 @@ $(BUILDDIR):
 	mkdir -p $(BUILDDIR)
 
 $(TARGET): $(OBJS)
-	$(CC) $(CFLAGS) -o $@ $^ $(GIT_LDFLAGS) -ldl
+	$(CC) $(CFLAGS) -o $@ $^ $(GIT_LDFLAGS) $(UTF8PROC_LDFLAGS) -ldl
 
 # Rebuild every object when the compiler flags change (e.g. libgit2 toggled).
 # Without this, `make` after installing libgit2 said "Nothing to be done" and
 # kept the no-op git.o stub.  Header dependencies are tracked with -MMD, so an
 # edited .h (e.g. buffer.h's struct) also rebuilds its users.
 $(BUILDDIR)/.flags: FORCE | $(BUILDDIR)
-	@echo '$(CC) $(CFLAGS) $(GIT_LDFLAGS)' | cmp -s - $@ || echo '$(CC) $(CFLAGS) $(GIT_LDFLAGS)' > $@
+	@echo '$(CC) $(CFLAGS) $(GIT_LDFLAGS) $(UTF8PROC_LDFLAGS)' | cmp -s - $@ || echo '$(CC) $(CFLAGS) $(GIT_LDFLAGS) $(UTF8PROC_LDFLAGS)' > $@
 
 FORCE:
 
@@ -84,7 +96,7 @@ plugins: $(BUILDDIR)
 
 # ── Test suite ────────────────────────────────────────────────
 test: $(BUILDDIR) $(TEST_OBJS)
-	$(CC) $(CFLAGS) -o $(BUILDDIR)/test_forge $(TESTDIR)/test_main.c $(TEST_OBJS) $(GIT_LDFLAGS) -ldl
+	$(CC) $(CFLAGS) -o $(BUILDDIR)/test_forge $(TESTDIR)/test_main.c $(TEST_OBJS) $(GIT_LDFLAGS) $(UTF8PROC_LDFLAGS) -ldl
 	@echo "════════════════════════════════════════════════"
 	@echo "  Running Forge C core tests"
 	@echo "════════════════════════════════════════════════"

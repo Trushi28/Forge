@@ -8,6 +8,10 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifdef _WIN32
+#include <windows.h>
+#include <io.h>
+#endif
 
 extern Arena *session_arena;
 
@@ -652,6 +656,39 @@ static int write_pieces(Buffer *b, FILE *f) {
 
 int buffer_save(Buffer *b, const char *path) {
     if (!b || !path || !path[0]) return -1;
+#ifdef _WIN32
+    char target[PATH_MAX];
+    if (!_fullpath(target, path, sizeof(target))) return -1;
+    char dir[PATH_MAX];
+    size_t target_len = strlen(target);
+    if (target_len >= sizeof(dir)) return -1;
+    memcpy(dir, target, target_len + 1);
+    char *slash = strrchr(dir, '\\');
+    char *forward_slash = strrchr(dir, '/');
+    if (!slash || (forward_slash && forward_slash > slash)) slash = forward_slash;
+    if (slash) {
+        if (slash == dir + 2 && dir[1] == ':') slash[1] = '\0';
+        else if (slash == dir) slash[1] = '\0';
+        else *slash = '\0';
+    } else {
+        strcpy(dir, ".");
+    }
+
+    char tmp[PATH_MAX];
+    if (!GetTempFileNameA(dir, "frg", 0, tmp)) return -1;
+    FILE *f = fopen(tmp, "wb");
+    if (!f) { DeleteFileA(tmp); return -1; }
+    int bad = write_pieces(b, f);
+    if (fflush(f) != 0) bad = 1;
+    intptr_t os_handle = _get_osfhandle(_fileno(f));
+    if (os_handle == -1 || !FlushFileBuffers((HANDLE)os_handle)) bad = 1;
+    if (fclose(f) != 0) bad = 1;
+    if (!bad && MoveFileExA(tmp, target,
+                            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+        return 0;
+    DeleteFileA(tmp);
+    return -1;
+#else
     char real[PATH_MAX];
     const char *target = realpath(path, real) ? real : path;
 
@@ -701,4 +738,5 @@ int buffer_save(Buffer *b, const char *path) {
 
     unlink(tmp);
     return -1;
+#endif
 }

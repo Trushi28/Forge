@@ -15,6 +15,9 @@
 #include <dirent.h>
 #include <dlfcn.h>
 #include <ctype.h>
+#include <sys/resource.h>
+#include <sys/prctl.h>
+#include <limits.h>
 
 /* ══════════════════════════════════════════════════════════════
    Global plugin host pointer — used by forge_api functions
@@ -127,13 +130,12 @@ static void worker_close(PluginWorker *worker, bool terminate) {
     if (worker->output_fd >= 0) close(worker->output_fd);
     worker->input_fd = worker->output_fd = -1;
     if (terminate && worker->pid > 0) {
-        if (kill(worker->pid, SIGTERM) == 0) {
-            int status;
-            if (waitpid(worker->pid, &status, WNOHANG) == 0) {
-                kill(worker->pid, SIGKILL);
-                while (waitpid(worker->pid, &status, 0) < 0 && errno == EINTR) {}
-            }
-        }
+        (void)kill(-worker->pid, SIGTERM);
+        (void)kill(worker->pid, SIGTERM);
+        usleep(20000);
+        (void)kill(-worker->pid, SIGKILL);
+        int status;
+        while (waitpid(worker->pid, &status, 0) < 0 && errno == EINTR) {}
     }
     worker->running = false;
     worker->pid = 0;
@@ -322,7 +324,7 @@ static void worker_read_available(PluginWorker *worker) {
     int status;
     pid_t result = waitpid(worker->pid, &status, WNOHANG);
     if (result == worker->pid || (result < 0 && errno == ECHILD))
-        worker_close(worker, false);
+        worker_close(worker, true);
 }
 
 void plugin_set_editor_context(EditorContext *ctx) {
@@ -430,10 +432,47 @@ static bool worker_start(PluginHost *ph, const char *path) {
     }
     pid_t pid = fork();
     if (pid == 0) {
+        (void)setpgid(0, 0);
         (void)dup2(to_child[0], STDIN_FILENO);
         (void)dup2(from_child[1], STDOUT_FILENO);
         close(to_child[0]); close(to_child[1]);
         close(from_child[0]); close(from_child[1]);
+
+        /* Bound accidental resource exhaustion and prevent privilege gain.
+           This is process isolation, not a filesystem/network sandbox. */
+        struct rlimit limit;
+        if (getrlimit(RLIMIT_CORE, &limit) == 0) {
+            limit.rlim_cur = 0;
+            (void)setrlimit(RLIMIT_CORE, &limit);
+        }
+        if (getrlimit(RLIMIT_NOFILE, &limit) == 0) {
+            if (limit.rlim_max > 32) limit.rlim_cur = 32;
+            else limit.rlim_cur = limit.rlim_max;
+            (void)setrlimit(RLIMIT_NOFILE, &limit);
+        }
+        if (getrlimit(RLIMIT_CPU, &limit) == 0) {
+            if (limit.rlim_cur == RLIM_INFINITY || limit.rlim_cur > 120)
+                limit.rlim_cur = limit.rlim_max < 120 ? limit.rlim_max : 120;
+            (void)setrlimit(RLIMIT_CPU, &limit);
+        }
+        if (getrlimit(RLIMIT_AS, &limit) == 0) {
+            rlim_t cap = (rlim_t)1024 * 1024 * 1024;
+            if (limit.rlim_cur == RLIM_INFINITY || limit.rlim_cur > cap)
+                limit.rlim_cur = limit.rlim_max < cap ? limit.rlim_max : cap;
+            (void)setrlimit(RLIMIT_AS, &limit);
+        }
+        if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) _exit(126);
+#ifdef __linux__
+        if (close_range(3, UINT_MAX, 0) != 0) {
+            long max_fd = sysconf(_SC_OPEN_MAX);
+            if (max_fd < 0) max_fd = 65536;
+            for (int fd = 3; fd < max_fd; fd++) close(fd);
+        }
+#else
+        long max_fd = sysconf(_SC_OPEN_MAX);
+        if (max_fd < 0) max_fd = 65536;
+        for (int fd = 3; fd < max_fd; fd++) close(fd);
+#endif
         execl(path, path, (char *)NULL);
         _exit(127);
     }
@@ -441,6 +480,7 @@ static bool worker_start(PluginHost *ph, const char *path) {
     if (pid < 0) {
         close(to_child[1]); close(from_child[0]); return false;
     }
+    (void)setpgid(pid, pid);
 
     int in_flags = fcntl(to_child[1], F_GETFL, 0);
     int out_flags = fcntl(from_child[0], F_GETFL, 0);
